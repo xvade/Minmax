@@ -1,0 +1,4 @@
+- Begin Minmax's documentation by writing an overview of the code structure needed to eventually accomplish the goals outlined in `AGENTS.md`.
+- Decide on a method for storing data, and a programming language to write in. Run these by the user before proceeding.
+- Complete the first goal in `AGENTS.md` "Minmax will support efficient import, storage, and retrieval for timetracking data". Timetracking data will be imported from Timecard (`/Users/xvade/dev/Misc/Timecard/Data`).
+- Complete the second goal in `AGENTS.md` "Minmax will include a convenient user interface for viewing timetracking data". Use Timecard as a model for how to display timetracking data.
