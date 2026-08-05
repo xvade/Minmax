@@ -20,10 +20,11 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from itertools import pairwise
 
-from minmax.core import paths
+from minmax.core import palette, paths
 from minmax.core.models import (
     Category,
     CategoryTotal,
+    DailyCategoryTotal,
     ImportRun,
     IntervalRecord,
     PeriodTotal,
@@ -175,6 +176,44 @@ class Repository:
             )
             for row in rows
         ]
+
+    # ------------------------------------------------------------------
+    # Group colours
+    # ------------------------------------------------------------------
+
+    def group_slots(self, stream_id: int) -> dict[str, int]:
+        """Stored palette slot for each top-level category group in this stream."""
+        rows = self._conn.execute(
+            "SELECT top_level, slot FROM group_color WHERE stream_id = ?", (stream_id,)
+        ).fetchall()
+        return {row["top_level"]: int(row["slot"]) for row in rows}
+
+    def ensure_group_slots(self, stream_id: int, top_levels: Sequence[str]) -> dict[str, int]:
+        """Assign a palette slot to any group that lacks one, and return them all.
+
+        New groups are assigned in sorted order so that the result does not
+        depend on the order rows happened to arrive in an import, and each takes
+        the least-used slot so colours stay distinct. Existing assignments are
+        never revised -- a group's colour is something the user learns to
+        recognize, and it must not shift because another group appeared later.
+        """
+        assigned = self.group_slots(stream_id)
+        missing = sorted(set(top_levels) - assigned.keys())
+        if not missing:
+            return assigned
+
+        now = int(time.time())
+        with transaction(self._conn) as conn:
+            for top_level in missing:
+                slot = palette.next_slot(assigned.values())
+                conn.execute(
+                    "INSERT INTO group_color (stream_id, top_level, slot, assigned_at)"
+                    " VALUES (?, ?, ?, ?)"
+                    " ON CONFLICT (stream_id, top_level) DO NOTHING",
+                    (stream_id, top_level, slot, now),
+                )
+                assigned[top_level] = slot
+        return assigned
 
     # ------------------------------------------------------------------
     # Import provenance
@@ -536,6 +575,55 @@ class Repository:
         return [
             PeriodTotal(
                 bucket=row["bucket"],
+                seconds=int(row["seconds"]),
+                record_count=int(row["record_count"]),
+            )
+            for row in rows
+        ]
+
+    def daily_totals_by_category(
+        self,
+        stream_id: int,
+        *,
+        start_bucket: str | None = None,
+        end_bucket: str | None = None,
+        path_prefix: str | None = None,
+    ) -> list[DailyCategoryTotal]:
+        """Seconds per (local day, category), read from the rollup table.
+
+        This is the query the trends view is built on, and the reason rollups
+        exist: a stacked area over a year of data is a scan of a few thousand
+        aggregate rows rather than of every observation in the range.
+
+        Buckets are inclusive at both ends and compare as strings, which works
+        because the key format sorts chronologically.
+        """
+        clause, params = _prefix_clause(path_prefix)
+        bounds = ""
+        bound_params: list[str] = []
+        if start_bucket is not None:
+            bounds += " AND r.bucket >= ?"
+            bound_params.append(start_bucket)
+        if end_bucket is not None:
+            bounds += " AND r.bucket <= ?"
+            bound_params.append(end_bucket)
+
+        rows = self._conn.execute(
+            "SELECT r.bucket, c.id AS category_id, c.path AS category_path,"
+            "       r.seconds, r.record_count"
+            " FROM rollup r JOIN category c ON c.id = r.category_id"
+            " WHERE r.stream_id = ? AND r.period = 'day'"
+            + bounds
+            + clause
+            + " ORDER BY r.bucket, c.path",
+            (stream_id, *bound_params, *params),
+        ).fetchall()
+
+        return [
+            DailyCategoryTotal(
+                bucket=row["bucket"],
+                category_id=int(row["category_id"]),
+                category_path=row["category_path"],
                 seconds=int(row["seconds"]),
                 record_count=int(row["record_count"]),
             )

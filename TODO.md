@@ -30,13 +30,25 @@ next.
   - [x] Document the import/retrieval feature in `README.md`.
 
 - [ ] Complete the second goal in `AGENTS.md` "Minmax will include a convenient user interface for viewing timetracking data". Use Timecard as a model for how to display timetracking data.
-  - [ ] Define the `MinmaxClient` protocol operations the UI needs; implement `InProcessClient`.
-  - [ ] PySide6 app shell: window, keyboard-shortcut registry, light/dark following system appearance.
-  - [ ] Day-timeline view modelled on Timecard's history screen — 24-hour grid, blocks sized to real duration, colored by top-level category, labels shown when tall enough.
-  - [ ] Pinch/scroll zoom of hour density, staying centered on the focus point; scroll to load earlier days.
-  - [ ] Summary views: totals by category and by category prefix over a selected range.
-  - [ ] Keyboard-first navigation (day/range movement, zoom, jump to date, category filter).
-  - [ ] Tests for everything testable below the UI layer; document the UI in `README.md`.
+  - [x] Define the `MinmaxClient` protocol operations the UI needs; implement `InProcessClient`.
+  - [x] PySide6 app shell: window, keyboard-shortcut registry, light/dark following system appearance.
+  - [x] Day-timeline view modelled on Timecard's history screen — hour grid, blocks sized to real duration, coloured by top-level category, labels shown when tall enough, midnight-crossing runs marked rather than clipped.
+  - [x] Zoom of hour density, anchored under the pointer on Ctrl/Cmd+scroll; fit-day on open.
+  - [x] Summary panel: totals by category for the shown day, with share bars.
+  - [x] Keyboard-first navigation (day movement, jump to date, zoom, fit, shortcut help).
+  - [x] Persisted per-group colours (`group_color` table, migration 0002) so a category's colour is stable and distinct.
+  - [x] Tests: timeline arithmetic, the client facade, and headless UI wiring; a test that fails if `ui/` ever imports the backend.
+  - [x] Document the UI in `README.md`.
+  - [ ] Category filter (`/` to restrict the timeline and totals to a path prefix). The backend already supports prefixes end to end — `Repository.totals_by_category(path_prefix=...)` and `MinmaxClient.range_totals(prefix=...)` — so this is UI work only.
+  - [ ] Scroll past the day boundary to load adjacent days, the way Timecard's history scrolls continuously, instead of stepping day by day.
+  - [x] Trends screen: side-scrolling stacked area over days, zoomable, with the visible date span and each group's share of it always on screen.
+  - [x] Re-step the category palette on validated colours (light and dark), storing palette slots rather than hex so it can change without a data migration (migration 0003).
+  - [x] Drill-down: focus a group on the trends screen to split it into its sub-categories.
+  - [ ] Click a block to inspect it (full path, exact times, which import it came from).
+  - [ ] Remappable shortcuts persisted to a config file; the `DAY_SHORTCUTS` / `TRENDS_SHORTCUTS` / `GLOBAL_SHORTCUTS` tables in `ui/main_window.py` are already the single source they would be read into.
+  - [ ] Trends: a range picker, so the chart can be pinned to a fixed window rather than always covering all history.
+  - [ ] Trends: weekly and monthly aggregation, so multi-year spans do not rely on one column per day.
+  - [ ] Confirm dark mode on a real display. It has been verified offscreen with a forced dark palette (chrome follows, category colours hold up), but never seen under the actual macOS dark appearance.
 
 ---
 
@@ -77,8 +89,15 @@ Known gaps, deliberately left:
 
 - Only `interval` observations have storage. `event_record` / `sample_record`
   get added by a migration when the first such stream lands.
-- `analysis/`, `api/`, and `ui/` do not exist yet; `cli.py` is the only
-  front-end.
+- `analysis/` does not exist yet — no correlation engine. Everything it will
+  need is already in the daily rollups.
 - `totals_by_category` reads observations directly (exact for arbitrary ranges);
-  only `totals_by_period` uses rollups. If category totals ever get slow, that
-  is the place to add a rollup-backed path.
+  `totals_by_period` and `daily_totals_by_category` use rollups. If category
+  totals ever get slow, that is the place to add a rollup-backed path.
+- The trends chart plots one column per day. Past a few years that is a lot of
+  columns for the pixels available; weekly/monthly aggregation is the fix, and
+  the rollup table already stores what it would need.
+- Category colours are stored as palette *slots*. If the palette is ever
+  re-stepped again, no migration is needed — but re-run the dataviz validator
+  before changing `core/palette.py`, since the current steps are chosen to pass
+  it in both light and dark.

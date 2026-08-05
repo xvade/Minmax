@@ -19,10 +19,10 @@ UTC to recover the local calendar fields.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta, timezone, tzinfo
 from enum import Enum
 
-__all__ = ["Instant", "Period", "split_by_local_period"]
+__all__ = ["Instant", "Period", "local_day_bounds", "split_by_local_period"]
 
 _UTC = UTC
 _SECONDS_PER_HOUR = 3600
@@ -176,6 +176,24 @@ def split_by_local_period(start: Instant, end: Instant, period: Period) -> list[
         cursor = piece_end
 
     return _merge_adjacent(pieces)
+
+
+def local_day_bounds(first_day: date, tz: tzinfo, *, days: int = 1) -> tuple[int, int]:
+    """Epoch bounds of ``[first_day 00:00, first_day+days 00:00)`` in ``tz``.
+
+    The timezone is required rather than read from the environment, so that
+    ``core`` stays free of environment access and a caller can ask about a day
+    somewhere other than where the machine happens to be.
+
+    Note that the span is not always ``days * 86400`` seconds: across a DST
+    transition a local day is 23 or 25 hours long, and callers that size a
+    timeline from these bounds render that correctly for free.
+    """
+    if days < 1:
+        raise ValueError(f"days must be at least 1, got {days}")
+    start = datetime.combine(first_day, datetime.min.time(), tzinfo=tz)
+    end = datetime.combine(first_day + timedelta(days=days), datetime.min.time(), tzinfo=tz)
+    return int(start.timestamp()), int(end.timestamp())
 
 
 def _offset_near(epoch_seconds: int, start: Instant, end: Instant) -> int:

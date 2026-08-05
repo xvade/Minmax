@@ -17,29 +17,19 @@ from datetime import date, datetime, timedelta
 from datetime import time as time_of_day
 from pathlib import Path
 
+from minmax.api.format import format_duration
 from minmax.core.timeref import Period
 from minmax.ingest import IMPORTERS, run_import
 from minmax.storage.database import default_home, open_database
 from minmax.storage.repository import OverlapError, Repository
 from minmax.storage.rollups import rebuild
 
-__all__ = ["main"]
+__all__ = ["format_duration", "main"]
 
 
 # ----------------------------------------------------------------------
 # Formatting helpers
 # ----------------------------------------------------------------------
-
-
-def format_duration(seconds: int) -> str:
-    """Render a span the way a person reads it: ``2h 30m``, ``45m``, ``12s``."""
-    if seconds < 60:
-        return f"{seconds}s"
-    minutes, _ = divmod(seconds, 60)
-    hours, minutes = divmod(minutes, 60)
-    if hours == 0:
-        return f"{minutes}m"
-    return f"{hours}h {minutes:02d}m" if minutes else f"{hours}h"
 
 
 def _parse_date(text: str) -> date:
@@ -225,6 +215,31 @@ def cmd_periods(args: argparse.Namespace, repository: Repository) -> int:
     return 0
 
 
+def cmd_ui(args: argparse.Namespace, repository: Repository) -> int:
+    """Launch the desktop app.
+
+    PySide6 is an optional dependency, so the import is deferred to here: every
+    other command must keep working on an installation that never wanted a GUI.
+    """
+    try:
+        from minmax.ui.app import run as run_ui
+    except ImportError:
+        print(
+            "the desktop UI needs PySide6, which is not installed.\n"
+            "  install it with:  uv sync --extra ui",
+            file=sys.stderr,
+        )
+        return 2
+
+    if repository.get_stream(args.stream) is None:
+        print(f"no stream {args.stream!r}; import something first", file=sys.stderr)
+        return 2
+
+    from minmax.api import InProcessClient
+
+    return run_ui(InProcessClient(repository), stream_key=args.stream)
+
+
 def cmd_revert(args: argparse.Namespace, repository: Repository) -> int:
     deleted = repository.revert_import(args.import_run_id)
     print(f"reverted import {args.import_run_id}: {deleted} observations removed")
@@ -284,6 +299,10 @@ def build_parser() -> argparse.ArgumentParser:
     periods.add_argument("--until", type=_parse_date)
     periods.add_argument("--prefix")
     periods.set_defaults(handler=cmd_periods)
+
+    ui = subparsers.add_parser("ui", help="open the desktop app")
+    ui.add_argument("--stream", default="timecard")
+    ui.set_defaults(handler=cmd_ui)
 
     revert = subparsers.add_parser("revert", help="undo an import by id")
     revert.add_argument("import_run_id", type=int)

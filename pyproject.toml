@@ -14,6 +14,11 @@ dependencies = []
 [project.scripts]
 minmax = "minmax.cli:main"
 
+[project.optional-dependencies]
+ui = [
+    "pyside6>=6.7",
+]
+
 [dependency-groups]
 dev = ["pytest>=8.0", "ruff>=0.6", "mypy>=1.11"]
 

@@ -20,6 +20,7 @@ from minmax.core.timeref import Instant
 __all__ = [
     "Category",
     "CategoryTotal",
+    "DailyCategoryTotal",
     "ImportRun",
     "IntervalRecord",
     "PeriodTotal",
@@ -188,6 +189,21 @@ class ImportRun:
 class CategoryTotal:
     """Time attributed to one category over a queried range."""
 
+    category_id: int
+    category_path: str
+    seconds: int
+    record_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class DailyCategoryTotal:
+    """Time attributed to one category on one local day.
+
+    The unit the trends view is built from: a stacked area is this table
+    pivoted, one band per category and one column per day.
+    """
+
+    bucket: str
     category_id: int
     category_path: str
     seconds: int

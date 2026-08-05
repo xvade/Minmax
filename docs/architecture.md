@@ -126,8 +126,11 @@ recomputed per query.
 ```
 src/minmax/
 ├── core/            # Domain model. Pure. No I/O, no SQL, no framework imports.
-│   ├── models.py    #   Stream, Category, Interval, Event, Sample, StreamKind
-│   ├── timerange.py #   TimeRange, local-day bucketing, offset-aware conversions
+│   ├── models.py    #   Stream, Category, IntervalRecord, StreamKind, ImportRun
+│   ├── timeref.py   #   Instant, local-period bucketing, offset-aware conversions
+│   ├── timeline.py  #   Day-timeline layout arithmetic (§8) — no Qt
+│   ├── trends.py    #   Stacked-area layout arithmetic (§8) — no Qt
+│   ├── palette.py   #   Validated categorical palette and slot assignment
 │   └── paths.py     #   Category path parsing, prefix matching, tree derivation
 │
 ├── storage/         # Persistence. The only layer that knows SQL exists.
@@ -144,13 +147,21 @@ src/minmax/
 ├── analysis/        # Statistics over stored data. Reads; never writes history.
 │                    #   (correlation engine, then forecasting — see §9)  [not yet built]
 │
-├── api/             # The facade the UI talks to.                        [not yet built]
-│   └── client.py    #   MinmaxClient protocol + in-process implementation
+├── api/             # The facade the UI talks to.
+│   ├── client.py    #   MinmaxClient protocol + InProcessClient + transfer objects
+│   └── format.py    #   Formatting every client must render identically
 │
-├── ui/              # PySide6 desktop app. Imports `api` and nothing else. [not yet built]
+├── ui/              # PySide6 desktop app. Imports `api` and nothing else.
+│   ├── app.py       #   Event loop entry point
+│   ├── main_window.py#  Window, navigation, the keyboard shortcut table
+│   ├── timeline_view.py# Day timeline: paint and input only
+│   ├── summary_panel.py# Category totals for the shown day
+│   ├── trends_view.py# Stacked area over days: paint and input only
+│   ├── trends_legend.py# Per-group share of the visible days
+│   └── theme.py     #   Colours derived from the system palette (light/dark)
 │
 └── cli.py           # Command-line entry point. A thin shell over the layers
-                     # above, so the feature is usable before the UI exists.
+                     # above, and how the data is reachable without a GUI.
 ```
 
 Each layer's hard rule:
@@ -255,7 +266,55 @@ added; neither the existing UI nor any backend module changes.
 
 The protocol is therefore designed as though it were already a network API:
 coarse-grained operations, serializable arguments and return values, no leaking
-of live database objects across it.
+of live database objects across it. A test walks `ui/` and fails if any module
+there mentions `storage`, `ingest`, or `analysis`, so the boundary is checked
+mechanically rather than by discipline.
+
+**Anything the UI would otherwise have to compute lives below it.** Three kinds
+of thing get pushed down, each for the same reason — a second client must not be
+able to disagree with the first, and logic hidden in a paint method is untested
+logic:
+
+- *Layout arithmetic* → `core/timeline.py`. Block positions, label thresholds,
+  and the scroll offset that keeps zoom anchored under the pointer. Free of Qt,
+  and unit-tested directly.
+- *Timezone-dependent labels* → `api`. Turning an hour boundary into a clock
+  reading needs a timezone, so `DayView` carries labelled `hour_marks`. A view
+  deriving labels from elapsed time would count to `24:00` on a fall-back day
+  when the clock actually read `01:00` twice.
+- *Colours* → `core/palette.py` plus the `group_color` table. Timecard gives
+  colour to a top-level folder so a whole branch reads as one colour, and Minmax
+  keeps that model. Colours are *assigned from the palette and stored*, not
+  hashed from the name: hashing is stable but collides, and a sorted index would
+  shift a group's colour the moment another group appeared. What is stored is a
+  palette **slot**, not a hex value, so each slot carries its own step for light
+  and dark surfaces and the palette can be re-stepped without a migration.
+
+### 8.1 Chart rules
+
+The trends chart follows a fixed set of rules rather than taste, because a chart
+is read by people and a plausible-looking wrong one is worse than none:
+
+- **At most eight categorical hues**, in a fixed assignment order, never cycled.
+  Past eight, adjacent hues stop being distinguishable under colour-vision
+  deficiency, so the tail folds into a neutral `Other` — which is not given a hue,
+  because it is not an identity.
+- **Colour follows the entity, never its rank.** The series set and its colours
+  are decided over the whole range, not the visible window, so scrolling never
+  repaints anything.
+- **The palette is validated, not eyeballed.** The eight steps clear the
+  lightness band, chroma floor, CVD separation (worst adjacent ΔE 9.1 light /
+  8.4 dark against a target of 8) and the normal-vision floor (19.6 / 19.3
+  against 15) on both surfaces. Three light steps fall below 3:1 contrast, which
+  obliges visible labels — the legend supplies them.
+- **A legend is always present**, so identity is never carried by colour alone,
+  and no value is printed on every point: the axis and the hover tooltip carry
+  detail.
+- **Solid hairline gridlines**, never dashed (dashing reads as a threshold), and
+  a 2px surface gap between stacked bands rather than borders around them.
+- **Empty days are drawn as empty.** Days with no data keep their column, and in
+  percentage mode they stay at zero rather than being stretched to fill — an
+  untracked day has no composition to show.
 
 ## 9. Roadmap → structure
 
@@ -263,8 +322,9 @@ How each goal in `AGENTS.md` lands in the structure above.
 
 | Goal | Where it lives | Needs new structure? |
 |---|---|---|
-| Import/store/retrieve timetracking | `ingest/timecard.py`, `storage/` | — |
-| UI for timetracking | `ui/`, `api/client.py` | — |
+| Import/store/retrieve timetracking ✅ | `ingest/timecard.py`, `storage/` | — |
+| UI for timetracking ✅ | `ui/`, `api/client.py` | — |
+| Trends over time ✅ | `ui/trends_view.py`, `core/trends.py` | reads `rollup` (day) |
 | Correlation engine + recommendations | `analysis/` | reads `rollup_daily` |
 | Streams beyond timetracking | one new module in `ingest/` each | — |
 | Multi-stream timeline | `ui/`, one new `api` query | — |
@@ -340,14 +400,22 @@ same path.
 
 Keyboard-first interaction is a priority, and Qt's `QAction`/`QShortcut` model
 gives fully remappable, discoverable shortcuts. Keeps the project to one
-language, and `QGraphicsView` is well suited to the zoomable multi-stream
-timeline goal.
+language, and Qt's painting is well suited to the zoomable timeline goal.
 
 *Rejected:* SwiftUI (truly native and consistent with Timecard, but a second
 toolchain and a forced HTTP boundary from day one); Textual (excellent
 keyboard story, weakest fit for the dense timeline).
 
-*Revisit if:* the timeline outgrows what `QGraphicsView` renders smoothly.
+*As built:* the day timeline is a custom-painted `QWidget` inside a
+`QScrollArea` rather than a `QGraphicsView`. One day is a single column of
+non-overlapping blocks, which needs neither a scene graph nor item picking, and
+direct painting keeps the widget to paint-and-input with all arithmetic in
+`core/timeline.py`. `QGraphicsView` remains the natural choice for the
+multi-stream timeline, where many lanes and per-item interaction do earn a
+scene.
+
+*Revisit if:* the multi-stream timeline arrives, or a day's rendering stops
+being smooth at maximum zoom.
 
 ### D4 — Facade now, HTTP later
 
