@@ -1,0 +1,43 @@
+[project]
+name = "minmax"
+version = "0.1.0"
+description = "A personal data hub: storage, retrieval, and analysis of time-bound life data."
+readme = "README.md"
+requires-python = ">=3.11"
+
+# Intentionally empty. Import, storage, and retrieval are built on the standard
+# library alone (sqlite3, csv, datetime). Analysis dependencies (polars, scipy,
+# statsmodels) and the UI dependency (PySide6) are added when those layers land,
+# so that using Minmax as a library stays cheap.
+dependencies = []
+
+[project.scripts]
+minmax = "minmax.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8.0", "ruff>=0.6", "mypy>=1.11"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/minmax"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.mypy]
+python_version = "3.11"
+packages = ["minmax"]
+mypy_path = "src"
+strict = true
+warn_unreachable = true
