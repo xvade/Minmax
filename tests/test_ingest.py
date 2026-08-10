@@ -10,7 +10,13 @@ import pytest
 from conftest import data_snapshot
 from minmax.core.models import FieldRole, FieldSpec, StreamKind
 from minmax.core.timeref import Instant, Period
-from minmax.ingest import CsvStreamImporter, TimecardCsvImporter, importer_for, run_import
+from minmax.ingest import (
+    CsvStreamImporter,
+    IntervalCsvImporter,
+    TimecardCsvImporter,
+    importer_for,
+    run_import,
+)
 from minmax.ingest.archive import sha256_of
 from minmax.storage.repository import OverlapError, Repository
 
@@ -422,6 +428,98 @@ class TestCsvStreamImporter:
         assert data_snapshot(repository.connection) == before
 
 
+class TestIntervalCsvImporter:
+    """The generic, config-driven importer for user-declared interval streams."""
+
+    def _fields(self) -> list[FieldSpec]:
+        return [
+            FieldSpec(
+                key="start", label="Start", role=FieldRole.START, source_column="session_start"
+            ),
+            FieldSpec(key="end", label="End", role=FieldRole.END, source_column="session_end"),
+            FieldSpec(
+                key="project", label="Project", role=FieldRole.CATEGORY, source_column="project"
+            ),
+            FieldSpec(key="note", label="Note", role=FieldRole.IGNORED, source_column="note"),
+        ]
+
+    def test_the_happy_rows_parse_with_derived_durations(
+        self, repository: Repository, sessions_csv: Path
+    ) -> None:
+        stream = repository.create_stream(
+            "sessions", "Sessions", StreamKind.INTERVAL, fields=self._fields()
+        )
+        assert stream.id is not None
+        importer = IntervalCsvImporter(stream.key, stream.name, repository.stream_fields(stream.id))
+        result = importer.parse(sessions_csv)
+        assert [r.category_path for r in result.records] == ["work", "break"]
+        assert [r.duration_seconds for r in result.records] == [3600, 2700]
+        assert [r.source_duration_seconds for r in result.records] == [None, None]
+
+    def test_an_inverted_row_is_rejected_not_fatal(
+        self, repository: Repository, sessions_csv: Path
+    ) -> None:
+        # IntervalRecord.__post_init__ raises a bare ValueError for an
+        # inverted span, which parse() does not catch -- the importer must
+        # pre-validate so one bad row becomes a Rejection, not an aborted
+        # import (see IntervalCsvImporter._record_from_row).
+        stream = repository.create_stream(
+            "sessions", "Sessions", StreamKind.INTERVAL, fields=self._fields()
+        )
+        assert stream.id is not None
+        importer = IntervalCsvImporter(stream.key, stream.name, repository.stream_fields(stream.id))
+        result = importer.parse(sessions_csv)
+        reasons = [r.reason for r in result.rejections]
+        assert any("before" in reason for reason in reasons)
+        assert any("empty" in reason for reason in reasons)
+        assert len(result.records) == 2
+
+    def test_an_implicit_category_is_used_when_none_is_declared(
+        self, repository: Repository, sessions_csv: Path
+    ) -> None:
+        fields = [f for f in self._fields() if f.role is not FieldRole.CATEGORY]
+        stream = repository.create_stream(
+            "sessions", "Sessions", StreamKind.INTERVAL, fields=fields
+        )
+        assert stream.id is not None
+        importer = IntervalCsvImporter(stream.key, stream.name, repository.stream_fields(stream.id))
+        result = importer.parse(sessions_csv)
+        assert all(r.category_path == "sessions" for r in result.records)
+
+    def test_exclusive_reflects_the_stream_flag(self, repository: Repository) -> None:
+        stream = repository.create_stream(
+            "sessions", "Sessions", StreamKind.INTERVAL, exclusive=True, fields=self._fields()
+        )
+        assert stream.id is not None
+        importer = IntervalCsvImporter(
+            stream.key, stream.name, repository.stream_fields(stream.id), exclusive=stream.exclusive
+        )
+        assert importer.stream_exclusive is True
+
+    def test_missing_start_or_end_role_is_rejected_at_construction(
+        self, repository: Repository
+    ) -> None:
+        fields = [f for f in self._fields() if f.role is not FieldRole.END]
+        stream = repository.create_stream(
+            "sessions", "Sessions", StreamKind.INTERVAL, fields=fields
+        )
+        assert stream.id is not None
+        with pytest.raises(ValueError, match="role 'end'"):
+            IntervalCsvImporter(stream.key, stream.name, repository.stream_fields(stream.id))
+
+    def test_a_number_role_is_rejected_at_construction(self, repository: Repository) -> None:
+        fields = [
+            *self._fields(),
+            FieldSpec(key="cost", label="Cost", role=FieldRole.NUMBER, source_column="cost"),
+        ]
+        stream = repository.create_stream(
+            "sessions", "Sessions", StreamKind.INTERVAL, fields=fields
+        )
+        assert stream.id is not None
+        with pytest.raises(ValueError, match="cannot store value columns"):
+            IntervalCsvImporter(stream.key, stream.name, repository.stream_fields(stream.id))
+
+
 class TestImporterFor:
     def test_a_hardcoded_stream_resolves_without_being_created_first(
         self, repository: Repository
@@ -432,12 +530,10 @@ class TestImporterFor:
         with pytest.raises(LookupError, match="create it first"):
             importer_for(repository, "nonexistent")
 
-    def test_an_interval_stream_is_refused_by_the_generic_path(
-        self, repository: Repository
-    ) -> None:
-        repository.ensure_stream("calendar", "Calendar", StreamKind.INTERVAL)
-        with pytest.raises(ValueError, match="point-in-time"):
-            importer_for(repository, "calendar")
+    def test_a_sample_stream_is_refused_by_the_generic_path(self, repository: Repository) -> None:
+        repository.ensure_stream("cpu", "CPU load", StreamKind.SAMPLE)
+        with pytest.raises(ValueError, match="point-in-time and interval"):
+            importer_for(repository, "cpu")
 
     def test_a_declared_event_stream_resolves_to_the_generic_importer(
         self, repository: Repository
@@ -451,3 +547,27 @@ class TestImporterFor:
             ],
         )
         assert isinstance(importer_for(repository, "pickups"), CsvStreamImporter)
+
+    def test_a_declared_interval_stream_resolves_to_the_generic_importer(
+        self, repository: Repository
+    ) -> None:
+        repository.create_stream(
+            "sessions",
+            "Sessions",
+            StreamKind.INTERVAL,
+            fields=[
+                FieldSpec(key="start", label="Start", role=FieldRole.START, source_column="start"),
+                FieldSpec(key="end", label="End", role=FieldRole.END, source_column="end"),
+            ],
+        )
+        assert isinstance(importer_for(repository, "sessions"), IntervalCsvImporter)
+
+    def test_an_interval_stream_with_no_declared_fields_fails_to_build_an_importer(
+        self, repository: Repository
+    ) -> None:
+        # ensure_stream (the auto-create path run_import uses) never declares
+        # fields, so a hand-created interval stream with none is exactly the
+        # same shape as one nobody ran `stream add` for.
+        repository.ensure_stream("calendar", "Calendar", StreamKind.INTERVAL)
+        with pytest.raises(ValueError, match="role 'start'"):
+            importer_for(repository, "calendar")

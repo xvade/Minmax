@@ -149,6 +149,30 @@ class Repository:
                 )
         return Stream(key=key, name=name, kind=kind, exclusive=exclusive, id=stream_id)
 
+    def delete_stream(self, key: str) -> Stream:
+        """Permanently delete a stream and everything derived from it.
+
+        Every table below ``stream`` -- categories, records, values, rollups,
+        ``stream_field``, import runs -- declares ``REFERENCES stream (id) ON
+        DELETE CASCADE``, and foreign keys are on for every connection (see
+        ``storage/database.py``). So one ``DELETE`` is the entire operation:
+        there is no cascade to hand-roll and, unlike :meth:`revert_import`, no
+        rollup to rebuild afterward, since nothing of the stream is left for a
+        rollup to be wrong about.
+
+        Archived raw files under ``home/archive/<key>/`` are deliberately left
+        on disk: :func:`~minmax.ingest.archive.archive_file`'s own contract is
+        "never modified or overwritten, only added," and keeping them lets the
+        same source be re-imported if the stream is ever recreated.
+        """
+        with transaction(self._conn) as conn:
+            row = conn.execute("SELECT * FROM stream WHERE key = ?", (key,)).fetchone()
+            if row is None:
+                raise LookupError(f"no stream {key!r}")
+            stream = _stream_from_row(row)
+            conn.execute("DELETE FROM stream WHERE id = ?", (stream.id,))
+        return stream
+
     def set_stream_watch(self, stream_id: int, *, path: str | None, enabled: bool) -> None:
         """Turn a stream's per-minute auto-fetch on or off.
 

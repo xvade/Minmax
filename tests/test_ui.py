@@ -28,18 +28,24 @@ from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
 
 from minmax.api import (
     MAX_INTERVAL_COUNT,
+    Aggregate,
+    CorrelationRow,
     Granularity,
     InProcessClient,
     Interval,
     MinmaxClient,
+    StreamKind,
     TimelineRecord,
     TimelineWindow,
+    TrendMetric,
 )
+from minmax.core.models import Stream
 from minmax.core.palette import swatch_for_slot
 from minmax.core.timeline import DEFAULT_PIXELS_PER_HOUR, MAX_PIXELS_PER_HOUR
 from minmax.ingest import TimecardCsvImporter, run_import
 from minmax.storage.repository import Repository
 from minmax.ui import shortcuts as bindings
+from minmax.ui.correlations_view import CorrelationsTable
 from minmax.ui.dialogs import IntervalDialog
 from minmax.ui.main_window import MAX_WINDOW_DAYS, MainWindow
 from minmax.ui.timeline_view import Timeline
@@ -467,6 +473,14 @@ class TestShortcutWiring:
     ) -> None:
         assert callable(getattr(window.trends_screen, action.name))
 
+    @pytest.mark.parametrize(
+        "action", bindings.actions_in(bindings.CORRELATIONS), ids=lambda a: a.name
+    )
+    def test_every_correlations_action_binds_to_a_real_method(
+        self, window: MainWindow, action: bindings.Action
+    ) -> None:
+        assert callable(getattr(window.correlations_screen, action.name))
+
     @pytest.mark.parametrize("action", bindings.actions_in(bindings.GLOBAL), ids=lambda a: a.name)
     def test_every_global_action_binds_to_a_real_method(
         self, window: MainWindow, action: bindings.Action
@@ -477,6 +491,7 @@ class TestShortcutWiring:
         for screen, scope in (
             (window.day_screen, bindings.DAY),
             (window.trends_screen, bindings.TRENDS),
+            (window.correlations_screen, bindings.CORRELATIONS),
         ):
             bound = {
                 action.shortcut().toString()
@@ -488,9 +503,12 @@ class TestShortcutWiring:
     def test_screen_actions_are_scoped_not_global(self, window: MainWindow) -> None:
         from PySide6.QtCore import Qt as _Qt
 
-        for action in window.trends_screen.actions():
-            if not action.shortcut().isEmpty():
-                assert action.shortcutContext() == _Qt.ShortcutContext.WidgetWithChildrenShortcut
+        for screen in (window.trends_screen, window.correlations_screen):
+            for action in screen.actions():
+                if not action.shortcut().isEmpty():
+                    assert (
+                        action.shortcutContext() == _Qt.ShortcutContext.WidgetWithChildrenShortcut
+                    )
 
 
 class TestRemappableShortcuts:
@@ -678,6 +696,213 @@ class TestTrendsScreen:
         assert blank.trends_screen.chart.geometry_model() is None
 
 
+class TestCorrelationsTable:
+    """Isolated from a full window -- just the table's own contract."""
+
+    def _row(self, x_key: str, y_key: str, r: float) -> CorrelationRow:
+        return CorrelationRow(
+            x_key=x_key,
+            x_label=x_key,
+            y_key=y_key,
+            y_label=y_key,
+            interval_label="week",
+            n=10,
+            r=r,
+            p_value=0.01,
+            q_value=0.02,
+            stability=1.0,
+            consistent_sign=True,
+            first_period=date(2026, 1, 5),
+            last_period=date(2026, 3, 2),
+        )
+
+    def test_sorting_by_r_is_numeric_not_lexical(self, qt_app: QApplication) -> None:
+        # "0.70" would sort after "0.90" character by character if the table
+        # compared displayed text -- this is exactly why _NumericItem exists.
+        table = CorrelationsTable()
+        table.set_rows([self._row("a", "b", 0.90), self._row("c", "d", 0.70)])
+
+        table.sortItems(0)  # column 0 is "r", ascending by default
+
+        # Both rows' q=0.02 clears the notable-q flag threshold, hence "*".
+        assert table.item(0, 0).text() == "+0.70*"
+        assert table.item(1, 0).text() == "+0.90*"
+
+    def test_a_notable_q_is_flagged_and_a_perfect_stability_is_blank(
+        self, qt_app: QApplication
+    ) -> None:
+        table = CorrelationsTable()
+        table.set_rows([self._row("a", "b", 0.9)])
+        assert table.item(0, 0).text() == "+0.90*"  # q=0.02 clears the 0.10 flag threshold
+        assert table.item(0, 6).text() == ""  # stability=1.0, consistent_sign=True
+
+    def test_caveats_become_the_row_tooltip(self, qt_app: QApplication) -> None:
+        from dataclasses import replace
+
+        table = CorrelationsTable()
+        row = replace(self._row("a", "b", 0.9), caveats=("a note",))
+        table.set_rows([row])
+        assert table.item(0, 4).toolTip() == "a note"
+
+
+class TestCorrelationsScreen:
+    """The statistics are pinned down in ``tests/test_analysis_*.py`` and
+    ``tests/test_api.py``; what matters here is wiring -- switching to the
+    screen, lazy loading, the controls actually changing what is requested,
+    and the missing-scipy path showing a message rather than crashing.
+    """
+
+    @pytest.fixture
+    def correlated_window(
+        self, qt_app: QApplication, repository: Repository, home: Path
+    ) -> MainWindow:
+        """Two streams whose durations/counts are an exact linear function of
+        the same day index -- enough to clear every gate at daily
+        granularity, deterministically. Mirrors ``tests/test_api.py``'s
+        ``TestCorrelations.two_correlated_streams`` fixture."""
+        from minmax.core.models import EventRecord, IntervalRecord, StreamKind
+        from minmax.core.timeref import Instant
+
+        a = repository.ensure_stream("focus", "Focus", StreamKind.INTERVAL)
+        b = repository.ensure_stream("commits", "Commits", StreamKind.EVENT)
+        assert a.id is not None
+        assert b.id is not None
+        run_a = repository.begin_import(
+            a.id, importer="test", source_name="a.csv", source_sha256="a" * 64, archived_path=None
+        )
+        run_b = repository.begin_import(
+            b.id, importer="test", source_name="b.csv", source_sha256="b" * 64, archived_path=None
+        )
+
+        start = date(2026, 3, 2)
+        intervals = []
+        events = []
+        for i in range(20):
+            day = start + timedelta(days=i)
+            begin = datetime.combine(day, datetime.min.time()).replace(hour=9)
+            end = begin + timedelta(seconds=600 + 60 * i)  # linear in i
+            intervals.append(
+                IntervalRecord(
+                    category_source_id="work",
+                    category_path="work",
+                    start=Instant.from_iso(begin.strftime("%Y-%m-%dT%H:%M:%S") + "-07:00"),
+                    end=Instant.from_iso(end.strftime("%Y-%m-%dT%H:%M:%S") + "-07:00"),
+                )
+            )
+            for minute in range(2 + i):  # linear in i, same slope sign
+                at = datetime.combine(day, datetime.min.time()).replace(hour=8) + timedelta(
+                    minutes=minute
+                )
+                events.append(
+                    EventRecord(
+                        category_source_id="repo",
+                        category_path="repo",
+                        at=Instant.from_iso(at.strftime("%Y-%m-%dT%H:%M:%S") + "-07:00"),
+                    )
+                )
+        repository.insert_intervals(a, run_a, intervals)
+        repository.insert_events(b, run_b, events)
+
+        client = InProcessClient(repository, home=home)
+        return MainWindow(client, stream_key="focus")
+
+    @pytest.fixture
+    def shown_correlated_window(self, correlated_window: MainWindow) -> MainWindow:
+        correlated_window.resize(900, 600)
+        correlated_window.show()
+        return correlated_window
+
+    def test_switching_screens_shows_it(self, correlated_window: MainWindow) -> None:
+        assert correlated_window.current_screen is correlated_window.day_screen
+        correlated_window.show_correlations_screen()
+        assert correlated_window.current_screen is correlated_window.correlations_screen
+        correlated_window.show_day_screen()
+        assert correlated_window.current_screen is correlated_window.day_screen
+
+    def test_it_does_not_run_the_sweep_until_first_shown(
+        self, correlated_window: MainWindow
+    ) -> None:
+        assert correlated_window.correlations_screen.table.rowCount() == 0
+        correlated_window.show_correlations_screen()
+        assert correlated_window.correlations_screen.table.rowCount() >= 1
+
+    def test_the_correlated_pair_appears_with_the_right_labels(
+        self, correlated_window: MainWindow
+    ) -> None:
+        correlated_window.show_correlations_screen()
+        table = correlated_window.correlations_screen.table
+        assert table.rowCount() >= 1
+        labels = {table.item(0, 4).text(), table.item(0, 5).text()}
+        assert labels == {"focus duration", "commits count"}
+
+    def test_controls_change_what_is_requested(
+        self, correlated_window: MainWindow, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        correlated_window.show_correlations_screen()
+        screen = correlated_window.correlations_screen
+        calls: list[dict[str, object]] = []
+        original = screen._client.correlations
+
+        def spy(**kwargs: object) -> object:
+            calls.append(kwargs)
+            return original(**kwargs)
+
+        monkeypatch.setattr(screen._client, "correlations", spy)
+
+        screen._per_category.setChecked(True)
+        assert calls[-1]["per_category"] is True
+
+        screen._min_r.setValue(0.75)
+        assert calls[-1]["min_r"] == pytest.approx(0.75)
+
+    def test_missing_scipy_shows_a_message_not_a_crash(
+        self, correlated_window: MainWindow, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import builtins
+
+        real_import = builtins.__import__
+
+        def fake_import(name: str, *args: object, **kwargs: object) -> object:
+            if name == "scipy":
+                raise ImportError("no module named scipy")
+            return real_import(name, *args, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+
+        correlated_window.show_correlations_screen()
+        screen = correlated_window.correlations_screen
+        assert screen.table.rowCount() == 0
+        assert "analysis extra" in screen._footer_label.text()
+
+    def test_mark_dirty_reloads_immediately_while_visible(
+        self, shown_correlated_window: MainWindow
+    ) -> None:
+        window = shown_correlated_window
+        window.show_correlations_screen()
+        screen = window.correlations_screen
+        assert screen.table.rowCount() >= 1
+
+        screen.table.set_rows([])
+        screen.mark_dirty()
+        assert screen.table.rowCount() >= 1
+
+    def test_mark_dirty_defers_reload_while_hidden(
+        self, shown_correlated_window: MainWindow
+    ) -> None:
+        window = shown_correlated_window
+        window.show_correlations_screen()
+        screen = window.correlations_screen
+        assert screen.table.rowCount() >= 1
+
+        window.show_day_screen()  # correlations screen is no longer the visible one
+        screen.table.set_rows([])
+        screen.mark_dirty()
+        assert screen.table.rowCount() == 0  # not reloaded while hidden
+
+        window.show_correlations_screen()  # becoming visible again reloads it
+        assert screen.table.rowCount() >= 1
+
+
 class TestTrendsInterval:
     def test_cycling_walks_auto_day_week_month(self, window: MainWindow) -> None:
         screen = window.trends_screen
@@ -802,15 +1027,25 @@ class TestAxisLabel:
     rounding bug it once had (a small count ceiling showed the same label on
     two different gridlines) has a test that does not need a display."""
 
+    _COUNT = TrendMetric(label="Count")
+    _DURATION = TrendMetric(label="Duration")
+    _FIELD = TrendMetric(label="Reading average", field_key="value", unit="pt")
+
     def test_a_duration_axis_never_shows_seconds_at_zero(self) -> None:
         from minmax.ui.trends_view import _axis_label
 
-        assert _axis_label(0.0, normalised=False, is_event=False) == "0"
+        label = _axis_label(
+            0.0, normalised=False, metric=self._DURATION, stream_kind=StreamKind.INTERVAL
+        )
+        assert label == "0"
 
     def test_a_percentage_axis_is_a_bare_percent(self) -> None:
         from minmax.ui.trends_view import _axis_label
 
-        assert _axis_label(0.5, normalised=True, is_event=False) == "50%"
+        label = _axis_label(
+            0.5, normalised=True, metric=self._DURATION, stream_kind=StreamKind.INTERVAL
+        )
+        assert label == "50%"
 
     def test_a_count_axis_shows_distinct_labels_at_half_integer_gridlines(self) -> None:
         # The regression: round(1.5) == round(2.0) == 2 via round-half-to-even,
@@ -819,7 +1054,13 @@ class TestAxisLabel:
 
         ceiling = 2.0
         labels = [
-            _axis_label(ceiling * step / 4, normalised=False, is_event=True) for step in range(5)
+            _axis_label(
+                ceiling * step / 4,
+                normalised=False,
+                metric=self._COUNT,
+                stream_kind=StreamKind.EVENT,
+            )
+            for step in range(5)
         ]
         assert labels == ["0", "0.5", "1", "1.5", "2"]
         assert len(set(labels)) == len(labels)
@@ -827,7 +1068,18 @@ class TestAxisLabel:
     def test_a_duration_axis_still_uses_hour_minute_form(self) -> None:
         from minmax.ui.trends_view import _axis_label
 
-        assert _axis_label(2 * 3600.0, normalised=False, is_event=False) == "2h"
+        label = _axis_label(
+            2 * 3600.0, normalised=False, metric=self._DURATION, stream_kind=StreamKind.INTERVAL
+        )
+        assert label == "2h"
+
+    def test_a_field_metric_axis_uses_its_unit(self) -> None:
+        from minmax.ui.trends_view import _axis_label
+
+        label = _axis_label(
+            72.0, normalised=False, metric=self._FIELD, stream_kind=StreamKind.EVENT
+        )
+        assert label == "72 pt"
 
 
 class TestTrendsRendering:
@@ -1229,7 +1481,8 @@ class TestNewStreamDialog:
     def test_selection_returns_the_edited_roles_not_just_the_guess(
         self, window: MainWindow, heart_rate_csv: Path
     ) -> None:
-        from minmax.api import FieldRole
+        from minmax.api import FieldRole, StreamKind
+        from minmax.ui.dialogs import _ROLES_FOR_KIND
 
         dialog = self._dialog(window)
         dialog._path = heart_rate_csv
@@ -1239,15 +1492,76 @@ class TestNewStreamDialog:
         dialog._sync_key_from_name()
 
         # bpm was guessed as text (the fixture has one bad row); override it.
+        roles = _ROLES_FOR_KIND[StreamKind.EVENT]
         bpm_combo = dialog._fields_table.cellWidget(1, 1)
-        bpm_combo.setCurrentIndex(list(FieldRole).index(FieldRole.NUMBER))
+        bpm_combo.setCurrentIndex(roles.index(FieldRole.NUMBER))
 
-        key, name, fields, path = dialog.selection()
-        assert key == "heart_rate"
-        assert name == "Heart Rate"
-        assert path == heart_rate_csv
-        bpm_field = next(f for f in fields if f.source_column == "bpm")
+        choice = dialog.selection()
+        assert choice.key == "heart_rate"
+        assert choice.name == "Heart Rate"
+        assert choice.kind is StreamKind.EVENT
+        assert choice.path == heart_rate_csv
+        bpm_field = next(f for f in choice.fields if f.source_column == "bpm")
         assert bpm_field.role is FieldRole.NUMBER
+
+    def test_switching_kind_to_interval_reguesses_start_and_end(
+        self, window: MainWindow, sessions_csv: Path
+    ) -> None:
+        from minmax.api import FieldRole
+
+        dialog = self._dialog(window)
+        dialog._path = sessions_csv
+        assert dialog._exclusive.isHidden()
+
+        dialog._kind.setCurrentIndex(1)  # Interval
+
+        assert not dialog._exclusive.isHidden()
+        assert dialog._preview is not None and dialog._preview.ok
+        assert dialog._fields_table.rowCount() == 4
+        assert dialog._fields_table.item(0, 0).text() == "session_start"
+
+        fields = dialog._current_fields()
+        start_field = next(f for f in fields if f.source_column == "session_start")
+        end_field = next(f for f in fields if f.source_column == "session_end")
+        assert start_field.role is FieldRole.START
+        assert end_field.role is FieldRole.END
+
+        # Switching back to Event hides the checkbox again and re-guesses
+        # under the event shape (nothing here looks like a single instant
+        # column, so nothing is guessed AT -- the dialog should not crash).
+        dialog._kind.setCurrentIndex(0)
+        assert dialog._exclusive.isHidden()
+
+    def test_interval_kind_is_invalid_until_start_and_end_are_set(
+        self, window: MainWindow, sessions_csv: Path
+    ) -> None:
+        dialog = self._dialog(window)
+        dialog._path = sessions_csv
+        dialog._kind.setCurrentIndex(1)  # Interval
+        dialog._name.setText("Sessions")
+        dialog._sync_key_from_name()
+        assert dialog._is_valid()
+
+        from minmax.api import FieldRole
+        from minmax.ui.dialogs import _ROLES_FOR_KIND
+
+        roles = _ROLES_FOR_KIND[dialog._current_kind()]
+        end_combo = dialog._fields_table.cellWidget(1, 1)
+        end_combo.setCurrentIndex(roles.index(FieldRole.IGNORED))
+        assert not dialog._is_valid(), "no end column declared anymore"
+
+    def test_exclusive_checkbox_reaches_the_selection(
+        self, window: MainWindow, sessions_csv: Path
+    ) -> None:
+        dialog = self._dialog(window)
+        dialog._path = sessions_csv
+        dialog._kind.setCurrentIndex(1)  # Interval
+        dialog._name.setText("Sessions")
+        dialog._sync_key_from_name()
+
+        assert dialog.selection().exclusive is False
+        dialog._exclusive.setChecked(True)
+        assert dialog.selection().exclusive is True
 
 
 class TestPromptForNewStream:
@@ -1260,15 +1574,21 @@ class TestPromptForNewStream:
         window: MainWindow,
         pickups_csv: Path,
     ) -> None:
-        from minmax.api import FieldRole, FieldSpec
-        from minmax.ui.dialogs import NewStreamDialog
+        from minmax.api import FieldRole, FieldSpec, StreamKind
+        from minmax.ui.dialogs import NewStreamChoice, NewStreamDialog
         from minmax.ui.main_window import MainWindow as MainWindowClass
 
         fields = [FieldSpec(key="at", label="Time", role=FieldRole.AT, source_column="occurred_at")]
-        monkeypatch.setattr(NewStreamDialog, "exec", lambda self: 1)
-        monkeypatch.setattr(
-            NewStreamDialog, "selection", lambda self: ("pickups", "Pickups", fields, pickups_csv)
+        choice = NewStreamChoice(
+            key="pickups",
+            name="Pickups",
+            kind=StreamKind.EVENT,
+            exclusive=False,
+            fields=fields,
+            path=pickups_csv,
         )
+        monkeypatch.setattr(NewStreamDialog, "exec", lambda self: 1)
+        monkeypatch.setattr(NewStreamDialog, "selection", lambda self: choice)
         monkeypatch.setattr(QMessageBox, "information", lambda *a, **k: None)
         assert isinstance(window, MainWindowClass)
 
@@ -1287,14 +1607,20 @@ class TestPromptForNewStream:
     def test_a_duplicate_key_warns_without_switching(
         self, monkeypatch: pytest.MonkeyPatch, window: MainWindow, pickups_csv: Path
     ) -> None:
-        from minmax.api import FieldRole, FieldSpec
-        from minmax.ui.dialogs import NewStreamDialog
+        from minmax.api import FieldRole, FieldSpec, StreamKind
+        from minmax.ui.dialogs import NewStreamChoice, NewStreamDialog
 
         fields = [FieldSpec(key="at", label="Time", role=FieldRole.AT, source_column="occurred_at")]
-        monkeypatch.setattr(NewStreamDialog, "exec", lambda self: 1)
-        monkeypatch.setattr(
-            NewStreamDialog, "selection", lambda self: ("timecard", "Timecard", fields, pickups_csv)
+        choice = NewStreamChoice(
+            key="timecard",
+            name="Timecard",
+            kind=StreamKind.EVENT,
+            exclusive=False,
+            fields=fields,
+            path=pickups_csv,
         )
+        monkeypatch.setattr(NewStreamDialog, "exec", lambda self: 1)
+        monkeypatch.setattr(NewStreamDialog, "selection", lambda self: choice)
         warnings: list[tuple[object, ...]] = []
         monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: warnings.append(a))
 
@@ -1303,6 +1629,100 @@ class TestPromptForNewStream:
         assert len(warnings) == 1
         assert "already exists" in warnings[0][-1]
         assert window._stream_key == "timecard"
+
+    def test_an_interval_choice_creates_an_exclusive_interval_stream(
+        self, monkeypatch: pytest.MonkeyPatch, window: MainWindow, sessions_csv: Path
+    ) -> None:
+        from minmax.api import FieldRole, FieldSpec, StreamKind
+        from minmax.ui.dialogs import NewStreamChoice, NewStreamDialog
+
+        fields = [
+            FieldSpec(
+                key="start", label="Start", role=FieldRole.START, source_column="session_start"
+            ),
+            FieldSpec(key="end", label="End", role=FieldRole.END, source_column="session_end"),
+        ]
+        choice = NewStreamChoice(
+            key="sessions",
+            name="Sessions",
+            kind=StreamKind.INTERVAL,
+            exclusive=True,
+            fields=fields,
+            path=sessions_csv,
+        )
+        monkeypatch.setattr(NewStreamDialog, "exec", lambda self: 1)
+        monkeypatch.setattr(NewStreamDialog, "selection", lambda self: choice)
+        monkeypatch.setattr(QMessageBox, "information", lambda *a, **k: None)
+
+        window.prompt_for_new_stream()
+
+        assert window._stream_key == "sessions"
+        summary = next(s for s in window._client.streams() if s.key == "sessions")
+        assert summary.kind == "interval"
+        assert summary.exclusive is True
+
+
+class TestPromptToDeleteStream:
+    """``MainWindow.prompt_to_delete_stream`` -- deletes whatever the picker
+    currently shows, after confirming."""
+
+    def test_refuses_when_only_one_stream_remains(
+        self, monkeypatch: pytest.MonkeyPatch, window: MainWindow
+    ) -> None:
+        # The `window` fixture starts with exactly one stream ("timecard").
+        warnings: list[tuple[object, ...]] = []
+        monkeypatch.setattr(
+            QMessageBox,
+            "warning",
+            lambda *a, **k: warnings.append(a) or QMessageBox.StandardButton.Ok,
+        )
+
+        window.prompt_to_delete_stream()
+
+        assert len(warnings) == 1
+        assert "only one stream" in warnings[0][2]
+        assert [s.key for s in window._client.streams()] == ["timecard"]
+
+    def test_cancelling_the_confirmation_deletes_nothing(
+        self, monkeypatch: pytest.MonkeyPatch, window: MainWindow
+    ) -> None:
+        from minmax.api import StreamKind
+
+        window._client.create_stream("pickups", "Pickups", StreamKind.EVENT)
+        monkeypatch.setattr(
+            QMessageBox, "warning", lambda *a, **k: QMessageBox.StandardButton.Cancel
+        )
+
+        window.prompt_to_delete_stream()
+
+        assert {s.key for s in window._client.streams()} == {"timecard", "pickups"}
+        assert window._stream_key == "timecard"
+
+    def test_confirming_deletes_and_switches_to_a_remaining_stream(
+        self, monkeypatch: pytest.MonkeyPatch, window: MainWindow
+    ) -> None:
+        from minmax.api import StreamKind
+
+        window._client.create_stream("pickups", "Pickups", StreamKind.EVENT)
+        monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: QMessageBox.StandardButton.Yes)
+
+        window.prompt_to_delete_stream()
+
+        assert {s.key for s in window._client.streams()} == {"pickups"}
+        assert window._stream_key == "pickups"
+
+    def test_confirming_marks_the_correlations_screen_dirty(
+        self, monkeypatch: pytest.MonkeyPatch, window: MainWindow
+    ) -> None:
+        from minmax.api import StreamKind
+
+        window._client.create_stream("pickups", "Pickups", StreamKind.EVENT)
+        monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: QMessageBox.StandardButton.Yes)
+        window.correlations_screen._dirty = False
+
+        window.prompt_to_delete_stream()
+
+        assert window.correlations_screen._dirty is True
 
 
 @pytest.fixture
@@ -1368,7 +1788,7 @@ class TestEventStreamRendering:
     def test_the_trends_chart_ceiling_has_no_24_hour_style_cap(
         self, event_window: MainWindow
     ) -> None:
-        from minmax.core.trends import nice_count_ceiling
+        from minmax.core.trends import nice_value_ceiling
 
         event_window.show_trends_screen()
         chart = event_window.trends_screen.chart
@@ -1377,11 +1797,226 @@ class TestEventStreamRendering:
 
         geometry = chart.geometry_model()
         assert geometry is not None
-        assert geometry.max_value == nice_count_ceiling(chart._view.peak_daily_seconds)
+        assert geometry.max_value == nice_value_ceiling(chart._view.peak_plot_value)
 
     def test_the_legend_reports_counts_not_durations(self, event_window: MainWindow) -> None:
         event_window.show_trends_screen()
         screen = event_window.trends_screen
-        [total] = screen.chart.window_totals_seconds()
+        [total] = screen.chart.window_values()
         assert total == 2
         assert screen.legend._stream_kind.value == "event"
+
+
+@pytest.fixture
+def readings_window(window: MainWindow, readings_stream: Stream) -> MainWindow:
+    """The ``window`` fixture, switched to ``readings_stream`` -- a
+    numeric-field event stream with two categories and a real gap in one of
+    them, for exercising the trends metric dropdown and its line-mode path.
+    """
+    window._refresh_stream_picker()
+    window.set_stream(readings_stream.key)
+    window.show_trends_screen()
+    return window
+
+
+class TestTrendMetricSelector:
+    """The metric dropdown a numeric-field stream gets on the trends screen,
+    and the unstacked-line rendering an average selects. See the
+    ``readings_stream`` fixture's docstring for why it, not ``heart_rate``,
+    is what can exercise a per-category gap and a value-weighted mean.
+    """
+
+    def test_the_combo_is_hidden_for_a_stream_with_nothing_to_choose(
+        self, window: MainWindow
+    ) -> None:
+        # "window" opens on timecard, an interval stream -- no metric choice.
+        assert window.trends_screen._controls_bar.isHidden()
+
+    def test_the_combo_is_populated_for_a_numeric_field_stream(
+        self, readings_window: MainWindow
+    ) -> None:
+        screen = readings_window.trends_screen
+        assert not screen._controls_bar.isHidden()
+        combo = screen._metric_combo
+        labels = [combo.itemText(i) for i in range(combo.count())]
+        assert labels == ["Count", "Reading total", "Reading average"]
+        assert combo.currentIndex() == 0
+
+    def test_choosing_an_entry_reloads_with_that_metric(self, readings_window: MainWindow) -> None:
+        screen = readings_window.trends_screen
+        screen._metric_combo.setCurrentIndex(2)  # "Reading average"
+        assert screen._field_key == "value"
+        assert screen._aggregate is Aggregate.MEAN
+        assert screen._view.metric.label == "Reading average"
+
+    def test_cycle_metric_steps_through_and_wraps(self, readings_window: MainWindow) -> None:
+        screen = readings_window.trends_screen
+        seen = []
+        for _ in range(4):
+            seen.append(screen._view.metric.label)
+            screen.cycle_metric()
+        assert seen == ["Count", "Reading total", "Reading average", "Count"]
+
+    def test_cycle_metric_does_nothing_for_a_stream_with_no_choice(
+        self, window: MainWindow
+    ) -> None:
+        screen = window.trends_screen
+        before = screen._view.metric
+        screen.cycle_metric()
+        assert screen._view.metric == before
+
+    def test_switching_streams_resets_the_metric_to_count(
+        self, readings_window: MainWindow
+    ) -> None:
+        screen = readings_window.trends_screen
+        screen.cycle_metric()
+        assert screen._field_key is not None
+
+        readings_window.set_stream("timecard")
+        assert screen._field_key is None
+        assert screen._aggregate is Aggregate.SUM
+
+    def test_selecting_average_leaves_bands_empty_and_draws_lines(
+        self, readings_window: MainWindow
+    ) -> None:
+        screen = readings_window.trends_screen
+        screen.set_metric("value", Aggregate.MEAN)
+        chart = screen.chart
+        assert chart._bands == []
+        assert chart._lines
+
+        # phone recorded nothing on day 3 -- a genuine gap, not a zero.
+        labels = [series.label for series in chart._view.series]
+        phone_line = chart._lines[labels.index("phone")]
+        assert phone_line[-1] is None
+        assert None not in chart._lines[labels.index("watch")]
+
+    def test_normalised_view_is_refused_for_a_mean_metric(
+        self, readings_window: MainWindow
+    ) -> None:
+        screen = readings_window.trends_screen
+        screen.set_metric("value", Aggregate.MEAN)
+        chart = screen.chart
+        chart.set_normalised(True)
+        assert not chart.normalised
+
+    def test_the_legend_drops_shares_for_a_mean_metric(self, readings_window: MainWindow) -> None:
+        screen = readings_window.trends_screen
+        screen.set_metric("value", Aggregate.MEAN)
+        assert screen.legend._metric.label == "Reading average"
+        assert not screen.legend._metric.stacks
+        assert screen.chart.window_shares() == []
+
+
+@pytest.fixture
+def many_categories_window(window: MainWindow, repository: Repository) -> MainWindow:
+    """The ``window`` fixture (already on 'timecard', with 3 categories from
+    ``sample_csv``), with enough extra categories added on a day of their
+    own that the default ``max_series=8`` folds some into "Other" -- real
+    GUI coverage for double-clicking it, rather than only the data-layer
+    coverage in ``tests/test_trends.py``.
+    """
+    from minmax.core.models import IntervalRecord
+    from minmax.core.timeref import Instant
+
+    stream = repository.get_stream("timecard")
+    assert stream is not None and stream.id is not None
+    run = repository.begin_import(
+        stream.id,
+        importer="test",
+        source_name="extra.csv",
+        source_sha256="e" * 64,
+        archived_path=None,
+    )
+    # A day the sample export never touches, so nothing here can collide
+    # with it under timecard's exclusive (non-overlapping) constraint.
+    records = [
+        IntervalRecord(
+            category_source_id=f"extra{i}",
+            category_path=f"extra{i}",
+            start=Instant.from_iso(f"2026-06-10T{i:02d}:00:00-07:00"),
+            end=Instant.from_iso(f"2026-06-10T{i:02d}:30:00-07:00"),
+        )
+        for i in range(20)  # enough that the fold itself needs folding too
+    ]
+    repository.insert_intervals(stream, run, records)
+    window.trends_screen.reload()
+    return window
+
+
+class TestOtherBreakdown:
+    """Double-clicking "Other" shows what got folded into it -- the desktop
+    counterpart of ``tests/test_trends.py``'s ``TestOtherBreakdown``, which
+    covers the data ``TrendsScreen`` is driven by here."""
+
+    def test_a_stream_with_more_than_max_series_categories_folds_one(
+        self, many_categories_window: MainWindow
+    ) -> None:
+        view = many_categories_window.trends_screen._view
+        other = [s for s in view.series if s.is_other]
+        assert len(other) == 1
+        assert other[0].members
+
+    def test_double_clicking_other_shows_its_members_without_a_query(
+        self, many_categories_window: MainWindow
+    ) -> None:
+        screen = many_categories_window.trends_screen
+        other = next(s for s in screen._view.series if s.is_other)
+        member_labels = [m.label for m in other.members]
+
+        screen._on_series_activated(other.label)
+
+        assert [s.label for s in screen._view.series] == member_labels
+        assert "Other" in screen._title()
+
+    def test_double_clicking_a_real_series_still_focuses_it(
+        self, many_categories_window: MainWindow
+    ) -> None:
+        screen = many_categories_window.trends_screen
+        real = next(s for s in screen._view.series if not s.is_other)
+
+        screen._on_series_activated(real.label)
+
+        assert screen.prefix == real.label
+
+    def test_escape_restores_the_view_from_before_the_breakdown(
+        self, many_categories_window: MainWindow
+    ) -> None:
+        screen = many_categories_window.trends_screen
+        before = [s.label for s in screen._view.series]
+        other = next(s for s in screen._view.series if s.is_other)
+
+        screen.push_other(other.label)
+        assert [s.label for s in screen._view.series] != before
+
+        screen.pop_focus()
+        assert [s.label for s in screen._view.series] == before
+
+    def test_a_nested_other_can_be_drilled_into_again(
+        self, many_categories_window: MainWindow
+    ) -> None:
+        screen = many_categories_window.trends_screen
+        other = next(s for s in screen._view.series if s.is_other)
+        nested = next((m for m in other.members if m.is_other), None)
+        if nested is None:
+            pytest.skip("this fixture's fold isn't deep enough to nest")
+
+        screen.push_other(other.label)
+        screen.push_other(nested.label)
+        assert [s.label for s in screen._view.series] == [m.label for m in nested.members]
+
+        # One Escape returns to the first breakdown, not all the way out.
+        screen.pop_focus()
+        assert [s.label for s in screen._view.series] == [m.label for m in other.members]
+
+    def test_a_real_reload_discards_a_cached_breakdown(
+        self, many_categories_window: MainWindow
+    ) -> None:
+        screen = many_categories_window.trends_screen
+        other = next(s for s in screen._view.series if s.is_other)
+        screen.push_other(other.label)
+        assert screen._other_stack
+
+        screen.cycle_interval()  # any action that ends in reload()
+        assert screen._other_stack == []
+        assert any(s.is_other for s in screen._view.series)

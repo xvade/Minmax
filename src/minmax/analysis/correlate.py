@@ -70,7 +70,7 @@ def correlate(
     top: int | None = 20,
     per_category: bool = False,
     include_fields: bool = True,
-    field_sum: bool = False,
+    field_sum: bool = True,
     max_series: int = DEFAULT_MAX_SERIES,
 ) -> CorrelationReport:
     """Run a full correlation sweep and return a ranked report.

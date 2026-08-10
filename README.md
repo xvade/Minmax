@@ -18,7 +18,7 @@ worked on next is in [`TODO.md`](TODO.md).
 | Desktop UI: trends chart by day, week, or month | **working** |
 | User-defined point-in-time streams (create, import, view) | **working** |
 | Auto-fetch: re-import a stream from a remembered path once a minute | **working** |
-| Correlation engine: level correlations across many period lengths (CLI) | **working** |
+| Correlation engine: level correlations across many period lengths (CLI + desktop screen) | **working** |
 
 Minmax ingests [Timecard](/Users/xvade/dev/Misc/Timecard) CSV exports out of
 the box, and any other CSV you point it at: a period-of-time stream needs a
@@ -76,9 +76,13 @@ reported; the rest of the file still imports.
 
 ### `minmax stream add`
 
-Declares a new point-in-time stream — one instant per row, with any payload
-from nothing to several numbers and a label — and its column mapping, guessed
-from a sample CSV's header and overridden where the guess is wrong.
+Declares a new stream and its column mapping, guessed from a sample CSV's
+header and overridden where the guess is wrong — either kind, no code:
+
+- `--kind event` (the default) — one instant per row, with any payload from
+  nothing to several numbers and a label.
+- `--kind interval` — a start and an end per row (a second Timecard-shaped
+  source: a calendar export, a sleep log, a session log).
 
 ```
 $ minmax stream add --key heart_rate --name "Heart Rate" --from readings.csv
@@ -86,26 +90,61 @@ created stream 'heart_rate' (event) with fields:
   measured_at          -> at      [measured_at]
   bpm                  -> number  [bpm]  (bpm)
 import into it with: minmax import <file> --stream heart_rate
+
+$ minmax stream add --key sessions --name Sessions --kind interval \
+    --from sessions.csv --role project=category
+created stream 'sessions' (interval) with fields:
+  session_start        -> start  [session_start]
+  session_end          -> end  [session_end]
+  project              -> category  [project]
+  note                 -> ignored  [note]
+import into it with: minmax import <file> --stream sessions
 ```
 
 - `--key` / `--name` — the stream's stable slug and display name.
+- `--kind event|interval` — which shape the source is.
 - `--from <csv>` — a sample file to read the header and a few rows from.
-- `--role COLUMN=ROLE` — override a guessed role (`at`, `category`,
-  `source_id`, `number`, `text`); repeatable.
+- `--role COLUMN=ROLE` — override a guessed role; repeatable. Legal roles
+  depend on the kind: `event` uses `at`, `category`, `source_id`, `number`,
+  `text`; `interval` uses `start`, `end`, `category`, `source_id`. Either
+  kind accepts `ignored` for a column that exists in the source but should
+  not be stored.
+- `--exclusive` — `interval` only: reject an import that would create an
+  overlapping span (Timecard's own single-tasking-timer guarantee, not the
+  norm for most interval sources — a calendar overlaps freely, so this
+  defaults off).
 
-The timestamp column is guessed with confidence — every sampled value must
-parse as an ISO 8601 instant with a UTC offset. Everything else defaults to
-`number` only if every sampled value parses as one, else `text`; a column
-identifying the row (`category`, `source_id`) is never guessed, since nothing
-about a column's *values* says "this is an identifier" — override it
-explicitly. Exactly one column must end up with role `at`.
+The timestamp column(s) are guessed with confidence — every sampled value
+must parse as an ISO 8601 instant with a UTC offset. For `event`, the first
+such column becomes `at`; everything else defaults to `number` only if every
+sampled value parses as one, else `text`. For `interval`, the first two such
+columns (in header order) become `start` and `end`; everything else defaults
+to `ignored`, since an interval stream has no payload to put a `number`/`text`
+column in. A column identifying the row (`category`, `source_id`) is never
+guessed for either kind, since nothing about a column's *values* says "this
+is an identifier" — override it explicitly.
 
 A stream with no `category` column files every record under one implicit
-category named after the stream itself.
+category named after the stream itself. An interval stream's duration is
+always derived from its start and end, never trusted from a source column —
+declare a source duration column `ignored` rather than mapping it anywhere.
 
-**Only point-in-time streams can be declared this way today.** A second
-period-of-time source (Timecard-shaped, with a start and an end) still needs a
-hand-written importer — see [`docs/architecture.md`](docs/architecture.md) §6.1.
+### `minmax stream delete`
+
+Permanently deletes a stream and everything recorded in it — categories,
+records, values, rollups, import history.
+
+```
+$ minmax stream delete --key heart_rate
+deleted stream 'heart_rate' (event)
+```
+
+There is no interactive confirmation and no undo — `--key` is the whole
+command, and typing it is the confirmation, the same as `minmax revert`.
+Archived raw files under the stream's key stay on disk (Minmax's archive is
+never modified or overwritten, only added to), so re-declaring a stream under
+the same key can still re-import the same source without hunting it down
+again.
 
 ### `minmax streams`
 
@@ -216,8 +255,10 @@ tests each stream's top-level categories against everything else — this is
 usually what you want once you're past a first look, since "gaming" and
 "sleep" moving together is a more specific, more actionable claim than
 "timecard as a whole" and "sleep" moving together. A point-in-time stream's
-declared numeric fields (heart rate, say) are tested by their daily mean;
-`--field-sum` also tests the sum.
+declared numeric fields (heart rate, say) are tested by their daily mean and
+their daily sum — the same two the desktop trends chart's metric dropdown
+offers, plus the count every point-in-time stream already gets. `--no-field-sum`
+drops the sum if you only want the mean.
 
 A pair is not filtered out for a low `q` by default — with the amount of
 data most streams have today, a strict filter would return nothing on the
@@ -230,7 +271,7 @@ either) causes the other.
 - `--stream KEY` (repeatable), `--since`, `--until` — restrict what's compared and over what range.
 - `--interval UNIT[:COUNT][,...]` — test specific period lengths (e.g. `week:2,month`) instead of the built-in ladder.
 - `--min-periods` (default `8`), `--min-r` (default `0.5`), `--max-q`, `--top` (default `20`, `0` for no limit).
-- `--per-category`, `--no-fields`, `--field-sum`, `--all-intervals`, `--max-series` (default `40`).
+- `--per-category`, `--no-fields`, `--no-field-sum`, `--all-intervals`, `--max-series` (default `40`).
 - `--json` for machine-readable output.
 
 Needs the `analysis` extra (`uv sync --extra analysis`) — scipy is optional,
@@ -247,19 +288,27 @@ A picker above the day and trends screens (`Ctrl`+`K`) lists every declared
 stream; switching resets whatever was specific to the one you left (a filter,
 a drill-down, a pinned range) since none of it means anything in the new one.
 
-`Ctrl`+`N` opens "New stream…": pick a CSV, and Minmax reads its header and
-guesses a role for each column — confidently for the timestamp, more
-cautiously (number vs. text) for everything else. Every guess is an ordinary
-dropdown you can change before anything is created; a category or
-source-id role is never guessed, since nothing about a column's *values* says
-"this identifies the row" rather than "this is text." Creating the stream
-imports the same file immediately and switches to it, so the loop is one
-dialog: pick a file, check the roles, see it on screen.
+`Ctrl`+`N` opens "New stream…": pick a CSV, choose its kind (event or
+interval), and Minmax reads the header and guesses a role for each column —
+confidently for the timestamp column(s), more cautiously (number vs. text)
+for an event stream's other columns. Every guess is an ordinary dropdown you
+can change before anything is created; a category or source-id role is never
+guessed, since nothing about a column's *values* says "this identifies the
+row" rather than "this is text." An interval stream also gets an "Exclusive"
+checkbox (off by default) for a single-tasking source like Timecard that
+should reject overlapping spans. Creating the stream imports the same file
+immediately and switches to it, so the loop is one dialog: pick a file, check
+the roles, see it on screen.
 
-Only point-in-time streams — one instant per row, with any payload from
-nothing to a few numbers and a label — can be declared this way today. This is
-the same thing `minmax stream add` does from the terminal; see that section
-for the CLI form and its `--role` overrides.
+This is the same thing `minmax stream add` does from the terminal; see that
+section for the CLI form, its `--kind`/`--exclusive` flags, and `--role`
+overrides.
+
+`Ctrl`+`Backspace` deletes whichever stream the picker currently shows —
+permanently, with a confirmation dialog first, and no undo. Switch to the one
+you want gone before pressing it. Disabled when it's the only stream left,
+since every screen but Correlations needs a current stream to show. Archived
+raw files stay on disk either way; see `minmax stream delete`.
 
 #### Importing
 
@@ -369,6 +418,42 @@ count sums over a set the same way a duration does. The axis, the tooltip, and
 the legend all read as counts ("14 events") rather than durations; nothing
 about the interactions above changes.
 
+**A stream that declares a numeric field** (heart rate, say) gets a dropdown
+next to the title — Count, `<field>` total, `<field>` average — and `M` cycles
+through it. Count and total stack like any other point-in-time chart; average
+does not (two categories' averages don't add up to anything), so it draws one
+line per category instead, with a real gap wherever a category recorded
+nothing that day rather than a misleading dip to zero. `N`'s percentage view
+only applies to a stacking metric and does nothing on an average. Switching
+streams always resets the choice back to Count.
+
+#### The correlations screen
+
+Press `3`: the same sweep `minmax correlate` runs on the command line (see
+that section above for what the numbers mean), as a sortable table instead of
+text. Unlike the day and trends screens, this one is **not** scoped to
+whichever stream the picker has selected — comparing across streams is the
+entire point, so it always considers every declared stream.
+
+- **Per-category** also tests each stream's top-level categories, not just
+  its grand total — usually what you want once you're past a first look.
+- **min |r|** narrows the table to pairs at least that strongly related.
+- Click a column header to sort by it — `r`, `q`, `n`, or **Stability**
+  (what share of the tested period lengths agree with this row; blank means
+  all of them did) are all sorted numerically, not alphabetically.
+- Hover a row for its caveats, if it has any (e.g. two categories competing
+  for one exclusive stream's time budget).
+- `R` re-runs the sweep on demand. It otherwise only runs the first time you
+  open this screen, and again if it's already open when new data arrives —
+  not on every launch or every stream switch, since a cross-stream sweep is
+  heavier than either other screen's queries.
+- Needs the `analysis` extra (`uv sync --extra analysis`); without it, the
+  screen says so instead of crashing.
+
+Same honesty as the CLI: **these are leads to test, not findings** — nothing
+here knows about shared trends, day-of-week effects, or which of two
+correlated things (if either) causes the other.
+
 #### Keyboard shortcuts
 
 Press `?` (or `Ctrl`+`,`) for the full list, which is also where you change
@@ -386,13 +471,15 @@ them.
 | `0` | Reset zoom to the default | — |
 | `/` | Filter to a category | — |
 | `N` | — | Percentage view |
+| `M` | — | Cycle the metric (numeric-field streams only) |
 | `D` / `Shift`+`D` | — | Cycle the interval / set any interval |
 | `R` / `Shift`+`R` | — | Pin / unpin the range |
 
-`1` and `2` switch screens, `?` shows the list, `Ctrl`+`I` imports a file,
-`Ctrl`+`K` switches streams, and `Ctrl`+`N` declares a new one — all anywhere.
-The same key means different things on each screen because actions are
-scoped to the screen that owns them.
+`1`, `2`, and `3` switch screens, `?` shows the list, `Ctrl`+`I` imports a
+file, `Ctrl`+`K` switches streams, and `Ctrl`+`N` declares a new one — all
+anywhere. The same key means different things on each screen because actions
+are scoped to the screen that owns them: `R` re-runs the sweep on the
+correlations screen, the same key that pins the trends range.
 
 `Ctrl`/`Cmd` + scroll zooms around the pointer rather than the centre.
 

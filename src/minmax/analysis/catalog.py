@@ -60,7 +60,7 @@ def candidate_measures(
     stream_keys: Sequence[str] | None = None,
     per_category: bool = False,
     include_fields: bool = True,
-    field_sum: bool = False,
+    field_sum: bool = True,
     max_series: int = DEFAULT_MAX_SERIES,
 ) -> list[Measure]:
     """Every measure worth correlating, across the requested streams.
@@ -68,9 +68,10 @@ def candidate_measures(
     ``stream_keys=None`` means every declared stream. ``per_category`` adds
     one measure per top-level category alongside each stream's grand total;
     ``include_fields`` (on by default) adds a mean for each declared numeric
-    field on an event stream, and ``field_sum`` additionally adds that
-    field's sum. Truncated to ``max_series`` if it would otherwise exceed it
-    -- see :func:`_truncate`.
+    field on an event stream, and ``field_sum`` (also on by default) adds
+    that field's sum too -- the same trio the desktop trends chart now offers
+    per field: count, total, average. Truncated to ``max_series`` if it would
+    otherwise exceed it -- see :func:`_truncate`.
     """
     streams = [
         stream
@@ -212,19 +213,47 @@ def _is_aggregate_variant(x: Measure, y: Measure) -> bool:
 
 
 def _caveats(x: Measure, y: Measure, exclusive_streams: set[str]) -> tuple[str, ...]:
+    caveats: list[str] = []
+
     same_exclusive_stream = (
         x.stream_key == y.stream_key
         and x.stream_key in exclusive_streams
         and x.category_path is not None
         and y.category_path is not None
     )
-    if not same_exclusive_stream:
-        return ()
-    return (
-        f"{x.stream_key!r} is an exclusive stream (at most one category is ever active at "
-        "once), so these two categories' durations mechanically compete for one shared "
-        "time budget.",
-    )
+    if same_exclusive_stream:
+        caveats.append(
+            f"{x.stream_key!r} is an exclusive stream (at most one category is ever active at "
+            "once), so these two categories' durations mechanically compete for one shared "
+            "time budget."
+        )
+
+    field = _paired_with_own_sum(x, y)
+    if field is not None:
+        caveats.append(
+            f"{field.stream_key!r}'s count and its {field.field_key!r} total are mechanically "
+            "linked -- a sum is the count times the mean, so a correlation here may just be "
+            "restating that."
+        )
+
+    return tuple(caveats)
+
+
+def _paired_with_own_sum(x: Measure, y: Measure) -> Measure | None:
+    """The field-sum measure, if ``x``/``y`` is a stream's count paired with a
+    numeric field's sum on that same stream and category -- ``None``
+    otherwise. Named separately from :func:`_is_ancestor_or_self` and
+    :func:`_is_aggregate_variant`, which *exclude* a pair outright: this one
+    is only ever attached as a caveat, per the module docstring's rule that a
+    real confound about the reading is flagged rather than hidden."""
+    count, field = (x, y) if x.kind is MeasureKind.COUNT else (y, x)
+    if count.kind is not MeasureKind.COUNT or field.kind is not MeasureKind.FIELD:
+        return None
+    if field.aggregate is not Aggregate.SUM:
+        return None
+    if count.stream_key != field.stream_key or count.category_path != field.category_path:
+        return None
+    return field
 
 
 def _truncate(repository: Repository, measures: list[Measure], max_series: int) -> list[Measure]:

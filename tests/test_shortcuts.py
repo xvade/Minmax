@@ -14,7 +14,15 @@ from pathlib import Path
 import pytest
 
 from minmax.ui import shortcuts as shortcuts_module
-from minmax.ui.shortcuts import ACTIONS, DAY, GLOBAL, TRENDS, ShortcutMap, load_shortcuts
+from minmax.ui.shortcuts import (
+    ACTIONS,
+    CORRELATIONS,
+    DAY,
+    GLOBAL,
+    TRENDS,
+    ShortcutMap,
+    load_shortcuts,
+)
 
 
 @pytest.fixture
@@ -38,14 +46,14 @@ class TestDefaults:
         assert len(keys) == len(set(keys))
 
     def test_no_two_actions_share_a_key_within_a_scope(self) -> None:
-        for scope in (GLOBAL, DAY, TRENDS):
+        for scope in (GLOBAL, DAY, TRENDS, CORRELATIONS):
             sequences = [action.sequence for action in shortcuts_module.actions_in(scope)]
             assert len(sequences) == len(set(sequences)), scope
 
     def test_no_screen_key_collides_with_a_global_one(self) -> None:
         # A global action fires everywhere, so it would shadow a screen's key.
         globals_ = {action.sequence for action in shortcuts_module.actions_in(GLOBAL)}
-        for scope in (DAY, TRENDS):
+        for scope in (DAY, TRENDS, CORRELATIONS):
             screen = {action.sequence for action in shortcuts_module.actions_in(scope)}
             assert not (globals_ & screen), scope
 

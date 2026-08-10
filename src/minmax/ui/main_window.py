@@ -34,6 +34,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDoubleSpinBox,
     QFileDialog,
     QHBoxLayout,
     QInputDialog,
@@ -47,6 +48,8 @@ from PySide6.QtWidgets import (
 )
 
 from minmax.api import (
+    Aggregate,
+    CorrelationsView,
     Granularity,
     ImportOutcome,
     Interval,
@@ -54,9 +57,13 @@ from minmax.api import (
     StreamKind,
     StreamSummary,
     TimelineRecord,
+    TrendMetric,
+    TrendsView,
+    other_breakdown,
 )
 from minmax.api.format import format_duration, format_measure
 from minmax.ui import shortcuts as bindings
+from minmax.ui.correlations_view import CorrelationsTable
 from minmax.ui.dialogs import (
     IntervalDialog,
     NewStreamDialog,
@@ -71,7 +78,7 @@ from minmax.ui.timeline_view import TimelinePane
 from minmax.ui.trends_legend import TrendsLegend
 from minmax.ui.trends_view import TrendsChart
 
-__all__ = ["DayScreen", "MainWindow", "TrendsScreen"]
+__all__ = ["CorrelationsScreen", "DayScreen", "MainWindow", "TrendsScreen"]
 
 #: Days loaded either side of the focus day when jumping somewhere new. Enough
 #: that the reader can scroll a little before anything has to be fetched.
@@ -137,6 +144,7 @@ STATUS_HINTS = {
         "cycle_interval",
         "prompt_for_range",
     ),
+    bindings.CORRELATIONS: ("refresh",),
 }
 
 
@@ -517,9 +525,18 @@ class TrendsScreen(_ShortcutHost):
         self._stream_key = stream_key
         #: Drill-down stack. Empty means top-level groups.
         self._focus: list[str] = []
+        #: Snapshots of ``self._view`` to restore when backing out of an
+        #: "Other" breakdown -- see push_other. Always empty except while
+        #: showing one, and always cleared by reload() (a real query makes
+        #: any cached breakdown stale, since it was fetched for the view
+        #: before it).
+        self._other_stack: list[TrendsView] = []
         self._since: date | None = None
         self._until: date | None = None
         self._interval = Interval(Granularity.AUTO)
+        self._field_key: str | None = None
+        self._aggregate = Aggregate.SUM
+        self._metric_options: tuple[TrendMetric, ...] = ()
 
         self._build_ui()
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -541,11 +558,24 @@ class TrendsScreen(_ShortcutHost):
         header.addStretch(1)
         header.addWidget(self._range_label)
 
+        # Hidden whenever a stream has nothing to choose (one option or
+        # fewer) -- see _refresh_metric_combo. A wrapper widget rather than
+        # just hiding the combo, so the empty row collapses to zero height.
+        self._metric_combo = QComboBox()
+        self._metric_combo.setToolTip("What the y axis plots.")
+        self._metric_combo.currentIndexChanged.connect(self._on_metric_chosen)
+        controls = QHBoxLayout()
+        controls.setContentsMargins(14, 0, 14, 6)
+        controls.addWidget(self._metric_combo)
+        controls.addStretch(1)
+        self._controls_bar = QWidget()
+        self._controls_bar.setLayout(controls)
+
         self.chart = TrendsChart(self)
         self.legend = TrendsLegend(self)
         self.chart.visibleRangeChanged.connect(self._on_range_changed)
-        self.chart.seriesActivated.connect(self.push_focus)
-        self.legend.seriesActivated.connect(self.push_focus)
+        self.chart.seriesActivated.connect(self._on_series_activated)
+        self.legend.seriesActivated.connect(self._on_series_activated)
 
         body = QHBoxLayout()
         body.setContentsMargins(0, 0, 0, 0)
@@ -557,6 +587,7 @@ class TrendsScreen(_ShortcutHost):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
         layout.addLayout(header)
+        layout.addWidget(self._controls_bar)
         layout.addLayout(body, 1)
         self.setLayout(layout)
 
@@ -575,13 +606,19 @@ class TrendsScreen(_ShortcutHost):
         return (self._since, self._until)
 
     def reload(self) -> None:
+        # A real query invalidates any cached "Other" breakdown -- it was
+        # fetched for the view before this one, which may no longer exist.
+        self._other_stack = []
         self._view = self._client.trends(
             self._stream_key,
             since=self._since,
             until=self._until,
             prefix=self.prefix,
             interval=self._interval,
+            field_key=self._field_key,
+            aggregate=self._aggregate,
         )
+        self._refresh_metric_combo()
         self.chart.set_view(self._view)
         self._title_label.setText(self._title())
         self._refresh_legend()
@@ -589,18 +626,119 @@ class TrendsScreen(_ShortcutHost):
     def _title(self) -> str:
         where = f"Trends · {self.prefix}" if self.prefix else "Trends · all categories"
         shown = interval_words(self._view.interval)
+        # A field metric is not the default, so it is named; the stream's own
+        # shape (a count or a duration) needs no naming -- it is what every
+        # other screen already calls this stream.
+        metric = f" · {self._view.metric.label}" if self._view.metric.field_key is not None else ""
+        # Showing an "Other" breakdown replaces the series on screen without
+        # changing the prefix, so the title needs its own word for it or the
+        # header would keep describing the view from before the click.
+        other = " · Other" if self._other_stack else ""
         # Naming the resolved interval matters most under AUTO, where the reader
         # has not chosen it and would otherwise have to infer it.
         if self._interval.is_auto:
-            return f"{where} · auto ({shown})"
-        return f"{where} · {shown}"
+            return f"{where} · auto ({shown}){metric}{other}"
+        return f"{where} · {shown}{metric}{other}"
+
+    def _refresh_metric_combo(self) -> None:
+        """Repopulate the metric dropdown from the view just loaded.
+
+        Built from ``TrendsView.metric_options`` rather than re-derived here,
+        so the menu and what a chosen entry actually queries can never
+        drift apart. The selected entry is read back by index into
+        ``self._metric_options`` (never ``currentData()``) -- ``Aggregate``
+        is a ``StrEnum``, and PySide6's ``QVariant`` round-trip would
+        silently coerce it to a plain ``str``, the same trap documented on
+        ``NewStreamDialog``'s role combo in ``ui/dialogs.py``.
+        """
+        options = self._view.metric_options
+        self._metric_options = options
+        self._controls_bar.setVisible(len(options) > 1)
+
+        self._metric_combo.blockSignals(True)
+        self._metric_combo.clear()
+        for option in options:
+            self._metric_combo.addItem(option.label)
+        index = next(
+            (
+                position
+                for position, option in enumerate(options)
+                if option.field_key == self._field_key and option.aggregate == self._aggregate
+            ),
+            0,
+        )
+        if options:
+            self._metric_combo.setCurrentIndex(index)
+        self._metric_combo.blockSignals(False)
+
+    def _on_metric_chosen(self, index: int) -> None:
+        if not 0 <= index < len(self._metric_options):
+            return
+        option = self._metric_options[index]
+        self.set_metric(option.field_key, option.aggregate)
+
+    def set_metric(self, field_key: str | None, aggregate: Aggregate = Aggregate.SUM) -> None:
+        if (field_key, aggregate) == (self._field_key, self._aggregate):
+            return
+        self._field_key = field_key
+        self._aggregate = aggregate
+        self.reload()
+
+    def cycle_metric(self) -> None:
+        """Step to the next metric in the dropdown, or back to the first."""
+        if len(self._metric_options) < 2:
+            return
+        current = next(
+            (
+                position
+                for position, option in enumerate(self._metric_options)
+                if option.field_key == self._field_key and option.aggregate == self._aggregate
+            ),
+            -1,
+        )
+        option = self._metric_options[(current + 1) % len(self._metric_options)]
+        self.set_metric(option.field_key, option.aggregate)
+
+    def _on_series_activated(self, label: str) -> None:
+        """Route a double-click to what it means for that series: a real
+        category focuses into its children (a fresh query); "Other" shows
+        the breakdown of whatever got folded into it (no query -- the data
+        is already in ``self._view``)."""
+        series = next((item for item in self._view.series if item.label == label), None)
+        if series is None:
+            return
+        if series.is_other:
+            self.push_other(series.label)
+        else:
+            self.push_focus(series.label)
 
     def push_focus(self, label: str) -> None:
         """Focus one group, splitting it into its children."""
         self._focus.append(label)
         self.reload()
 
+    def push_other(self, label: str) -> None:
+        """Show an "Other" series' own members instead of the top-level
+        series it was folded out of -- a local reshape of the view already
+        on screen, not a second query (see ``api.other_breakdown``)."""
+        other = next(
+            (item for item in self._view.series if item.is_other and item.label == label), None
+        )
+        if other is None:
+            return
+        self._other_stack.append(self._view)
+        self._view = other_breakdown(self._view, other)
+        self.chart.set_view(self._view)
+        self._title_label.setText(self._title())
+        self._refresh_legend()
+
     def pop_focus(self) -> None:
+        if self._other_stack:
+            self._view = self._other_stack.pop()
+            self.chart.set_view(self._view)
+            self._title_label.setText(self._title())
+            self._refresh_legend()
+            return
         if self._focus:
             self._focus.pop()
             self.reload()
@@ -616,6 +754,8 @@ class TrendsScreen(_ShortcutHost):
         self._since = None
         self._until = None
         self._interval = Interval(Granularity.AUTO)
+        self._field_key = None
+        self._aggregate = Aggregate.SUM
         self.reload()
 
     # -- range and granularity -------------------------------------------
@@ -711,8 +851,157 @@ class TrendsScreen(_ShortcutHost):
         self.legend.set_series(
             list(self._view.series),
             self.chart.window_shares(),
-            self.chart.window_totals_seconds(),
+            self.chart.window_values(),
             stream_kind=self._view.stream_kind,
+            metric=self._view.metric,
+        )
+
+
+class CorrelationsScreen(_ShortcutHost):
+    """A cross-stream sweep: "when X increases in a period, does Y also
+    increase" -- see ``docs/architecture.md`` §7.1 and ``minmax correlate``.
+
+    Unlike :class:`DayScreen`/:class:`TrendsScreen`, this is not scoped to one
+    stream -- ``MinmaxClient.correlations()`` takes no stream key, since
+    comparing across streams is the entire point. It therefore never appears
+    in :meth:`MainWindow.set_stream`, and the stream picker has no effect on it.
+    """
+
+    scope = bindings.CORRELATIONS
+
+    def __init__(self, client: MinmaxClient, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._client = client
+        self._view: CorrelationsView | None = None
+        #: A sweep across every stream is heavier than either existing
+        #: screen's queries, so it is not run on app launch, on every stream
+        #: switch (irrelevant to this screen anyway), or on every import --
+        #: only the first time this screen is actually shown, and again
+        #: whenever data changes while it already is the visible one.
+        self._dirty = True
+
+        self._build_ui()
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    def _build_ui(self) -> None:
+        self._title_label = QLabel("Correlations")
+        title_font = QFont(self.font())
+        title_font.setPointSizeF(title_font.pointSizeF() + 3)
+        title_font.setBold(True)
+        self._title_label.setFont(title_font)
+
+        self._summary_label = QLabel()
+        self._summary_label.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
+
+        header = QHBoxLayout()
+        header.setContentsMargins(14, 10, 14, 10)
+        header.addWidget(self._title_label)
+        header.addStretch(1)
+        header.addWidget(self._summary_label)
+
+        self._per_category = QCheckBox("Per-category")
+        self._per_category.setToolTip(
+            "Also compare each stream's top-level categories, not just its grand total."
+        )
+        self._per_category.toggled.connect(self.reload)
+
+        self._min_r = QDoubleSpinBox()
+        self._min_r.setRange(0.0, 1.0)
+        self._min_r.setSingleStep(0.05)
+        self._min_r.setDecimals(2)
+        self._min_r.setValue(0.5)
+        self._min_r.setPrefix("min |r|  ")
+        self._min_r.setToolTip("Only show pairs whose correlation is at least this strong.")
+        self._min_r.valueChanged.connect(self.reload)
+
+        controls = QHBoxLayout()
+        controls.setContentsMargins(14, 0, 14, 6)
+        controls.addWidget(self._per_category)
+        controls.addWidget(self._min_r)
+        controls.addStretch(1)
+
+        self.table = CorrelationsTable(self)
+
+        self._footer_label = QLabel()
+        self._footer_label.setWordWrap(True)
+        self._footer_label.setEnabled(False)
+        self._footer_label.setContentsMargins(14, 6, 14, 10)
+
+        layout = QVBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        layout.addLayout(header)
+        layout.addLayout(controls)
+        layout.addWidget(self.table, 1)
+        layout.addWidget(self._footer_label)
+        self.setLayout(layout)
+
+    # -- data --------------------------------------------------------------
+
+    def reload(self) -> None:
+        """Re-run the sweep and redisplay it, unconditionally."""
+        self._dirty = False
+        try:
+            view = self._client.correlations(
+                per_category=self._per_category.isChecked(), min_r=self._min_r.value()
+            )
+        except ImportError:
+            self._show_missing_scipy()
+            return
+
+        self._view = view
+        self.table.set_rows(view.rows)
+        self._summary_label.setText(self._summary(view))
+        self._footer_label.setText(self._footer(view))
+
+    def refresh(self) -> None:
+        """The ``R`` keyboard action: re-run the sweep on demand."""
+        self.reload()
+
+    def show_if_stale(self) -> None:
+        """Reload if data may have changed since the last reload. Called by
+        :meth:`MainWindow.show_correlations_screen` every time this screen
+        becomes the visible one, rather than left to a ``showEvent`` override
+        -- that would depend on the top-level window actually being shown,
+        which is not true of every test, whereas this is the one method
+        actually responsible for making this screen visible in the first
+        place."""
+        if self._dirty:
+            self.reload()
+
+    def mark_dirty(self) -> None:
+        """Called from :class:`MainWindow` after any stream's data changes.
+        Reloads immediately if this screen is the one currently on screen;
+        otherwise just flags it, since redoing a cross-stream sweep after
+        every import is wasted work while nobody is looking at the result.
+        """
+        self._dirty = True
+        if self.isVisible():
+            self.reload()
+
+    def _summary(self, view: CorrelationsView) -> str:
+        span = ""
+        if view.first_day and view.last_day:
+            span = f"{view.first_day} - {view.last_day}  ·  "
+        return f"{span}{view.series_count} series · {view.tests_performed} tested"
+
+    def _footer(self, view: CorrelationsView) -> str:
+        lines: list[str] = []
+        if view.is_empty:
+            lines.append("Nothing cleared the r threshold with the data available.")
+        if view.truncated_series:
+            lines.append(f"{view.truncated_series} series left out (see the CLI's --max-series).")
+        lines.extend(view.skipped_notes)
+        lines.append("These are leads to test, not findings.")
+        return "   ·   ".join(lines)
+
+    def _show_missing_scipy(self) -> None:
+        self.table.set_rows([])
+        self._summary_label.setText("")
+        self._footer_label.setText(
+            "The correlation engine needs the optional analysis extra: uv sync --extra analysis"
         )
 
 
@@ -736,10 +1025,12 @@ class MainWindow(QMainWindow):
 
         self._day_screen = DayScreen(client, stream_key, self)
         self._trends_screen = TrendsScreen(client, stream_key, self)
+        self._correlations_screen = CorrelationsScreen(client, self)
 
         self._screens = QStackedWidget()
         self._screens.addWidget(self._day_screen)
         self._screens.addWidget(self._trends_screen)
+        self._screens.addWidget(self._correlations_screen)
 
         self._stream_picker = QComboBox()
         self._stream_picker.currentIndexChanged.connect(self._on_stream_picker_changed)
@@ -807,6 +1098,7 @@ class MainWindow(QMainWindow):
 
         self._day_screen.apply_shortcuts(self._shortcuts)
         self._trends_screen.apply_shortcuts(self._shortcuts)
+        self._correlations_screen.apply_shortcuts(self._shortcuts)
 
     def set_shortcuts(self, shortcuts: ShortcutMap) -> None:
         self._shortcuts = shortcuts
@@ -859,9 +1151,15 @@ class MainWindow(QMainWindow):
         dialog = NewStreamDialog(self, existing_keys=existing, inspect=self._client.inspect_csv)
         if not dialog.exec():
             return
-        key, name, fields, path = dialog.selection()
+        choice = dialog.selection()
         try:
-            self._client.create_stream(key, name, StreamKind.EVENT, fields=fields)
+            self._client.create_stream(
+                choice.key,
+                choice.name,
+                choice.kind,
+                exclusive=choice.exclusive,
+                fields=choice.fields,
+            )
         except ValueError as error:
             QMessageBox.warning(self, "New stream", str(error))
             return
@@ -872,8 +1170,43 @@ class MainWindow(QMainWindow):
         # data yet, landing on today rather than wherever this data actually
         # is. Reusing _import_path still gets the new stream its usual
         # import report, force-reimport offer included.
-        self._import_path(path, stream_key=key)
-        self.set_stream(key)
+        self._import_path(choice.path, stream_key=choice.key)
+        self.set_stream(choice.key)
+
+    def prompt_to_delete_stream(self) -> None:
+        """Delete the currently picked stream, after confirming.
+
+        Acts on whatever the picker is currently showing rather than opening
+        a second stream-selection UI -- switch to the one to remove first,
+        the same way the picker is already how every other per-stream action
+        is scoped. Refuses to delete the last remaining stream: every screen
+        but Correlations assumes a current stream always exists, and there is
+        no "no streams" state for them to fall back to.
+        """
+        summaries = self._client.streams()
+        if len(summaries) <= 1:
+            QMessageBox.warning(
+                self, "Delete stream", "There's only one stream left; nothing to switch to after."
+            )
+            return
+        current = self._current_stream_summary()
+        assert current is not None
+
+        confirmed = QMessageBox.warning(
+            self,
+            "Delete stream",
+            f"Permanently delete '{current.name}' ({current.kind}) and everything recorded "
+            "in it?\n\nThis cannot be undone. Any archived raw files stay on disk.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if confirmed != QMessageBox.StandardButton.Yes:
+            return
+
+        self._client.delete_stream(current.key)
+        remaining = next(s for s in summaries if s.key != current.key)
+        self.set_stream(remaining.key)
+        self._correlations_screen.mark_dirty()
 
     def _refresh_stream_picker(self) -> None:
         self._stream_picker.blockSignals(True)
@@ -1002,6 +1335,9 @@ class MainWindow(QMainWindow):
         if key == self._stream_key:
             self._day_screen.refresh()
             self._trends_screen.reload()
+        # Any stream changing is relevant to a cross-stream sweep, not just
+        # the one currently picked -- unlike the day/trends refresh above.
+        self._correlations_screen.mark_dirty()
         self.statusBar().showMessage(
             f"auto-fetched {outcome.source_name}: {outcome.inserted} new", 5_000
         )
@@ -1068,6 +1404,10 @@ class MainWindow(QMainWindow):
         if outcome.inserted and target == self._stream_key:
             self._day_screen.refresh()
             self._trends_screen.reload()
+        if outcome.inserted:
+            # Relevant regardless of which stream is currently picked -- a
+            # cross-stream sweep cares about every stream's data, not just it.
+            self._correlations_screen.mark_dirty()
 
     def _offer_reimport(self, path: Path, outcome: ImportOutcome, *, stream_key: str) -> None:
         detail = f"\n{outcome.notes[0]}" if outcome.notes else ""
@@ -1111,6 +1451,12 @@ class MainWindow(QMainWindow):
         self._trends_screen.setFocus()
         self.statusBar().showMessage(self._hint(bindings.TRENDS))
 
+    def show_correlations_screen(self) -> None:
+        self._screens.setCurrentWidget(self._correlations_screen)
+        self._correlations_screen.setFocus()
+        self._correlations_screen.show_if_stale()
+        self.statusBar().showMessage(self._hint(bindings.CORRELATIONS))
+
     def _hint(self, scope: str) -> str:
         """A one-line reminder, built from the bindings actually in effect.
 
@@ -1138,6 +1484,10 @@ class MainWindow(QMainWindow):
     @property
     def trends_screen(self) -> TrendsScreen:
         return self._trends_screen
+
+    @property
+    def correlations_screen(self) -> CorrelationsScreen:
+        return self._correlations_screen
 
     # -- day-screen delegation -------------------------------------------
     # The day screen's controls stay reachable from the window so that callers

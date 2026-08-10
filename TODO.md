@@ -116,7 +116,8 @@ next.
     `CsvStreamImporter` built from the stream's stored fields -- replacing a
     duplicated `IMPORTERS.get()` lookup that used to live in both `cli.py`
     and `api/client.py`.
-    - **Scope cut, logged rather than silently dropped:** only point-in-time
+    - **Scope cut, logged rather than silently dropped -- closed later, see
+      "Build the generic interval-declaration path" below:** only point-in-time
       (`event`) custom streams go through the generic importer. A second
       Timecard-*shaped* custom stream (interval, with a start and an end
       column) is not implemented -- `stream_field`/EAV storage exists
@@ -214,7 +215,8 @@ next.
       by tests now (`TestMarkers`, `TestAxisLabel`), not just the screenshot.
   - [ ] Deliberately deferred, logged rather than silently dropped: editing a
     stream's column mapping after creation (would invalidate every stored
-    `payload_hash`); deleting a stream; a measure picker on the day screen (it
+    `payload_hash`); deleting a stream (closed later, see "Add a way to
+    delete streams" below); a measure picker on the day screen (it
     shows records, not aggregates); de-overlapping markers that land close
     together on the timeline (mirrors the existing decision not to de-overlap
     interval blocks either); aggregating a text field (mode, distinct count).
@@ -366,18 +368,266 @@ next.
     `insert_events` path; a layering test (`analysis/` never imports `api`
     or `ui`, no `SELECT` string outside `storage/`); CLI tests including the
     missing-scipy path.
-  - [ ] Deliberately deferred, logged rather than silently dropped: any GUI
-    screen (CLI-only this pass); lagged correlation (X this week vs. Y next
-    week); period-over-period delta correlation (levels only, this pass);
-    leaf-category drill-down (`--depth`, only grand total + top-level today);
-    non-Pearson methods (Spearman, partial correlation, day-of-week/season
-    deconfounding); a cached/derived results table (a full sweep is
-    milliseconds against rollup-sized data; caching would buy nothing but a
-    staleness bug); the "increase/decrease X -> advice" query interface and
-    the DL forecasting model (both distant `AGENTS.md` end-goals this does
-    not attempt); retrofitting `api/client.trends()`/`ui/` onto `Measure`
-    (D7 -- the chart's existing count-reuse hack is untouched and still
-    correct for what it does).
+  - [x] A desktop screen for the correlation engine. Requested by user
+    2026-08-09, immediately after the CLI-only v1 above shipped ("any GUI
+    screen" had been logged as a deliberate deferral, not a gap). Planned and
+    approved before building.
+    - [x] `ui/shortcuts.py`: a fourth scope, `CORRELATIONS`, with one global
+      action (`show_correlations_screen`, key `3` -- the next free digit
+      after `1`/`2`) and one screen action (`refresh`, key `R`).
+    - [x] `ui/correlations_view.py` (new): `CorrelationsTable`, a native
+      `QTableWidget` -- nothing custom-painted, since a table is the right
+      shape for record-per-row results and Qt already gives sortable columns
+      and system styling for free. `_NumericItem` overrides `__lt__` so
+      sorting the `r`/`q`/`n`/`Stability` columns compares the underlying
+      value, not the displayed text (`"0.90"` would otherwise sort before
+      `"0.7"` character by character -- the same category of Qt gotcha as
+      the `QComboBox.currentData()` StrEnum coercion found earlier). Caveats
+      surface as a row tooltip rather than a separate detail panel.
+    - [x] `ui/main_window.py`: a new `CorrelationsScreen(_ShortcutHost)`,
+      added to the `QStackedWidget` as a third screen alongside
+      `DayScreen`/`TrendsScreen`. Deliberately **not** scoped to one stream
+      and **not** added to `set_stream()` -- `MinmaxClient.correlations()`
+      takes no stream key, since comparing across streams is the entire
+      point, so the stream picker has no effect on this screen.
+    - [x] Two controls only, for v1: "Per-category" (off by default, matching
+      the CLI) and a min-`r` spinbox (default 0.5). No stream filter, date
+      range, or the CLI's more advanced flags (`--no-field-sum`,
+      `--all-intervals`, a custom `--interval` sweep) yet -- the same
+      incremental order `TrendsScreen` shipped in (a range picker and an
+      interval picker both arrived after the chart itself worked).
+    - [x] The sweep is **not** run eagerly. Unlike `TrendsScreen.reload()` in
+      `__init__`, a cross-stream sweep is heavier than either existing
+      screen's queries, so it only runs the first time the screen is shown
+      and again if data changes while it is already the visible one
+      (`CorrelationsScreen.mark_dirty()`, called from the two places
+      `MainWindow` already refreshes day/trends after a successful import --
+      but *outside* their `target == self._stream_key` guards, since any
+      stream changing is relevant here, not just the currently picked one).
+      "Reload if stale" is resolved explicitly in
+      `MainWindow.show_correlations_screen()` rather than a `showEvent`
+      override, since the latter depends on the top-level window actually
+      being shown (true in real use, not true of every test) and the former
+      is the one method already responsible for making the screen visible.
+    - [x] `ImportError` (scipy not installed) is caught in
+      `CorrelationsScreen.reload()` and shown as an inline message, the same
+      case `cmd_correlate` already guards against for the CLI -- verified by
+      literally uninstalling scipy (`uv sync --extra ui` without
+      `--extra analysis`) and confirming the screen degrades to the message
+      instead of raising.
+    - [x] Tests: shortcut scope registration extended to `CORRELATIONS`
+      (mirroring the existing per-scope parametrized tests); a synthetic
+      two-stream fixture (linear-in-day-index durations/counts, the same
+      shape used in `tests/test_api.py`/`test_analysis_correlate.py`)
+      exercising screen switching, lazy loading, the controls actually
+      changing what `client.correlations()` is called with (spied, not
+      inferred from data), the missing-scipy path, and the dirty-flag/
+      visibility logic in both directions; a direct sorting test for
+      `_NumericItem`.
+    - [ ] Deliberately deferred, logged rather than silently dropped: a
+      stream filter, a date-range picker, and the CLI's more advanced flags
+      in the GUI (all reachable from the CLI today); double-clicking a row to
+      jump to that pair's categories on the day/trends screens; anything
+      beyond a tooltip for a row's caveats (a fuller detail panel, mirroring
+      `RecordInspector`, if caveats ever grow longer than a sentence or two).
+- [x] Build the generic interval-declaration path: a second Timecard-*shaped*
+      custom stream (start + end column, no code) declarable through
+      `minmax stream add --kind interval` and the GUI's "New stream" dialog,
+      closing the scope cut logged under the datastreams task above.
+      Requested by user 2026-08-10. Two decisions confirmed with the user
+      before building: start + end columns only (no start+duration shape --
+      duration is always derived from the timestamps, never trusted from the
+      source, same as `IntervalRecord.duration_seconds` already enforces);
+      exclusivity is an opt-in flag defaulting off (Timecard's non-overlap
+      guarantee comes from being a single-tasking timer, not from being an
+      interval stream -- most aren't).
+  - [x] The design question the scope cut raised, resolved: `interval_record`
+    has fixed columns and no per-row payload table, unlike `event_record`
+    (`docs/architecture.md` §6.1/D5's whole point is that an interval's
+    payload *is* fixed-shape). So a declared interval stream gets no
+    `NUMBER`/`TEXT` columns -- there is nowhere to put them, and D5's own
+    reasoning gives no reason to build one. `stream_field` still carries the
+    *mapping* for both kinds (already kind-agnostic in `create_stream`/
+    `stream_fields`; only its docstrings and the SQL `CHECK` assumed events).
+  - [x] `core/models.py`: `FieldRole` gains `START`, `END` (the interval
+    analogue of `AT`) and `IGNORED` ("this column exists but is deliberately
+    not stored" -- needed because an interval CSV's extra columns, e.g.
+    Timecard's own `duration_seconds`, have nowhere to go; incidentally also
+    usable by an event stream, since its value-field selection is already an
+    allowlist of `NUMBER`/`TEXT` and ignores anything else for free).
+  - [x] `storage/migrations/0006_interval_streams.sql`: widens
+    `stream_field.role`'s `CHECK` to the new roles via the same
+    create-copy-drop-rename rebuild `0003_colour_slots.sql` established --
+    but a genuine hazard `0003` didn't have. `event_value.field_id` and
+    `field_rollup.field_id` both `REFERENCES stream_field (id) ON DELETE
+    CASCADE`, and `ALTER TABLE ... RENAME` rewrites *other* tables'
+    `REFERENCES` clauses to follow the new name. A first draft renamed
+    nothing first and simply dropped the old `stream_field` once a new one
+    already existed under the same name -- which fired the cascade against
+    whichever table currently had a live FK reading "stream_field" by name,
+    silently deleting every event stream's payload and rollups, caught by a
+    round-trip test (build a v5-shaped database with real payload rows,
+    migrate, assert nothing vanished) before this ever touched a real
+    database. Fixed by renaming all three old tables out of the way first,
+    building the three new ones under the final names (so anything created
+    from here on binds to the *new* `stream_field`), then dropping the
+    `_old` tables leaves-first -- at no point does a live table's FK still
+    name something about to be dropped.
+  - [x] `ingest/csvstream.py`: `IntervalCsvImporter`, mirroring
+    `CsvStreamImporter`'s shape (built from a stream's stored `stream_field`
+    mapping, no per-stream code). `_record_from_row` pre-validates
+    `end >= start` and raises `RowError` itself, exactly as
+    `TimecardCsvImporter` already does -- `IntervalRecord.__post_init__`
+    raises a bare `ValueError` for an inverted span, which `parse()` does
+    not catch, so skipping this check would abort a whole import on one bad
+    row instead of rejecting it. `guess_fields`/`sniff_fields` take a `kind`
+    parameter: for `INTERVAL`, the first two time-like columns (header
+    order) guess as `START`/`END` and everything else guesses `IGNORED`
+    (never `NUMBER`/`TEXT`, which are invalid for the kind); `CATEGORY`/
+    `SOURCE_ID` stay unguessed for both kinds, unchanged. A new
+    `validate_declaration(fields, kind)` is the one place the legality rules
+    live, shared by the CLI and the dialog so they cannot disagree; re-exported
+    through `minmax.api` for the dialog to reach without breaking the
+    UI-may-only-import-`api` layering rule.
+  - [x] `ingest/__init__.py`'s `importer_for` now dispatches on the stream's
+    kind (`EVENT` -> `CsvStreamImporter`, `INTERVAL` -> `IntervalCsvImporter`)
+    instead of refusing anything non-event; a `SAMPLE`-kind stream (no
+    storage yet) still gets a clear refusal.
+  - [x] `api/client.py`: `inspect_csv` takes `kind` and passes it to
+    `guess_fields`, so the dialog can re-guess when the reader switches kinds.
+    `create_stream` needed no change -- it already accepted `kind` and
+    `exclusive`.
+  - [x] `cli.py`: `--kind` accepts `interval`; new `--exclusive` flag; the CLI's
+    hardcoded "only --kind event is supported today" refusal is gone. The
+    "exactly one `at`" arity check is now `validate_declaration`, shared with
+    the dialog. `streams`' declared-mapping listing now runs for either kind
+    (skipping structural roles -- `at`/`start`/`end` -- the same way it always
+    skipped `at`), rather than only for `EVENT`.
+  - [x] `ui/dialogs.py`: `NewStreamDialog` gains a "Kind" combo and an
+    "Exclusive" checkbox (interval only). Per-kind role lists
+    (`_ROLES_FOR_KIND`) replace the previous `list(FieldRole)` in both
+    `_populate_fields` and `_current_fields`, keeping the established
+    index-not-`currentData()` discipline (`FieldRole`/`StreamKind` are both
+    `StrEnum`s that PySide6's `QVariant` round-trip silently coerces to a
+    plain `str`, breaking `is` checks). `selection()` now returns a
+    `NewStreamChoice` dataclass instead of a 4-tuple -- a 6-tuple
+    (`key, name, kind, exclusive, fields, path`) would have been unreadable
+    at every call site.
+  - [x] Tests: a new `sessions.csv` fixture (start, end, a category-ish
+    column, a junk column, one inverted row, one blank-end row) exercises
+    the guess, the importer's rejection path (inverted row -> `Rejection`,
+    import still succeeds), the implicit-category fallback, and
+    `--exclusive` actually rejecting overlapping spans end to end through
+    the CLI (the default does not); a migration round-trip test is the
+    regression test for the cascade hazard above; dialog tests cover
+    switching kinds re-guessing roles and toggling the exclusive checkbox
+    through to `create_stream`.
+  - [ ] Deliberately not built, logged rather than silently dropped: no
+    `NUMBER`/`TEXT` payload for a declared interval stream (see the design
+    question above -- would need a new `interval_value`-style table, out of
+    scope for closing this gap); no start+duration column shape (start+end
+    only, per the decision above); editing an existing stream's kind or
+    column mapping after creation (same deferral already logged for event
+    streams, for the same reason -- would invalidate every stored natural
+    key).
+- [x] Add a way to delete streams, closing the deferral logged under the
+      first datastreams task above. Requested by user 2026-08-10. Two
+      decisions confirmed with the user before building: available from both
+      the CLI and the GUI (not CLI-only); archived raw files stay on disk
+      rather than being deleted along with the database rows.
+  - [x] `storage/repository.py`: `delete_stream(key) -> Stream`, raising
+    `LookupError` for an unknown key. Turned out to be a one-`DELETE`
+    operation, not a hand-rolled cascade: every table below `stream`
+    (`category`, `interval_record`/`event_record`, `stream_field`,
+    `event_value`, `rollup`/`field_rollup`, `import_run`) already declares
+    `REFERENCES stream (id) ON DELETE CASCADE`, built that way from
+    migration `0001` on. Unlike `revert_import`, no rollup rebuild is needed
+    afterward, since nothing of the stream survives for a rollup to be wrong
+    about. Archived files under `home/archive/<key>/` are deliberately left
+    alone -- `archive_file`'s own contract is "never modified or overwritten,
+    only added" (`ingest/archive.py`), and keeping them lets the same source
+    be re-imported if the stream is ever recreated.
+  - [x] `api/client.py`: `MinmaxClient.delete_stream(key) -> None` on the
+    protocol and `InProcessClient`, a thin pass-through.
+  - [x] `cli.py`: `minmax stream delete --key KEY`, sibling to `stream add`.
+    No interactive confirmation, matching `revert`'s existing precedent (no
+    destructive CLI command in this codebase prompts interactively) -- an
+    explicit `--key` typed on the command line is treated as the
+    confirmation.
+  - [x] GUI: a new `GLOBAL` shortcut, `prompt_to_delete_stream` (`Ctrl+Backspace`,
+    discoverable via `?` like every other global action -- there is no
+    dedicated button for "New stream…" either). Acts on whatever the stream
+    picker currently shows rather than opening a second stream-selection UI.
+    A `QMessageBox` confirmation (default button Cancel) is required before
+    anything is deleted -- the CLI's "explicit command is confirmation
+    enough" reasoning does not transfer to a keyboard shortcut a reader could
+    fire by reflex. Refuses to delete the last remaining stream (a clear
+    warning instead): every screen but Correlations assumes a current stream
+    always exists, and there is no "no streams" state for `DayScreen`/
+    `TrendsScreen` to fall back to. On confirmation, switches to another
+    remaining stream via the existing `set_stream()` and marks the
+    correlations screen dirty, the same way a successful import already does.
+  - [x] Tests: repository-level cascade tests for both stream kinds
+    (categories/records/values/rollups all gone, `PRAGMA foreign_key_check`
+    clean) plus the not-found case; API and CLI round trips; GUI tests for
+    the confirm/cancel paths, the last-stream refusal, and the switch-away
+    after deleting the currently-picked stream.
+- [x] Give the trends chart a metric selector for a declared numeric field
+      (count of data points, total, or average), and make the correlation
+      sweep consider all three by default instead of two. Requested by user
+      2026-08-10. Two decisions confirmed with the user before building: an
+      average is drawn as unstacked lines rather than collapsing categories
+      away (stacking an average is arithmetically meaningless); the dropdown
+      gets one total/average entry per declared numeric field, not just the
+      single-field case originally described.
+  - [x] `api/client.py`: new `TrendMetric` transfer object (label, field
+    key, `Aggregate`, unit, and a `stacks` property); `TrendSeries` gains
+    `weights` alongside `values` (empty unless the metric is a field
+    average); `TrendsView` gains `metric`/`metric_options`; `trends()` gains
+    `field_key`/`aggregate` kwargs, validated (`LookupError` for an
+    undeclared field, `ValueError` for an interval stream or an
+    unsupported aggregate). See `docs/architecture.md` D8 for why this
+    reuses `core.measures.Aggregate` but not `Measure`/`SeriesLoader`
+    themselves -- the chart's problem is column-shaped, the correlation
+    engine's is day-shaped.
+  - [x] `core/trends.py`: `nice_count_ceiling` renamed to `nice_value_ceiling`
+    (it was already generic; only the name was count-specific) and reused
+    for a field's total/average axis too; `window_totals` retyped to floats.
+  - [x] `ui/trends_view.py`: a second paint path, `_line_values`/`_paint_lines`,
+    alongside the existing stacked bands -- picked by `TrendMetric.stacks`.
+    A category with no reading in a column plots as a gap (`None`), never a
+    false zero. Percentage view (`N`) refuses on a mean metric, since an
+    average has no whole to be a share of.
+  - [x] `ui/trends_legend.py`: drops the share column and switches its
+    heading for a mean metric; formats a field's value with its unit
+    instead of as a count or a duration.
+  - [x] `ui/main_window.py`: `TrendsScreen` gains a metric dropdown (hidden
+    when there is nothing to choose -- an interval stream, or an event
+    stream with no declared numeric field) and the `M` shortcut cycles it.
+    Switching streams always resets the choice back to Count, the same way
+    a pinned range or a drill-down already resets.
+  - [x] `analysis/catalog.py`/`cli.py`: `field_sum` now defaults to `True`
+    (a field's sum was previously opt-in behind `--field-sum`, tested less
+    often than its mean for no principled reason); the CLI flag flipped to
+    `--no-field-sum` to opt back out, mirroring `--no-fields`. A stream's
+    count and its own field's sum now carry a caveat when paired (a sum is
+    the count times the mean, so the two are not independent) -- attached,
+    not filtered, the same way the exclusive-stream caveat already is.
+  - [x] Deliberately not built: no `MIN`/`MAX` on the trends axis (the chart
+    has no way to draw a per-column extreme the way a sum or a mean already
+    plots as a point); no metric selector for an interval stream (a
+    duration has no competing reading of "how much" to choose between).
+  - [x] New shared test fixture, `readings_stream` (`tests/conftest.py`):
+    a numeric-field event stream with two categories, unequal reading
+    counts per day, and a day where one category records nothing at all --
+    every existing numeric-field fixture (`heart_rate`: no category;
+    `location`: one reading per category on one day) was too degenerate to
+    catch a mean-of-means bug or exercise a real gap in a per-category line.
+  - [x] Tests: value-weighted multi-day mean vs. the mean-of-daily-means bug
+    it must not regress into; `metric_options` for zero/one/two declared
+    fields; the metric combo, `M`, the line-mode gap, and the legend's
+    share-column drop in the GUI; the new count/sum caveat and the default
+    `field_sum=True` in the correlation sweep, CLI and library both.
 
 ---
 

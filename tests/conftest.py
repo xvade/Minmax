@@ -13,6 +13,8 @@ from pathlib import Path
 
 import pytest
 
+from minmax.core.models import EventRecord, FieldRole, FieldSpec, Stream, StreamKind
+from minmax.core.timeref import Instant
 from minmax.storage.database import open_database
 from minmax.storage.repository import Repository
 
@@ -74,6 +76,67 @@ def location_csv() -> Path:
     """A point-in-time stream with a category, a source id, two numbers, and
     an optional text field left blank on one row."""
     return FIXTURES / "location.csv"
+
+
+@pytest.fixture
+def sessions_csv() -> Path:
+    """A generic interval stream: start, end, a category-ish column, and a
+    junk column -- plus one inverted row and one blank-end row for the
+    rejection paths."""
+    return FIXTURES / "sessions.csv"
+
+
+@pytest.fixture
+def readings_stream(repository: Repository) -> Stream:
+    """A numeric-field event stream shaped to catch a mean-of-means bug: two
+    categories, several readings per day, over several days, with unequal
+    reading counts per day and one day where a category has no reading at
+    all.
+
+    Every existing numeric-field fixture is too degenerate for this:
+    ``heart_rate.csv`` has no category column, and ``location.csv`` has one
+    reading per category on a single day. Neither can catch a multi-day
+    average computed as the mean of daily means instead of the correct
+    value-weighted one, or exercise a per-category line with a real gap in
+    it (see ``minmax.ui.trends_view.TrendsChart._line_values``).
+    """
+    stream = repository.create_stream(
+        "readings",
+        "Readings",
+        StreamKind.EVENT,
+        fields=[
+            FieldSpec(
+                key="value",
+                label="Reading",
+                role=FieldRole.NUMBER,
+                source_column="value",
+                unit="pt",
+            )
+        ],
+    )
+    assert stream.id is not None
+    run = repository.begin_import(
+        stream.id,
+        importer="test",
+        source_name="readings.csv",
+        source_sha256="a" * 64,
+        archived_path=None,
+    )
+    records = [
+        # phone: day 1 has two readings, day 2 has one, day 3 has none at all.
+        EventRecord(None, "phone", Instant.from_iso("2026-07-01T08:00:00-07:00"), {"value": 10.0}),
+        EventRecord(None, "phone", Instant.from_iso("2026-07-01T09:00:00-07:00"), {"value": 20.0}),
+        EventRecord(None, "phone", Instant.from_iso("2026-07-02T08:00:00-07:00"), {"value": 100.0}),
+        # watch: a reading every day, so its line has no gap to contrast with
+        # phone's, and its daily reading count never matches phone's.
+        EventRecord(None, "watch", Instant.from_iso("2026-07-01T08:00:00-07:00"), {"value": 50.0}),
+        EventRecord(None, "watch", Instant.from_iso("2026-07-02T08:00:00-07:00"), {"value": 10.0}),
+        EventRecord(None, "watch", Instant.from_iso("2026-07-02T09:00:00-07:00"), {"value": 10.0}),
+        EventRecord(None, "watch", Instant.from_iso("2026-07-02T10:00:00-07:00"), {"value": 10.0}),
+        EventRecord(None, "watch", Instant.from_iso("2026-07-03T08:00:00-07:00"), {"value": 5.0}),
+    ]
+    repository.insert_events(stream, run, records)
+    return stream
 
 
 def data_snapshot(conn: sqlite3.Connection) -> dict[str, list[tuple[object, ...]]]:

@@ -173,22 +173,37 @@ class StoredInterval:
 
 
 class FieldRole(StrEnum):
-    """What a declared column contributes to a point-in-time record.
+    """What a declared column contributes to a stream's record, per kind.
 
-    ``AT`` is the column read as the record's instant -- structural, like
-    ``CATEGORY`` and ``SOURCE_ID``, so none of the three ever becomes an
-    :class:`EventRecord` value. ``CATEGORY`` and ``SOURCE_ID`` feed the same
-    category-resolution machinery interval streams already use. ``NUMBER``
-    and ``TEXT`` become values, keyed by the field's :attr:`StreamField.key`.
-    Exactly one column must declare ``AT``; at most one may declare each of
-    ``CATEGORY`` and ``SOURCE_ID``; any number may declare ``NUMBER``/``TEXT``.
+    ``CATEGORY``, ``SOURCE_ID``, and ``IGNORED`` are structural in either
+    kind and feed the same category-resolution machinery both record kinds
+    already share; ``IGNORED`` means the column exists in the source but is
+    deliberately not stored (e.g. a duration column redundant with the
+    timestamps).
+
+    For an **event** (point-in-time) stream: exactly one column must declare
+    ``AT``; any number may declare ``NUMBER``/``TEXT``, which become values
+    keyed by the field's :attr:`StreamField.key`.
+
+    For an **interval** (span) stream: exactly one column must declare
+    ``START`` and exactly one ``END``. ``NUMBER``/``TEXT`` are not valid --
+    ``interval_record`` has fixed columns and no per-row payload table (its
+    shape is already fixed, unlike an event stream's -- see
+    ``docs/architecture.md`` §6.1), so there is nowhere for an interval
+    stream's extra column to be stored; it must be ``IGNORED`` instead.
+
+    In both kinds, at most one column may declare each of ``CATEGORY`` and
+    ``SOURCE_ID``.
     """
 
     AT = "at"
+    START = "start"
+    END = "end"
     CATEGORY = "category"
     SOURCE_ID = "source_id"
     NUMBER = "number"
     TEXT = "text"
+    IGNORED = "ignored"
 
 
 @dataclass(frozen=True, slots=True)
@@ -211,7 +226,7 @@ class FieldSpec:
 
 @dataclass(frozen=True, slots=True)
 class StreamField:
-    """One declared column of a point-in-time stream, and where it reads from.
+    """One declared column of a user-declared stream, and where it reads from.
 
     Declared once -- the new-stream dialog, or ``minmax stream add`` -- and
     reused for every later import into that stream, so a CSV's header can be

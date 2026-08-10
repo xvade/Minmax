@@ -23,7 +23,7 @@ from minmax.api.format import format_duration
 from minmax.core.columns import Granularity, Interval
 from minmax.core.models import FieldRole, StreamKind
 from minmax.core.timeref import Period
-from minmax.ingest import importer_for, run_import, sniff_fields
+from minmax.ingest import importer_for, run_import, sniff_fields, validate_declaration
 from minmax.storage.database import default_home, open_database
 from minmax.storage.repository import OverlapError, Repository
 from minmax.storage.rollups import rebuild
@@ -146,22 +146,16 @@ def _parse_role_overrides(role_args: Sequence[str]) -> dict[str, FieldRole]:
 
 
 def cmd_stream_add(args: argparse.Namespace, repository: Repository) -> int:
-    """Declare a new point-in-time stream and its column mapping.
+    """Declare a new stream and its column mapping.
 
     The mapping is guessed from ``--from``'s header and sample rows --
-    confidently for the timestamp column, conservatively (number vs. text)
-    for everything else -- then any ``--role`` overrides are applied on top.
-    Nothing is guessed for category or source-id columns, since nothing about
-    a column's values distinguishes "this identifies the row" from "this is
-    just text"; those need an explicit ``--role``.
+    confidently for the timestamp column(s), conservatively (number vs. text)
+    for an event stream's other columns -- then any ``--role`` overrides are
+    applied on top. Nothing is guessed for category or source-id columns,
+    since nothing about a column's values distinguishes "this identifies the
+    row" from "this is just data"; those need an explicit ``--role``.
     """
-    if args.kind != "event":
-        print(
-            "only --kind event is supported today; interval-shaped custom streams"
-            " are not yet implemented (see TODO.md)",
-            file=sys.stderr,
-        )
-        return 2
+    kind = StreamKind.EVENT if args.kind == "event" else StreamKind.INTERVAL
     if repository.get_stream(args.key) is not None:
         print(f"a stream named {args.key!r} already exists", file=sys.stderr)
         return 2
@@ -172,7 +166,7 @@ def cmd_stream_add(args: argparse.Namespace, repository: Repository) -> int:
         print(str(error), file=sys.stderr)
         return 2
 
-    fields = sniff_fields(args.from_csv)
+    fields = sniff_fields(args.from_csv, kind=kind)
     unknown_columns = sorted(set(overrides) - {f.source_column for f in fields})
     if unknown_columns:
         print(
@@ -184,21 +178,36 @@ def cmd_stream_add(args: argparse.Namespace, repository: Repository) -> int:
         for f in fields
     ]
 
-    at_fields = [f for f in fields if f.role is FieldRole.AT]
-    if len(at_fields) != 1:
-        print(
-            f"exactly one column must have role 'at' (found {len(at_fields)});"
-            " override the guess with --role COLUMN=at",
-            file=sys.stderr,
-        )
+    problem = validate_declaration(fields, kind)
+    if problem is not None:
+        print(problem, file=sys.stderr)
         return 2
 
-    stream = repository.create_stream(args.key, args.name, StreamKind.EVENT, fields=fields)
+    stream = repository.create_stream(
+        args.key, args.name, kind, exclusive=args.exclusive, fields=fields
+    )
     print(f"created stream {stream.key!r} ({stream.kind}) with fields:")
     for declared in fields:
         unit = f" ({declared.unit})" if declared.unit else ""
         print(f"  {declared.source_column:<20} -> {declared.role.value}{unit}  [{declared.key}]")
     print(f"import into it with: minmax import <file> --stream {stream.key}")
+    return 0
+
+
+def cmd_stream_delete(args: argparse.Namespace, repository: Repository) -> int:
+    """Permanently delete a stream and everything recorded in it.
+
+    No interactive confirmation, matching ``revert``'s precedent -- an
+    explicit ``--key`` typed on the command line is treated as the
+    confirmation. Archived raw files under the stream's key are left on
+    disk (see ``Repository.delete_stream``).
+    """
+    try:
+        stream = repository.delete_stream(args.key)
+    except LookupError as error:
+        print(str(error), file=sys.stderr)
+        return 2
+    print(f"deleted stream {stream.key!r} ({stream.kind})")
     return 0
 
 
@@ -219,12 +228,15 @@ def cmd_streams(args: argparse.Namespace, repository: Repository) -> int:
             )
             span = f"  {low} -> {high}"
         print(f"{stream.key}  ({stream.kind}{', exclusive' if stream.exclusive else ''}){span}")
-        if stream.kind is StreamKind.EVENT:
-            for declared in repository.stream_fields(stream.id):
-                if declared.role is FieldRole.AT:
-                    continue
-                unit = f" ({declared.unit})" if declared.unit else ""
-                print(f"    {declared.role.value:<10} {declared.label}{unit}")
+        # A declared stream (any kind) has stream_field rows; Timecard and
+        # any other hardcoded importer do not, so this only ever prints a
+        # mapping for a user-declared stream.
+        structural = (FieldRole.AT, FieldRole.START, FieldRole.END)
+        for declared in repository.stream_fields(stream.id):
+            if declared.role in structural:
+                continue
+            unit = f" ({declared.unit})" if declared.unit else ""
+            print(f"    {declared.role.value:<10} {declared.label}{unit}")
     return 0
 
 
@@ -455,7 +467,7 @@ def cmd_correlate(args: argparse.Namespace, repository: Repository) -> int:
         top=None if args.top == 0 else args.top,
         per_category=args.per_category,
         include_fields=not args.no_fields,
-        field_sum=args.field_sum,
+        field_sum=not args.no_field_sum,
         max_series=args.max_series,
         all_intervals=args.all_intervals,
     )
@@ -546,12 +558,15 @@ def build_parser() -> argparse.ArgumentParser:
     stream = subparsers.add_parser("stream", help="declare a new datastream")
     stream_commands = stream.add_subparsers(dest="stream_command", required=True)
     stream_add = stream_commands.add_parser(
-        "add", help="declare a point-in-time stream and its column mapping"
+        "add", help="declare a new stream (event or interval) and its column mapping"
     )
     stream_add.add_argument("--key", required=True, help="stable slug, e.g. 'heart_rate'")
     stream_add.add_argument("--name", required=True, help="human-facing label")
     stream_add.add_argument(
-        "--kind", choices=("event",), default="event", help="stream kind (only 'event' today)"
+        "--kind",
+        choices=("event", "interval"),
+        default="event",
+        help="'event' for one instant per row, 'interval' for a start/end span per row",
     )
     stream_add.add_argument(
         "--from",
@@ -565,9 +580,26 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         metavar="COLUMN=ROLE",
-        help="override a guessed column role (at, category, source_id, number, text); repeatable",
+        help=(
+            "override a guessed column role (at, start, end, category, source_id, number, text,"
+            " ignored); repeatable"
+        ),
+    )
+    stream_add.add_argument(
+        "--exclusive",
+        action="store_true",
+        help=(
+            "reject overlapping spans (only meaningful for --kind interval; a single-tasking"
+            " source like Timecard, not the norm for a calendar-style one)"
+        ),
     )
     stream_add.set_defaults(handler=cmd_stream_add)
+
+    stream_delete = stream_commands.add_parser(
+        "delete", help="permanently delete a stream and everything recorded in it"
+    )
+    stream_delete.add_argument("--key", required=True, help="the stream to delete")
+    stream_delete.set_defaults(handler=cmd_stream_delete)
 
     streams = subparsers.add_parser("streams", help="list every declared stream")
     streams.set_defaults(handler=cmd_streams)
@@ -654,9 +686,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-fields", action="store_true", help="skip numeric event-field measures"
     )
     correlate.add_argument(
-        "--field-sum",
+        "--no-field-sum",
         action="store_true",
-        help="also test a numeric field's sum, alongside its mean",
+        help="skip a numeric field's sum, testing only its mean",
     )
     correlate.add_argument(
         "--all-intervals",

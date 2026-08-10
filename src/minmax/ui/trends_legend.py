@@ -16,9 +16,9 @@ from PySide6.QtCore import QRectF, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QFontMetrics, QMouseEvent, QPainter, QPaintEvent
 from PySide6.QtWidgets import QSizePolicy, QWidget
 
-from minmax.api import StreamKind, TrendSeries
-from minmax.api.format import format_measure
+from minmax.api import StreamKind, TrendMetric, TrendSeries
 from minmax.ui import theme
+from minmax.ui.trends_view import format_trend_amount
 
 __all__ = ["TrendsLegend"]
 
@@ -31,9 +31,17 @@ PADDING = 12
 DURATION_COLUMN = 82
 SHARE_COLUMN = 56
 
+_DEFAULT_METRIC = TrendMetric(label="")
+
 
 class TrendsLegend(QWidget):
-    """One row per series: swatch, label, share of the visible window, total."""
+    """One row per series: swatch, label, share of the visible window, value.
+
+    "Share" only means something for a stacking metric -- a mean has no whole
+    for a share to be a fraction of, so :attr:`TrendMetric.stacks` switches
+    the heading and drops the percentage column entirely rather than showing
+    a number that would not add up to 100%.
+    """
 
     seriesActivated = Signal(str)
 
@@ -41,8 +49,9 @@ class TrendsLegend(QWidget):
         super().__init__(parent)
         self._series: list[TrendSeries] = []
         self._shares: list[float] = []
-        self._totals: list[int] = []
+        self._values: list[float] = []
         self._stream_kind = StreamKind.INTERVAL
+        self._metric = _DEFAULT_METRIC
         self.setMinimumWidth(300)
         self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
         self.setMouseTracking(True)
@@ -51,14 +60,16 @@ class TrendsLegend(QWidget):
         self,
         series: list[TrendSeries],
         shares: list[float],
-        totals: list[int],
+        values: list[float],
         *,
         stream_kind: StreamKind = StreamKind.INTERVAL,
+        metric: TrendMetric = _DEFAULT_METRIC,
     ) -> None:
         self._series = series
         self._shares = shares
-        self._totals = totals
+        self._values = values
         self._stream_kind = stream_kind
+        self._metric = metric
         self.update()
 
     def sizeHint(self) -> QSize:
@@ -78,6 +89,8 @@ class TrendsLegend(QWidget):
         dark = theme.is_dark(appearance)
         text_colour = appearance.color(appearance.currentColorGroup(), appearance.ColorRole.Text)
         metrics = QFontMetrics(self.font())
+        stacks = self._metric.stacks
+        share_column = SHARE_COLUMN if stacks else 0
 
         heading = QFont(self.font())
         heading.setBold(True)
@@ -86,14 +99,13 @@ class TrendsLegend(QWidget):
         painter.drawText(
             QRectF(PADDING, 6, self.width() - PADDING * 2, 22),
             int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
-            "SHARE OF VISIBLE RANGE",
+            "SHARE OF VISIBLE RANGE" if stacks else "AVERAGE OVER VISIBLE RANGE",
         )
         painter.setFont(self.font())
 
         for index, series in enumerate(self._series):
             top = 32 + index * ROW_HEIGHT
-            share = self._shares[index] if index < len(self._shares) else 0.0
-            total = self._totals[index] if index < len(self._totals) else 0
+            value = self._values[index] if index < len(self._values) else 0.0
 
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(QColor(series.swatch.for_surface(dark=dark)))
@@ -105,33 +117,35 @@ class TrendsLegend(QWidget):
             # beside it is what carries identity.
             painter.setPen(text_colour)
             label_left = PADDING + SWATCH + 8
-            label_width = self.width() - label_left - SHARE_COLUMN - DURATION_COLUMN - PADDING
+            label_width = self.width() - label_left - share_column - DURATION_COLUMN - PADDING
             painter.drawText(
                 QRectF(label_left, top, label_width, ROW_HEIGHT),
                 int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
                 metrics.elidedText(series.label, Qt.TextElideMode.ElideMiddle, int(label_width)),
             )
 
-            share_font = QFont(self.font())
-            share_font.setBold(True)
-            painter.setFont(share_font)
-            painter.drawText(
-                QRectF(
-                    self.width() - DURATION_COLUMN - SHARE_COLUMN - PADDING,
-                    top,
-                    SHARE_COLUMN,
-                    ROW_HEIGHT,
-                ),
-                int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter),
-                f"{share:.1%}",
-            )
+            if stacks:
+                share = self._shares[index] if index < len(self._shares) else 0.0
+                share_font = QFont(self.font())
+                share_font.setBold(True)
+                painter.setFont(share_font)
+                painter.drawText(
+                    QRectF(
+                        self.width() - DURATION_COLUMN - share_column - PADDING,
+                        top,
+                        share_column,
+                        ROW_HEIGHT,
+                    ),
+                    int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter),
+                    f"{share:.1%}",
+                )
+                painter.setFont(self.font())
 
-            painter.setFont(self.font())
             painter.setPen(theme.subdued_text(appearance))
             painter.drawText(
                 QRectF(self.width() - DURATION_COLUMN - PADDING, top, DURATION_COLUMN, ROW_HEIGHT),
                 int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter),
-                format_measure(total, self._stream_kind),
+                format_trend_amount(value, self._metric, self._stream_kind),
             )
 
     def _series_at(self, y: float) -> TrendSeries | None:
@@ -142,13 +156,13 @@ class TrendsLegend(QWidget):
 
     def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
         series = self._series_at(event.position().y())
-        if series is not None and series.can_drill and not series.is_other:
+        if series is not None and (series.can_drill or series.is_other):
             self.seriesActivated.emit(series.label)
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
         series = self._series_at(event.position().y())
-        drillable = series is not None and series.can_drill and not series.is_other
+        clickable = series is not None and (series.can_drill or series.is_other)
         self.setCursor(
-            Qt.CursorShape.PointingHandCursor if drillable else Qt.CursorShape.ArrowCursor
+            Qt.CursorShape.PointingHandCursor if clickable else Qt.CursorShape.ArrowCursor
         )
         super().mouseMoveEvent(event)

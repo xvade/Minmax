@@ -9,6 +9,7 @@ from minmax.api.client import (
     AUTO_INTERVAL,
     DAILY_INTERVAL,
     MAX_INTERVAL_COUNT,
+    Aggregate,
     CategorySlice,
     CorrelationRow,
     CorrelationsView,
@@ -28,18 +29,22 @@ from minmax.api.client import (
     TimelineRecord,
     TimelineWindow,
     TrendColumn,
+    TrendMetric,
     TrendSeries,
     TrendsView,
+    other_breakdown,
     system_timezone,
 )
-from minmax.api.format import format_duration
+from minmax.api.format import format_duration, format_value
 from minmax.core.models import FieldRole, FieldSpec
 from minmax.core.palette import Swatch
+from minmax.ingest import validate_declaration
 
 __all__ = [
     "AUTO_INTERVAL",
     "DAILY_INTERVAL",
     "MAX_INTERVAL_COUNT",
+    "Aggregate",
     "CategorySlice",
     "CorrelationRow",
     "CorrelationsView",
@@ -62,8 +67,12 @@ __all__ = [
     "TimelineRecord",
     "TimelineWindow",
     "TrendColumn",
+    "TrendMetric",
     "TrendSeries",
     "TrendsView",
     "format_duration",
+    "format_value",
+    "other_breakdown",
     "system_timezone",
+    "validate_declaration",
 ]

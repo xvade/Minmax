@@ -312,6 +312,189 @@ class TestStreamCommands:
         assert run(home, "day", "--stream", "pickups", "2026-06-06") == 2
         assert "only supports interval streams" in capsys.readouterr().err
 
+    def test_stream_add_kind_interval_end_to_end(
+        self, home: Path, sessions_csv: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        assert (
+            run(
+                home,
+                "stream",
+                "add",
+                "--key",
+                "sessions",
+                "--name",
+                "Sessions",
+                "--kind",
+                "interval",
+                "--from",
+                str(sessions_csv),
+                "--role",
+                "project=category",
+            )
+            == 0
+        )
+        out = capsys.readouterr().out
+        assert "created stream 'sessions'" in out
+        assert "session_start        -> start" in out
+        assert "session_end          -> end" in out
+        assert "project              -> category" in out
+        assert "note                 -> ignored" in out
+
+        assert run(home, "streams") == 0
+        listed = capsys.readouterr().out
+        assert "sessions  (interval)" in listed
+        # streams' listing skips structural roles (start/end), same as 'at'
+        # for an event stream.
+        assert "session_start" not in listed
+        assert "project" in listed
+
+        assert run(home, "import", str(sessions_csv), "--stream", "sessions") == 0
+        out = capsys.readouterr().out
+        assert "2 new" in out
+        assert "2 rejected" in out
+
+        assert run(home, "day", "--stream", "sessions", "2026-06-06") == 0
+        out = capsys.readouterr().out
+        assert "work" in out and "break" in out
+
+    def test_stream_add_requires_exactly_one_start_and_end_column(
+        self, home: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        no_time = tmp_path / "no_time.csv"
+        no_time.write_text("a,b\n1,2\n3,4\n", encoding="utf-8")
+        assert (
+            run(
+                home,
+                "stream",
+                "add",
+                "--key",
+                "odd",
+                "--name",
+                "Odd",
+                "--kind",
+                "interval",
+                "--from",
+                str(no_time),
+            )
+            == 2
+        )
+        assert "exactly one column must have role 'start'" in capsys.readouterr().err
+
+    def test_stream_add_rejects_a_value_column_on_an_interval_stream(
+        self, home: Path, sessions_csv: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        assert (
+            run(
+                home,
+                "stream",
+                "add",
+                "--key",
+                "sessions",
+                "--name",
+                "Sessions",
+                "--kind",
+                "interval",
+                "--from",
+                str(sessions_csv),
+                "--role",
+                "note=number",
+            )
+            == 2
+        )
+        assert "cannot store value columns" in capsys.readouterr().err
+
+    def test_exclusive_flag_rejects_overlapping_spans_default_does_not(
+        self, home: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        overlapping = tmp_path / "overlapping.csv"
+        overlapping.write_text(
+            "start,end\n"
+            "2026-06-06T08:00:00-07:00,2026-06-06T09:00:00-07:00\n"
+            "2026-06-06T08:30:00-07:00,2026-06-06T10:00:00-07:00\n",
+            encoding="utf-8",
+        )
+
+        run(
+            home,
+            "stream",
+            "add",
+            "--key",
+            "calendar",
+            "--name",
+            "Calendar",
+            "--kind",
+            "interval",
+            "--exclusive",
+            "--from",
+            str(overlapping),
+        )
+        capsys.readouterr()
+        assert run(home, "streams") == 0
+        assert "calendar  (interval, exclusive)" in capsys.readouterr().out
+
+        assert run(home, "import", str(overlapping), "--stream", "calendar") == 1
+        assert "overlap" in capsys.readouterr().err.lower()
+
+    def test_a_non_exclusive_interval_stream_accepts_overlapping_spans(
+        self, home: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        overlapping = tmp_path / "overlapping.csv"
+        overlapping.write_text(
+            "start,end\n"
+            "2026-06-06T08:00:00-07:00,2026-06-06T09:00:00-07:00\n"
+            "2026-06-06T08:30:00-07:00,2026-06-06T10:00:00-07:00\n",
+            encoding="utf-8",
+        )
+        run(
+            home,
+            "stream",
+            "add",
+            "--key",
+            "calendar",
+            "--name",
+            "Calendar",
+            "--kind",
+            "interval",
+            "--from",
+            str(overlapping),
+        )
+        capsys.readouterr()
+
+        assert run(home, "import", str(overlapping), "--stream", "calendar") == 0
+        assert "2 new" in capsys.readouterr().out
+
+
+class TestStreamDeletion:
+    def test_deleting_a_stream_removes_it_and_its_data(
+        self, home: Path, heart_rate_csv: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        run(
+            home,
+            "stream",
+            "add",
+            "--key",
+            "heart_rate",
+            "--name",
+            "Heart Rate",
+            "--from",
+            str(heart_rate_csv),
+        )
+        run(home, "import", str(heart_rate_csv), "--stream", "heart_rate")
+        capsys.readouterr()
+
+        assert run(home, "stream", "delete", "--key", "heart_rate") == 0
+        out = capsys.readouterr().out
+        assert "deleted stream 'heart_rate' (event)" in out
+
+        assert run(home, "streams") == 0
+        assert "no streams yet" in capsys.readouterr().out
+
+    def test_deleting_an_unknown_key_fails_clearly(
+        self, home: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        assert run(home, "stream", "delete", "--key", "nonexistent") == 2
+        assert "no stream" in capsys.readouterr().err
+
 
 class TestMaintenanceCommands:
     def test_revert_removes_an_import(
@@ -489,3 +672,57 @@ class TestCorrelateCommand:
         err = capsys.readouterr().err
         assert "scipy" in err
         assert "uv sync --extra analysis" in err
+
+    @pytest.fixture
+    def numeric_field_stream(
+        self, home: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> Path:
+        """A point-in-time stream with one numeric field -- enough on its own
+        for a sweep to have a count, a mean, and (when included) a sum
+        measure to count and pair against each other."""
+        csv_path = tmp_path / "readings.csv"
+        lines = ["measured_at,value"]
+        for i in range(20):
+            day = date(2026, 3, 2) + timedelta(days=i)
+            lines.append(f"{day.isoformat()}T08:00:00-07:00,{10 + i}")
+        csv_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        assert (
+            run(
+                home,
+                "stream",
+                "add",
+                "--key",
+                "readings",
+                "--name",
+                "Readings",
+                "--from",
+                str(csv_path),
+            )
+            == 0
+        )
+        assert run(home, "import", str(csv_path), "--stream", "readings") == 0
+        capsys.readouterr()
+        return home
+
+    def test_field_sum_is_a_default_candidate(
+        self, numeric_field_stream: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # A single numeric-field stream already has three measures to count
+        # against each other: its count, its field's mean, and (by default
+        # now) its field's sum.
+        import json
+
+        assert run(numeric_field_stream, "correlate", "--json", "--min-r", "0.0") == 0
+        assert json.loads(capsys.readouterr().out)["series_count"] == 3
+
+    def test_no_field_sum_drops_it(
+        self, numeric_field_stream: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import json
+
+        assert (
+            run(numeric_field_stream, "correlate", "--json", "--min-r", "0.0", "--no-field-sum")
+            == 0
+        )
+        assert json.loads(capsys.readouterr().out)["series_count"] == 2

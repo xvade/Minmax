@@ -144,7 +144,11 @@ src/minmax/
 ├── ingest/          # Getting foreign data in. One module per source.
 │   ├── base.py      #   Importer protocol, ParseResult, the import pipeline
 │   ├── archive.py   #   Byte-for-byte raw file archiving + content hashing
-│   └── timecard.py  #   Timecard CSV → IntervalRecord
+│   ├── rows.py      #   Row-level parsing helpers shared by every CSV importer
+│   ├── csvstream.py #   CsvStreamImporter/IntervalCsvImporter -- declared,
+│                    #   no-code streams of either kind (§6.1)
+│   └── timecard.py  #   Timecard CSV → IntervalRecord (hand-written; the only
+│                    #   stream with golden tests against a real export)
 │
 ├── analysis/        # Statistics over stored data. Reads rollups; never writes history.
 │   ├── catalog.py   #   Candidate Measures and pairs worth testing (§7.1)
@@ -177,6 +181,8 @@ src/minmax/
 │   ├── record_inspector.py# Full detail and provenance for one record
 │   ├── trends_view.py# Stacked area over columns: paint and input only
 │   ├── trends_legend.py# Per-group share of the visible columns
+│   ├── correlations_view.py# The correlation sweep's results table -- a
+│                    #   native QTableWidget, nothing custom-painted (§7.1)
 │   └── theme.py     #   Colours derived from the system palette (light/dark)
 │
 └── cli.py           # Command-line entry point. A thin shell over the layers
@@ -288,6 +294,19 @@ limitation this leaves: a stream with *no* declared fields has a constant
 hash, so two field-less events landing in the same second collapse into one.
 The fix, if it is ever needed, is to declare a field that distinguishes them —
 not a schema change.
+
+**`stream_field` also carries a declared interval stream's column mapping**
+(`START`/`END`/`CATEGORY`/`SOURCE_ID`/`IGNORED` roles, migration `0006`), not
+only an event stream's. This does not reopen the EAV-vs-fixed-columns choice
+above — it is the opposite case, restated: an interval's payload *is*
+fixed-shape (a category and a span), so `interval_record` keeps its own fixed
+columns and gained no `event_value`-style table. `stream_field` was already
+structurally kind-agnostic (`create_stream`/`stream_fields` never branched on
+kind); only its role vocabulary was event-only. A declared interval stream
+therefore cannot carry `NUMBER`/`TEXT` columns — there is nowhere to store
+them, and an importer rejects a declaration that tries (`ingest.csvstream.
+validate_declaration`). An interval CSV's extra columns (Timecard's own
+`duration_seconds`, say) are declared `IGNORED` rather than mapped anywhere.
 
 ### 6.2 Auto-fetch: a remembered path, re-imported on a timer
 
@@ -427,8 +446,21 @@ return an empty table against the amount of data Minmax has today. A pair's
 lengths, or only the one the sweep happened to find) is treated as the more
 trustworthy signal.
 
-This is a CLI feature today (`minmax correlate`) — no GUI screen, and nothing
-in `api/client.trends()` or `ui/` changed to build it (see **D7**).
+Reachable two ways: `minmax correlate` on the command line, and a third
+desktop screen (`ui/correlations_view.py`'s `CorrelationsTable`, wired up by
+`main_window.py`'s `CorrelationsScreen`) reachable with `3`. Both call the
+same `MinmaxClient.correlations()` and render the same
+`CorrelationRow`/`CorrelationsView` transfer objects — nothing analysis- or
+statistics-specific lives in `ui/`. The screen is deliberately **not** scoped
+to one stream the way `DayScreen`/`TrendsScreen` are (the whole point of the
+engine is comparing *across* streams), so it does not participate in
+`MainWindow.set_stream()`/the stream picker, and its sweep is not run until
+the screen is actually shown for the first time, or data changes while it is
+already the visible one — recomputing a cross-stream sweep on every launch or
+stream switch would be wasted work most of the time. Neither surface touched
+`api/client.trends()` or the rest of `ui/` at the time (see **D7**) — that
+stopped being true once the trends chart itself gained a field-metric
+selector (**D8**).
 
 ## 8. The UI boundary
 
@@ -596,9 +628,9 @@ How each goal in `AGENTS.md` lands in the structure above.
 |---|---|---|
 | Import/store/retrieve timetracking ✅ | `ingest/timecard.py`, `storage/` | — |
 | UI for timetracking ✅ | `ui/`, `api/client.py` | — |
-| Trends over time ✅ | `ui/trends_view.py`, `core/trends.py`, `core/columns.py` | reads `rollup` (day); every interval from a fortnight to a year is summed from it, so no second rollup period is needed |
-| Correlation engine ✅ (level correlations, CLI) | `analysis/`, `minmax correlate` | reads `rollup`/`field_rollup` (day), via `core/measures.py` (§7.1) |
-| Streams beyond timetracking ✅ | `ingest/csvstream.py`, `storage/` (§6.1) | a point-in-time stream is user-declared, not a new module per source -- see D5 |
+| Trends over time ✅ | `ui/trends_view.py`, `core/trends.py`, `core/columns.py` | reads `rollup` (day), or `field_rollup` for a declared numeric field's total/average (§7.1, D8); every interval from a fortnight to a year is summed from it, so no second rollup period is needed |
+| Correlation engine ✅ (level correlations, CLI + desktop screen) | `analysis/`, `minmax correlate`, `ui/correlations_view.py` | reads `rollup`/`field_rollup` (day), via `core/measures.py` (§7.1) |
+| Streams beyond timetracking ✅ (event and interval, both no-code) | `ingest/csvstream.py`, `storage/` (§6.1) | a declared stream of either kind is user-declared, not a new module per source -- see D5 |
 | Multi-stream timeline | `ui/`, one new `api` query | still one stream on screen at a time -- the picker switches between streams, not several overlaid |
 | Cross-stream correlation ✅ | `analysis/catalog.py` | came for free: a `Measure` doesn't know or care which stream it reads from |
 | Recommendations / "Increase X" → advice queries | `analysis/` | ranks existing correlations; needs a query interface on top, not a new engine |
@@ -779,8 +811,9 @@ units is small multiples or an indexed comparison, never a second axis.
 ### D7 — The `Measure` abstraction, built for the correlation engine
 
 D6's stated trigger was a numeric field's own aggregate reaching *the trends
-chart*. That has not happened — `api/client.trends()` and everything under
-`ui/` are unchanged by this decision. What actually fired is the same
+chart*. That had not happened yet at the time of this decision — see **D8**
+for when it did — `api/client.trends()` and everything under `ui/` were
+unchanged by this one. What actually fired first is the same
 underlying condition D6 named (a numeric field's mean/sum/min/max needing to
 reach a real consumer, not a guessed one): the correlation engine
 ([§7.1](#71-the-correlation-engine-measures-and-a-period-sweep)) needs to
@@ -811,6 +844,60 @@ could otherwise conclude more was unified than actually was:
 its own reduction rules that would be guessed at, the exact mistake D6 was
 about not repeating.
 
-*Revisit if:* the trends chart ever needs to plot a numeric field's own
-aggregate (not just an event count) — at that point `Measure` has two real
-callers and unifying the chart onto it stops being speculative.
+*Revisited in* **D8**, where the trends chart gained exactly this: a numeric
+field's own total and average, not just an event count.
+
+### D8 — The trends chart's metric selector: `Aggregate` reused, `Measure`/`SeriesLoader` not
+
+D7 predicted correctly what would trigger this: the trends chart needing to
+plot a declared numeric field's own total or average, not just an event
+count. `TrendsScreen` now offers a dropdown — Count, `<field>` total,
+`<field>` average — backed by `MinmaxClient.trends(field_key=...,
+aggregate=...)` and a new `TrendMetric` transfer object (`api/client.py`)
+carrying the chosen metric's label, unit, field key, aggregate, and whether
+it stacks.
+
+**What was reused from D7's `Measure` work:** `core.measures.Aggregate`
+(`SUM`/`MEAN`), and the invariant it exists to enforce — a multi-day mean is
+`Σvalue_sum / Σvalue_count` over the days it covers, never the mean of the
+days' own means. `TrendSeries` grew a `weights` field for exactly this,
+alongside `values`; the two are divided only once, at the last moment before
+display, the same rule `Measure.reduce` and `DailyValue.weight` already
+encode for the correlation engine.
+
+**What was not reused: `Measure`/`DailyValue`/`SeriesLoader` themselves.**
+That machinery is shaped for the correlation engine's problem — many streams,
+each read once and cached per *day*, aligned across an arbitrary sweep of
+period lengths chosen after the fact. The trends chart's problem is
+different: one stream, already grouped into calendar *columns*
+(`core/trends.py`'s existing day/week/month/custom-count machinery), needing
+per-column values *and* weights per category so that ranking, the
+`max_series` cap, and the "Other" fold all keep working the way they already
+did for a count or a duration. Threading `SeriesLoader`'s per-day cache
+through `columns_for`'s grouping would mean deriving column boundaries a
+second way; reading `Repository.daily_field_totals_by_category` straight into
+the same `column_of` lookup `trends()` already builds for `rollup` rows was
+more direct.
+
+**An average cannot stack, so it does not try to.** `TrendMetric.stacks` is
+false for `Aggregate.MEAN`, and `TrendsChart` grows a second, parallel paint
+path (`_line_values`/`_paint_lines`) alongside the existing stacked-band one,
+rather than forcing both shapes into one code path. A category with no
+reading in a column plots as a gap (`None`), not a false zero — the same
+honesty [§8.2](#82-columns-and-why-they-are-plotted-as-averages) already
+insists on for an empty column's stacked height. The one-axis rule
+([§8.1](#81-chart-rules)) holds the way D6 anticipated it would: switching
+the metric replaces the axis: it never adds a second one.
+
+*Rejected:* generalizing `TrendsChart`/`TrendSeries` onto `Measure` itself —
+e.g. a `TrendsView` that holds a `Measure` and reads `SeriesLoader` output
+directly. The column/day mismatch above is one reason; `SeriesLoader` also
+has no notion of the `prefix`-scoped drill-down or the `max_series`-driven
+"Other" fold the chart needs, and retrofitting those onto it would have made
+the correlation engine's code harder to read for a chart-only need.
+
+*Revisit if:* a third caller needs the same "per-column value and weight,
+ranked and capped" shape `InProcessClient.trends()` just grew a bespoke
+version of — at that point factoring it out into something
+`SeriesLoader`-adjacent is worth doing. One caller doing it inline is not yet
+a pattern.

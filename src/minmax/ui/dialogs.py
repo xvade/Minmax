@@ -15,6 +15,7 @@ from pathlib import Path
 from PySide6.QtCore import QDate, Qt
 from PySide6.QtGui import QKeySequence
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QDateEdit,
     QDialog,
@@ -35,7 +36,16 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from minmax.api import MAX_INTERVAL_COUNT, CsvPreview, FieldRole, FieldSpec, Granularity, Interval
+from minmax.api import (
+    MAX_INTERVAL_COUNT,
+    CsvPreview,
+    FieldRole,
+    FieldSpec,
+    Granularity,
+    Interval,
+    StreamKind,
+    validate_declaration,
+)
 from minmax.ui.shortcuts import SCOPE_TITLES, SCOPES, Action, ShortcutMap
 
 __all__ = [
@@ -261,15 +271,58 @@ class RangeDialog(QDialog):
         return (_pydate(self._since.date()), _pydate(self._until.date()))
 
 
-class NewStreamDialog(QDialog):
-    """Declare a point-in-time stream: pick a CSV, name it, and assign roles.
+#: Combo contents per kind, in display order. A column's role is read back
+#: by index into this tuple rather than via ``combo.currentData()`` -- see
+#: ``_current_fields``'s docstring for why -- so ``_populate_fields`` and
+#: ``_current_fields`` must always agree on the same tuple for a given kind.
+_ROLES_FOR_KIND: dict[StreamKind, tuple[FieldRole, ...]] = {
+    StreamKind.EVENT: (
+        FieldRole.AT,
+        FieldRole.CATEGORY,
+        FieldRole.SOURCE_ID,
+        FieldRole.NUMBER,
+        FieldRole.TEXT,
+        FieldRole.IGNORED,
+    ),
+    StreamKind.INTERVAL: (
+        FieldRole.START,
+        FieldRole.END,
+        FieldRole.CATEGORY,
+        FieldRole.SOURCE_ID,
+        FieldRole.IGNORED,
+    ),
+}
 
-    Roles are guessed from the file -- confidently for the timestamp,
-    conservatively (number vs. text) for everything else -- and start there,
-    but every column's role is an ordinary dropdown a reader can change:
-    nothing is committed until "Create" is pressed. ``inspect`` is injected
-    rather than reaching for the client directly so this stays constructible
-    in a test without a real file on disk.
+#: The "Kind" combo's contents, in display order -- same index-not-currentData
+#: discipline as ``_ROLES_FOR_KIND``, since ``StreamKind`` is also a ``StrEnum``.
+_KINDS: tuple[StreamKind, ...] = (StreamKind.EVENT, StreamKind.INTERVAL)
+
+
+@dataclass(frozen=True, slots=True)
+class NewStreamChoice:
+    """What :class:`NewStreamDialog` returns once "Create" is pressed.
+
+    ``path`` is the CSV just inspected, so the caller can offer to import it
+    immediately.
+    """
+
+    key: str
+    name: str
+    kind: StreamKind
+    exclusive: bool
+    fields: list[FieldSpec]
+    path: Path
+
+
+class NewStreamDialog(QDialog):
+    """Declare a new stream: pick a CSV, name it, choose its kind, and assign roles.
+
+    Roles are guessed from the file -- confidently for the timestamp column(s),
+    conservatively (number vs. text) for an event stream's other columns --
+    and start there, but every column's role is an ordinary dropdown a reader
+    can change: nothing is committed until "Create" is pressed. ``inspect`` is
+    injected rather than reaching for the client directly so this stays
+    constructible in a test without a real file on disk.
     """
 
     def __init__(
@@ -277,7 +330,7 @@ class NewStreamDialog(QDialog):
         parent: QWidget,
         *,
         existing_keys: Sequence[str],
-        inspect: Callable[[Path], CsvPreview],
+        inspect: Callable[..., CsvPreview],
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("New stream")
@@ -303,9 +356,22 @@ class NewStreamDialog(QDialog):
         self._key.setPlaceholderText("heart_rate")
         self._key.textEdited.connect(self._on_key_edited)
 
+        self._kind = QComboBox()
+        self._kind.addItems(["Event (point-in-time)", "Interval (start/end span)"])
+        self._kind.currentIndexChanged.connect(self._on_kind_changed)
+        self._exclusive = QCheckBox("Exclusive -- reject overlapping spans")
+        self._exclusive.setToolTip(
+            "Only for a single-tasking source like Timecard; most interval streams"
+            " (a calendar, say) overlap freely and should leave this off."
+        )
+        self._exclusive.hide()
+        self._exclusive.stateChanged.connect(self._update_ok_state)
+
         form = QFormLayout()
         form.addRow("Name", self._name)
         form.addRow("Key", self._key)
+        form.addRow("Kind", self._kind)
+        form.addRow("", self._exclusive)
 
         self._fields_table = QTableWidget(0, 2)
         self._fields_table.setHorizontalHeaderLabels(["CSV column", "Role"])
@@ -335,6 +401,9 @@ class NewStreamDialog(QDialog):
         layout.addWidget(self._buttons)
         self.setLayout(layout)
 
+    def _current_kind(self) -> StreamKind:
+        return _KINDS[self._kind.currentIndex()]
+
     def _choose_file(self) -> None:
         path_str, _ = QFileDialog.getOpenFileName(
             self, "New stream", "", "CSV files (*.csv);;All files (*)"
@@ -343,21 +412,35 @@ class NewStreamDialog(QDialog):
             return
         self._path = Path(path_str)
         self._path_label.setText(self._path.name)
-        self._preview = self._inspect(self._path)
+        self._reinspect()
 
+        if self._preview is not None and self._preview.ok and not self._name.text():
+            self._name.setText(self._path.stem.replace("_", " ").replace("-", " ").title())
+            self._sync_key_from_name()
+
+    def _reinspect(self) -> None:
+        """Re-read the chosen file under the currently selected kind.
+
+        Called both after choosing a file and after switching kinds -- the
+        guess (which column is a timestamp vs. a start/end pair) depends on
+        the kind, so a kind change without this would leave stale roles from
+        the other shape showing.
+        """
+        if self._path is None:
+            return
+        self._preview = self._inspect(self._path, kind=self._current_kind())
         if not self._preview.ok:
             self._problem.setText(self._preview.error or "could not read that file")
             self._problem.show()
             self._fields_table.setRowCount(0)
-            self._update_ok_state()
-            return
-
-        self._problem.hide()
-        if not self._name.text():
-            self._name.setText(self._path.stem.replace("_", " ").replace("-", " ").title())
-            self._sync_key_from_name()
-        self._populate_fields()
+        else:
+            self._problem.hide()
+            self._populate_fields()
         self._update_ok_state()
+
+    def _on_kind_changed(self, _index: int) -> None:
+        self._exclusive.setVisible(self._current_kind() is StreamKind.INTERVAL)
+        self._reinspect()
 
     def _sync_key_from_name(self) -> None:
         if not self._key_edited_by_hand:
@@ -373,6 +456,7 @@ class NewStreamDialog(QDialog):
 
     def _populate_fields(self) -> None:
         assert self._preview is not None
+        roles = _ROLES_FOR_KIND[self._current_kind()]
         self._fields_table.setRowCount(0)
         for spec in self._preview.suggested_fields:
             row = self._fields_table.rowCount()
@@ -380,23 +464,23 @@ class NewStreamDialog(QDialog):
             self._fields_table.setItem(row, 0, QTableWidgetItem(spec.source_column))
 
             combo = QComboBox()
-            for role in FieldRole:
+            for role in roles:
                 combo.addItem(role.value.replace("_", " "))
-            combo.setCurrentIndex(list(FieldRole).index(spec.role))
+            combo.setCurrentIndex(roles.index(spec.role))
             combo.currentIndexChanged.connect(self._update_ok_state)
             self._fields_table.setCellWidget(row, 1, combo)
 
     def _current_fields(self) -> list[FieldSpec]:
         """The declared fields with whatever role each dropdown now shows.
 
-        Read back by index into ``FieldRole`` rather than via
+        Read back by index into the current kind's role tuple rather than via
         ``combo.currentData()``: ``FieldRole`` is a ``StrEnum``, and PySide6's
         ``QVariant`` round-trip silently coerces it to a plain ``str`` on the
         way back out, which would make every ``is FieldRole.X`` check below
         fail despite the value comparing equal.
         """
         assert self._preview is not None
-        roles = list(FieldRole)
+        roles = _ROLES_FOR_KIND[self._current_kind()]
         fields: list[FieldSpec] = []
         for row, spec in enumerate(self._preview.suggested_fields):
             combo = self._fields_table.cellWidget(row, 1)
@@ -423,18 +507,17 @@ class NewStreamDialog(QDialog):
             return False
         if not self._name.text().strip():
             return False
-        at_fields = [f for f in self._current_fields() if f.role is FieldRole.AT]
-        return len(at_fields) == 1
+        return validate_declaration(self._current_fields(), self._current_kind()) is None
 
-    def selection(self) -> tuple[str, str, list[FieldSpec], Path]:
-        """``(key, name, fields, path)``. ``path`` is the CSV just inspected,
-        so the caller can offer to import it immediately."""
+    def selection(self) -> NewStreamChoice:
         assert self._path is not None
-        return (
-            self._key.text().strip(),
-            self._name.text().strip(),
-            self._current_fields(),
-            self._path,
+        return NewStreamChoice(
+            key=self._key.text().strip(),
+            name=self._name.text().strip(),
+            kind=self._current_kind(),
+            exclusive=self._exclusive.isChecked(),
+            fields=self._current_fields(),
+            path=self._path,
         )
 
 

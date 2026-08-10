@@ -41,13 +41,15 @@ CONFIG_VERSION = 1
 GLOBAL = "global"
 DAY = "day"
 TRENDS = "trends"
+CORRELATIONS = "correlations"
 
-SCOPES = (GLOBAL, DAY, TRENDS)
+SCOPES = (GLOBAL, DAY, TRENDS, CORRELATIONS)
 
 SCOPE_TITLES = {
     GLOBAL: "Anywhere",
     DAY: "Day view",
     TRENDS: "Trends view",
+    CORRELATIONS: "Correlations view",
 }
 
 
@@ -80,6 +82,20 @@ ACTIONS: tuple[Action, ...] = (
     Action(GLOBAL, "prompt_for_import", "Import…", "Ctrl+I", "Import a source file"),
     Action(GLOBAL, "prompt_for_stream", "Switch stream…", "Ctrl+K", "Pick a different stream"),
     Action(GLOBAL, "prompt_for_new_stream", "New stream…", "Ctrl+N", "Declare a new datastream"),
+    Action(
+        GLOBAL,
+        "prompt_to_delete_stream",
+        "Delete stream…",
+        "Ctrl+Backspace",
+        "Permanently delete the current stream and everything in it",
+    ),
+    Action(
+        GLOBAL,
+        "show_correlations_screen",
+        "Correlations view",
+        "3",
+        "Cross-stream correlation sweep",
+    ),
     Action(DAY, "show_previous_day", "Previous day", "Left", "Move back one day"),
     Action(DAY, "show_next_day", "Next day", "Right", "Move forward one day"),
     Action(DAY, "show_today", "Today", "T", "Jump to today"),
@@ -100,11 +116,13 @@ ACTIONS: tuple[Action, ...] = (
     Action(TRENDS, "zoom_out", "Show more columns", "-", "Fit more columns on screen"),
     Action(TRENDS, "fit_all", "Fit all", "F", "Show the whole range at once"),
     Action(TRENDS, "toggle_normalised", "Percentage view", "N", "Hours, or share of each column"),
+    Action(TRENDS, "cycle_metric", "Metric", "M", "Cycle count, total, and average"),
     Action(TRENDS, "cycle_interval", "Interval", "D", "Cycle auto, daily, weekly, monthly"),
     Action(TRENDS, "prompt_for_interval", "Interval…", "Shift+D", "Set how long a column covers"),
     Action(TRENDS, "prompt_for_range", "Range…", "R", "Pin the chart to a fixed date range"),
     Action(TRENDS, "clear_range", "All history", "Shift+R", "Unpin the range"),
     Action(TRENDS, "pop_focus", "Back out", "Escape", "Leave the focused group"),
+    Action(CORRELATIONS, "refresh", "Refresh", "R", "Re-run the correlation sweep"),
 )
 
 

@@ -43,15 +43,15 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import QSizePolicy, QToolTip, QWidget
 
-from minmax.api import StreamKind, TrendsView
-from minmax.api.format import format_duration, format_measure
+from minmax.api import StreamKind, TrendMetric, TrendsView
+from minmax.api.format import format_duration, format_measure, format_value
 from minmax.core.trends import (
     DEFAULT_PIXELS_PER_COLUMN,
     TrendsGeometry,
     clamp_column_zoom,
     fit_column_zoom,
-    nice_count_ceiling,
     nice_seconds_ceiling,
+    nice_value_ceiling,
     stack_bands,
     tick_interval_columns,
     visible_column_range,
@@ -59,7 +59,7 @@ from minmax.core.trends import (
 )
 from minmax.ui import theme
 
-__all__ = ["TrendsChart"]
+__all__ = ["TrendsChart", "format_trend_amount"]
 
 AXIS_GUTTER = 58
 AXIS_STRIP = 34
@@ -86,8 +86,13 @@ class TrendsChart(QWidget):
         #: when either changes rather than on every paint -- a paint can be
         #: triggered by a hover-driven crosshair move or a scroll, which would
         #: otherwise re-stack every column of a multi-year view dozens of
-        #: times a second for no change in the result.
+        #: times a second for no change in the result. Empty whenever the
+        #: view's metric does not stack -- see ``_lines`` instead.
         self._bands: list[list[tuple[float, float]]] = []
+        #: Per-column reading averages for a mean metric, recomputed only
+        #: when the view changes (never by normalisation, which a mean
+        #: metric refuses). Empty whenever the view's metric stacks.
+        self._lines: list[list[float | None]] = []
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
@@ -109,12 +114,25 @@ class TrendsChart(QWidget):
 
     def set_view(self, view: TrendsView) -> None:
         self._view = view
-        self._bands = stack_bands(self._plot_values(), normalise=self._normalised)
+        if not view.metric.stacks:
+            # A percentage of a set of averages means nothing -- there is no
+            # whole they add up to -- so a mean view never opens normalised.
+            self._normalised = False
+        self._bands = (
+            stack_bands(self._plot_values(), normalise=self._normalised)
+            if view.metric.stacks
+            else []
+        )
+        self._lines = [] if view.metric.stacks else self._line_values()
         self._scroll_offset = 0.0
         self.scroll_to_end()
         self.update()
 
     def set_normalised(self, normalised: bool) -> None:
+        if self._view is not None and not self._view.metric.stacks:
+            # Refused rather than silently ignored: a mean's bands are never
+            # built, so there is nothing here to normalise.
+            return
         if normalised != self._normalised:
             self._normalised = normalised
             self._bands = stack_bands(self._plot_values(), normalise=self._normalised)
@@ -138,10 +156,14 @@ class TrendsChart(QWidget):
             return None
         if self._normalised:
             ceiling = 1.0
-        elif self._view.stream_kind is StreamKind.EVENT:
-            ceiling = float(nice_count_ceiling(self._view.peak_daily_seconds))
+        elif self._view.stream_kind is StreamKind.INTERVAL:
+            # An interval stream's only metric is a duration, capped at 24h
+            # for a real reason (a day cannot hold more hours than that).
+            ceiling = float(nice_seconds_ceiling(self._view.peak_plot_value))
         else:
-            ceiling = float(nice_seconds_ceiling(self._view.peak_daily_seconds))
+            # An event count, a field's total, or a field's average all have
+            # no natural bound, so they share the generic 1-2-5 ceiling.
+            ceiling = float(nice_value_ceiling(self._view.peak_plot_value))
         return TrendsGeometry(
             column_count=len(self._view.columns),
             pixels_per_column=self._pixels_per_column,
@@ -150,12 +172,35 @@ class TrendsChart(QWidget):
         )
 
     def _plot_values(self) -> list[list[float]]:
-        """Per-column daily averages, which is what the bands are drawn from."""
+        """Per-column daily averages, which is what the bands are drawn from.
+
+        Only meaningful for a stacking metric -- see :meth:`_line_values` for
+        a mean one, which must not be divided by the column's day count a
+        second time.
+        """
         if self._view is None:
             return []
         spans = [max(1, column.day_count) for column in self._view.columns]
         return [
             [value / span for value, span in zip(series.values, spans, strict=True)]
+            for series in self._view.series
+        ]
+
+    def _line_values(self) -> list[list[float | None]]:
+        """Per-column reading averages for a mean metric.
+
+        ``None`` where a category recorded no reading that column: plotting
+        zero there would claim the reading *was* zero, the same false claim
+        :mod:`minmax.core.trends` already refuses to make about an empty
+        column's stacked height.
+        """
+        if self._view is None:
+            return []
+        return [
+            [
+                value / weight if weight else None
+                for value, weight in zip(series.values, series.weights, strict=True)
+            ]
             for series in self._view.series
         ]
 
@@ -259,7 +304,10 @@ class TrendsChart(QWidget):
         high = min(geometry.column_count - 1, last + 1)
 
         self._paint_value_grid(painter, geometry)
-        self._paint_bands(painter, geometry, low, high, dark=dark)
+        if self._view.metric.stacks:
+            self._paint_bands(painter, geometry, low, high, dark=dark)
+        else:
+            self._paint_lines(painter, geometry, low, high, dark=dark)
         self._paint_date_axis(painter, geometry, first, last)
         self._paint_crosshair(painter, geometry)
 
@@ -324,8 +372,13 @@ class TrendsChart(QWidget):
             painter.drawLine(AXIS_GUTTER, int(y), self.width(), int(y))
 
             painter.setPen(theme.gutter_text(appearance))
-            is_event = self._view is not None and self._view.stream_kind is StreamKind.EVENT
-            label = _axis_label(value, normalised=self._normalised, is_event=is_event)
+            assert self._view is not None  # geometry_model() already checked this
+            label = _axis_label(
+                value,
+                normalised=self._normalised,
+                metric=self._view.metric,
+                stream_kind=self._view.stream_kind,
+            )
             painter.drawText(
                 QRectF(0, y - 9, AXIS_GUTTER - 8, 18),
                 int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter),
@@ -361,6 +414,39 @@ class TrendsChart(QWidget):
             gap_pen.setWidthF(BAND_GAP)
             painter.setPen(gap_pen)
             painter.drawPolyline(QPolygonF(top_edge))
+
+        painter.setClipping(False)
+
+    def _paint_lines(
+        self, painter: QPainter, geometry: TrendsGeometry, low: int, high: int, *, dark: bool
+    ) -> None:
+        """A mean metric's series as unstacked lines rather than bands: an
+        average does not add, so nothing here is stacked or filled."""
+        if self._view is None:
+            return
+        painter.setClipRect(
+            QRectF(AXIS_GUTTER, 0, self.plot_width, self.plot_height + PLOT_PADDING_TOP)
+        )
+
+        for series, values in zip(self._view.series, self._lines, strict=True):
+            pen = painter.pen()
+            pen.setColor(QColor(series.swatch.for_surface(dark=dark)))
+            pen.setWidthF(2.0)
+            painter.setPen(pen)
+
+            # A run of consecutive readings, broken at each gap -- a missing
+            # column has no average to interpolate across.
+            segment: list[QPointF] = []
+            for column in range(low, high + 1):
+                value = values[column]
+                if value is None:
+                    if len(segment) > 1:
+                        painter.drawPolyline(QPolygonF(segment))
+                    segment = []
+                    continue
+                segment.append(self._plot_point(geometry, column, value))
+            if len(segment) > 1:
+                painter.drawPolyline(QPolygonF(segment))
 
         painter.setClipping(False)
 
@@ -464,50 +550,94 @@ class TrendsChart(QWidget):
 
     def _tooltip_for(self, column: int) -> str:
         assert self._view is not None
-        kind = self._view.stream_kind
-        span = self._view.columns[column]
-        total = sum(series.values[column] for series in self._view.series)
-
+        view = self._view
+        metric = view.metric
+        span = view.columns[column]
         lines = [span.detail_label]
-        if span.day_count > 1:
-            # A multi-day column needs both numbers: the total is what happened,
-            # the average is what the plotted height means.
-            lines.append(
-                f"{format_measure(total, kind)} over {span.day_count} days"
-                f"  ·  {format_measure(round(total / span.day_count), kind)}/day"
-            )
-        else:
-            # "N events tracked" reads oddly; "N events" already says enough.
-            suffix = "" if kind is StreamKind.EVENT else " tracked"
-            lines.append(f"{format_measure(total, kind)}{suffix}")
 
-        for series in sorted(self._view.series, key=lambda s: -s.values[column]):
-            if series.values[column]:
-                share = series.values[column] / total if total else 0.0
+        if metric.stacks:
+            kind = view.stream_kind
+            total = sum(series.values[column] for series in view.series)
+            if span.day_count > 1:
+                # A multi-day column needs both numbers: the total is what
+                # happened, the average is what the plotted height means.
                 lines.append(
-                    f"  {series.label}  {format_measure(series.values[column], kind)}  {share:.0%}"
+                    f"{format_trend_amount(total, metric, kind)} over {span.day_count} days"
+                    f"  ·  {format_trend_amount(total / span.day_count, metric, kind)}/day"
                 )
+            else:
+                # "N events tracked" reads oddly; "N events" (or a field's
+                # bare value) already says enough.
+                bare = metric.field_key is not None or kind is StreamKind.EVENT
+                suffix = "" if bare else " tracked"
+                lines.append(f"{format_trend_amount(total, metric, kind)}{suffix}")
+
+            for series in sorted(view.series, key=lambda s: -s.values[column]):
+                if series.values[column]:
+                    share = series.values[column] / total if total else 0.0
+                    amount = format_trend_amount(series.values[column], metric, kind)
+                    lines.append(f"  {series.label}  {amount}  {share:.0%}")
+        else:
+            # A mean does not sum to a meaningful whole, so there is no share
+            # to report -- only each series' own average this column, and the
+            # value-weighted average across all of them.
+            readings = [
+                (series, series.values[column] / series.weights[column])
+                for series in view.series
+                if series.weights[column]
+            ]
+            if readings:
+                overall_value = sum(series.values[column] for series, _ in readings)
+                overall_weight = sum(series.weights[column] for series, _ in readings)
+                overall = format_value(overall_value / overall_weight, unit=metric.unit)
+                lines.append(f"average {overall}")
+            else:
+                lines.append("no readings")
+            for series, average in sorted(readings, key=lambda item: -item[1]):
+                lines.append(f"  {series.label}  {format_value(average, unit=metric.unit)}")
+
         return "\n".join(lines)
 
     def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
-        """Double-clicking a band focuses that group, splitting it into children."""
-        if self._view is None:
+        """Double-clicking a band or line activates that series: a regular
+        one focuses that group, splitting it into children; "Other" shows
+        the breakdown of whatever got folded into it. Either way the screen
+        that owns this chart decides which, from the same ``seriesActivated``
+        signal -- the chart only needs to know a series is *clickable*, not
+        what clicking it does."""
+        view = self._view
+        if view is None:
             return
         column = self.column_at(event.position().x())
         if column is None:
             return
-        bands = self._bands
         geometry = self.geometry_model()
         if geometry is None:
             return
-        value = geometry.max_value * (
-            1.0 - (event.position().y() - PLOT_PADDING_TOP) / self.plot_height
-        )
-        for series, band in zip(self._view.series, bands, strict=True):
-            lower, upper = band[column]
-            if lower <= value <= upper and series.can_drill and not series.is_other:
-                self.seriesActivated.emit(series.label)
-                return
+        y = event.position().y()
+
+        if view.metric.stacks:
+            value = geometry.max_value * (1.0 - (y - PLOT_PADDING_TOP) / self.plot_height)
+            for series, band in zip(view.series, self._bands, strict=True):
+                lower, upper = band[column]
+                if lower <= value <= upper and (series.can_drill or series.is_other):
+                    self.seriesActivated.emit(series.label)
+                    return
+            return
+
+        # No band to hit-test against a line, so the nearest plotted point
+        # within a few pixels wins instead.
+        threshold = 6.0
+        nearest: tuple[float, str] | None = None
+        for series, values in zip(view.series, self._lines, strict=True):
+            reading = values[column]
+            if reading is None or not (series.can_drill or series.is_other):
+                continue
+            distance = abs(PLOT_PADDING_TOP + geometry.y_for_value(reading) - y)
+            if distance <= threshold and (nearest is None or distance < nearest[0]):
+                nearest = (distance, series.label)
+        if nearest is not None:
+            self.seriesActivated.emit(nearest[1])
 
     def wheelEvent(self, event: QWheelEvent) -> None:
         if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
@@ -520,22 +650,50 @@ class TrendsChart(QWidget):
         event.accept()
 
     def window_shares(self) -> list[float]:
-        """Each series' share of the columns currently on screen."""
-        if self._view is None:
+        """Each series' share of the columns currently on screen.
+
+        Empty for a mean metric: an average does not sum to a meaningful
+        whole, so there is no share to compute.
+        """
+        if self._view is None or not self._view.metric.stacks:
             return []
         first, last = self.visible_indices()
         totals = window_totals([s.values for s in self._view.series], first, last)
         grand = sum(totals)
         return [(value / grand) if grand else 0.0 for value in totals]
 
-    def window_totals_seconds(self) -> list[int]:
+    def window_values(self) -> list[float]:
+        """Each series' value over the visible window: a sum for a stacking
+        metric, or the value-weighted average of its readings for a mean --
+        never the mean of the window's per-column averages, which would be
+        the same mean-of-means mistake ``core/measures.py`` is written to
+        prevent everywhere else.
+        """
         if self._view is None:
             return []
         first, last = self.visible_indices()
-        return window_totals([s.values for s in self._view.series], first, last)
+        value_sums = window_totals([s.values for s in self._view.series], first, last)
+        if self._view.metric.stacks:
+            return value_sums
+        weight_sums = window_totals([s.weights for s in self._view.series], first, last)
+        return [
+            (value / weight) if weight else 0.0
+            for value, weight in zip(value_sums, weight_sums, strict=True)
+        ]
 
 
-def _axis_label(value: float, *, normalised: bool, is_event: bool) -> str:
+def format_trend_amount(value: float, metric: TrendMetric, kind: StreamKind) -> str:
+    """A stacking metric's value the way its shape reads: a count or a
+    duration via :func:`format_measure`, or a declared field's total via
+    :func:`format_value` and its unit."""
+    if metric.field_key is None:
+        return format_measure(round(value), kind)
+    return format_value(value, unit=metric.unit)
+
+
+def _axis_label(
+    value: float, *, normalised: bool, metric: TrendMetric, stream_kind: StreamKind
+) -> str:
     """One y-axis gridline's text.
 
     Pulled out of the paint method because it is easy to get subtly wrong in
@@ -550,7 +708,9 @@ def _axis_label(value: float, *, normalised: bool, is_event: bool) -> str:
         return f"{value * 100:.0f}%"
     if value == 0:
         return "0"
-    if is_event:
-        return f"{value:g}"
-    # "0s" reads oddly in a column of "6h", "12h", "18h" -- handled above.
-    return format_duration(int(value))
+    if metric.field_key is not None:
+        return format_value(value, unit=metric.unit)
+    if stream_kind is StreamKind.INTERVAL:
+        # "0s" reads oddly in a column of "6h", "12h", "18h" -- handled above.
+        return format_duration(int(value))
+    return f"{value:g}"

@@ -86,27 +86,21 @@ class TestCandidateMeasures:
         measures = candidate_measures(repository, include_fields=False)
         assert measures == [Measure(stream_key="heart_rate", kind=MeasureKind.COUNT)]
 
-    def test_numeric_fields_yield_a_mean_measure_by_default(
+    def test_numeric_fields_yield_mean_and_sum_measures_by_default(
         self, repository: Repository, heart_rate: None
     ) -> None:
         measures = candidate_measures(repository)
-        field_measures = [m for m in measures if m.kind is MeasureKind.FIELD]
-        assert field_measures == [
-            Measure(
-                stream_key="heart_rate",
-                kind=MeasureKind.FIELD,
-                field_key="bpm",
-                aggregate=Aggregate.MEAN,
-                unit=None,
-            )
-        ]
+        field_measures = {
+            (m.field_key, m.aggregate) for m in measures if m.kind is MeasureKind.FIELD
+        }
+        assert field_measures == {("bpm", Aggregate.MEAN), ("bpm", Aggregate.SUM)}
 
-    def test_field_sum_adds_a_sum_variant_alongside_the_mean(
+    def test_field_sum_false_excludes_the_sum_variant(
         self, repository: Repository, heart_rate: None
     ) -> None:
-        measures = candidate_measures(repository, field_sum=True)
+        measures = candidate_measures(repository, field_sum=False)
         aggregates = {m.aggregate for m in measures if m.kind is MeasureKind.FIELD}
-        assert aggregates == {Aggregate.MEAN, Aggregate.SUM}
+        assert aggregates == {Aggregate.MEAN}
 
     def test_no_fields_excludes_field_measures_entirely(
         self, repository: Repository, heart_rate: None
@@ -218,6 +212,44 @@ class TestCandidatePairs:
         self, repository: Repository, heart_rate: None, home: Path
     ) -> None:
         repository.create_stream("pickups", "Pickups", StreamKind.EVENT)
-        measures = candidate_measures(repository, stream_keys=["heart_rate", "pickups"])
+        # field_sum=False: a stream's count paired with its own field's sum
+        # carries a different caveat (see below), which is not this test's
+        # concern -- this one is about two genuinely unrelated streams.
+        measures = candidate_measures(
+            repository, stream_keys=["heart_rate", "pickups"], field_sum=False
+        )
         pairs = candidate_pairs(repository, measures)
-        assert pairs and all(pair.caveats == () for pair in pairs)
+        cross_stream = [p for p in pairs if p.x.stream_key != p.y.stream_key]
+        assert cross_stream and all(pair.caveats == () for pair in cross_stream)
+
+    def test_a_streams_count_and_its_own_field_sum_carry_a_caveat(
+        self, repository: Repository, heart_rate: None
+    ) -> None:
+        # A sum is the count times the mean, so the two are not independent.
+        # (A COUNT measure's own aggregate is always SUM too -- Measure
+        # forces it -- so it is the FIELD side's aggregate that must be
+        # checked, not "SUM appears somewhere in the pair".)
+        measures = candidate_measures(repository, field_sum=True)
+        pairs = candidate_pairs(repository, measures)
+
+        def is_field_sum(measure: Measure) -> bool:
+            return measure.kind is MeasureKind.FIELD and measure.aggregate is Aggregate.SUM
+
+        [pair] = [
+            p
+            for p in pairs
+            if {p.x.kind, p.y.kind} == {MeasureKind.COUNT, MeasureKind.FIELD}
+            and (is_field_sum(p.x) or is_field_sum(p.y))
+        ]
+        assert pair.caveats
+        assert "mechanically linked" in pair.caveats[0]
+
+    def test_a_streams_count_and_its_own_field_mean_has_no_such_caveat(
+        self, repository: Repository, heart_rate: None
+    ) -> None:
+        # A mean is not a count scaled by a constant, so no confound to flag.
+        measures = candidate_measures(repository, field_sum=False)
+        pairs = candidate_pairs(repository, measures)
+        wanted = {MeasureKind.COUNT, MeasureKind.FIELD}
+        [pair] = [p for p in pairs if {p.x.kind, p.y.kind} == wanted]
+        assert pair.caveats == ()

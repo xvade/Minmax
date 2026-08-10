@@ -120,6 +120,92 @@ class TestMigrations:
         before = migrate(connection)
         assert migrate(connection) == before
 
+    def test_migration_0006_preserves_event_value_and_field_rollup_rows(self, home: Path) -> None:
+        """0006 rebuilds stream_field, event_value, and field_rollup to widen
+        a CHECK constraint. All three are FK-linked with ON DELETE CASCADE,
+        and a first attempt at this migration silently dropped every event
+        stream's payload and rollups -- SQLite fires a parent's cascades
+        against *any* table currently referencing its name, including a
+        same-named replacement not yet renamed into place. This is the
+        regression test for that: build a database at v5's shape with real
+        payload rows, migrate it, and confirm nothing was cascaded away.
+        """
+        from minmax.storage.database import _migration_files, connect
+
+        conn = connect(home / "legacy.db")
+        try:
+            for version, path in _migration_files():
+                if version > 5:
+                    continue
+                conn.executescript(
+                    "BEGIN IMMEDIATE;\n"
+                    + path.read_text(encoding="utf-8")
+                    + f"\nPRAGMA user_version = {version};\nCOMMIT;\n"
+                )
+            assert conn.execute("PRAGMA user_version").fetchone()[0] == 5
+
+            conn.execute(
+                "INSERT INTO stream (id, key, name, kind, exclusive, created_at)"
+                " VALUES (1, 'hr', 'Heart Rate', 'event', 0, 0)"
+            )
+            conn.execute(
+                "INSERT INTO category"
+                " (id, stream_id, source_id, path, top_level, first_seen_at, last_seen_at)"
+                " VALUES (1, 1, NULL, 'hr', 'hr', 0, 0)"
+            )
+            conn.execute(
+                "INSERT INTO import_run"
+                " (id, stream_id, importer, source_name, source_sha256, started_at,"
+                " rows_read, rows_inserted, rows_duplicate, rows_rejected)"
+                " VALUES (1, 1, 'csv', 'x.csv', 'sha', 0, 1, 1, 0, 0)"
+            )
+            conn.execute(
+                "INSERT INTO stream_field (id, stream_id, key, label, role, unit, position,"
+                " source_column) VALUES (1, 1, 'bpm', 'BPM', 'number', 'bpm', 1, 'bpm')"
+            )
+            conn.execute(
+                "INSERT INTO event_record (id, stream_id, category_id, import_run_id,"
+                " occurred_at, offset_seconds, recorded_path, payload_hash)"
+                " VALUES (1, 1, 1, 1, 0, 0, 'hr', 'abc')"
+            )
+            conn.execute(
+                "INSERT INTO event_value (record_id, field_id, num, txt) VALUES (1, 1, 72.0, NULL)"
+            )
+            conn.execute(
+                "INSERT INTO field_rollup (stream_id, category_id, field_id, period, bucket,"
+                " value_sum, value_count, value_min, value_max)"
+                " VALUES (1, 1, 1, 'day', '2026-01-01', 72.0, 1, 72.0, 72.0)"
+            )
+
+            def counts() -> tuple[int, int, int]:
+                return (
+                    conn.execute("SELECT count(*) FROM event_value").fetchone()[0],
+                    conn.execute("SELECT count(*) FROM field_rollup").fetchone()[0],
+                    conn.execute("SELECT count(*) FROM stream_field").fetchone()[0],
+                )
+
+            before = counts()
+            migrate(conn)
+            assert counts() == before
+            rows = conn.execute("SELECT record_id, field_id, num, txt FROM event_value").fetchall()
+            assert [tuple(row) for row in rows] == [(1, 1, 72.0, None)]
+
+            assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+            assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+
+            # The widened CHECK accepts an interval role and still rejects garbage.
+            conn.execute(
+                "INSERT INTO stream_field (id, stream_id, key, label, role, unit, position,"
+                " source_column) VALUES (2, 1, 'start', 'Start', 'start', NULL, 2, 'start')"
+            )
+            with pytest.raises(sqlite3.IntegrityError):
+                conn.execute(
+                    "INSERT INTO stream_field (id, stream_id, key, label, role, unit, position,"
+                    " source_column) VALUES (3, 1, 'bad', 'Bad', 'bogus', NULL, 3, 'bad')"
+                )
+        finally:
+            conn.close()
+
     def test_reopening_an_existing_database_preserves_data(
         self, home: Path, repository: Repository, stream: Stream, run_id: int
     ) -> None:
@@ -309,6 +395,70 @@ class TestStreamsAndCategories:
             ],
         )
         assert len(repository.list_categories(stream.id)) == 1
+
+
+class TestDeleteStream:
+    def test_deleting_an_unknown_key_raises(self, repository: Repository) -> None:
+        with pytest.raises(LookupError, match="no stream"):
+            repository.delete_stream("nonexistent")
+
+    def test_delete_returns_the_deleted_stream(
+        self, repository: Repository, stream: Stream
+    ) -> None:
+        deleted = repository.delete_stream(stream.key)
+        assert deleted.key == stream.key
+        assert deleted.kind is StreamKind.INTERVAL
+        assert repository.get_stream(stream.key) is None
+        assert repository.list_streams() == []
+
+    def test_deleting_an_interval_stream_cascades_everything(
+        self, repository: Repository, connection: sqlite3.Connection, stream: Stream, run_id: int
+    ) -> None:
+        assert stream.id is not None
+        repository.insert_intervals(
+            stream,
+            run_id,
+            [record("admin", "2026-06-06T09:00:00-07:00", "2026-06-06T10:00:00-07:00")],
+        )
+        assert repository.list_categories(stream.id) != []
+
+        repository.delete_stream(stream.key)
+
+        assert connection.execute("SELECT count(*) FROM category").fetchone()[0] == 0
+        assert connection.execute("SELECT count(*) FROM interval_record").fetchone()[0] == 0
+        assert connection.execute("SELECT count(*) FROM import_run").fetchone()[0] == 0
+        assert connection.execute("SELECT count(*) FROM rollup").fetchone()[0] == 0
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+
+    def test_deleting_an_event_stream_cascades_its_fields_and_values(
+        self,
+        repository: Repository,
+        connection: sqlite3.Connection,
+        heart_rate_stream: Stream,
+        event_run_id: int,
+    ) -> None:
+        assert heart_rate_stream.id is not None
+        repository.insert_events(
+            heart_rate_stream,
+            event_run_id,
+            [event("heart_rate", "2026-06-06T08:00:00-07:00", values={"bpm": 58.0})],
+        )
+        assert connection.execute("SELECT count(*) FROM event_value").fetchone()[0] > 0
+
+        repository.delete_stream(heart_rate_stream.key)
+
+        assert connection.execute("SELECT count(*) FROM stream_field").fetchone()[0] == 0
+        assert connection.execute("SELECT count(*) FROM event_value").fetchone()[0] == 0
+        assert connection.execute("SELECT count(*) FROM event_record").fetchone()[0] == 0
+        assert connection.execute("SELECT count(*) FROM field_rollup").fetchone()[0] == 0
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+
+    def test_deleting_one_stream_leaves_another_untouched(
+        self, repository: Repository, stream: Stream, heart_rate_stream: Stream
+    ) -> None:
+        repository.delete_stream(stream.key)
+        assert repository.get_stream(heart_rate_stream.key) is not None
+        assert [s.key for s in repository.list_streams()] == [heart_rate_stream.key]
 
 
 class TestIdempotency:

@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import csv
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta, tzinfo
 from pathlib import Path
 from typing import Protocol, runtime_checkable
@@ -42,13 +42,16 @@ from minmax.core.columns import (
     Interval,
     columns_for,
 )
+from minmax.core.measures import Aggregate
 from minmax.core.models import (
     CategoryTotal,
     EventCategoryTotal,
+    FieldRole,
     FieldSpec,
     StoredEvent,
     StoredInterval,
     Stream,
+    StreamField,
     StreamKind,
 )
 from minmax.core.palette import OTHER, Swatch, swatch_for_slot
@@ -61,6 +64,7 @@ __all__ = [
     "AUTO_INTERVAL",
     "DAILY_INTERVAL",
     "MAX_INTERVAL_COUNT",
+    "Aggregate",
     "CategorySlice",
     "CorrelationRow",
     "CorrelationsView",
@@ -80,8 +84,10 @@ __all__ = [
     "TimelineRecord",
     "TimelineWindow",
     "TrendColumn",
+    "TrendMetric",
     "TrendSeries",
     "TrendsView",
+    "other_breakdown",
     "system_timezone",
 ]
 
@@ -346,30 +352,79 @@ class TrendColumn:
 
 
 @dataclass(frozen=True, slots=True)
+class TrendMetric:
+    """What a trends column's height (or, for an average, a line's position)
+    means.
+
+    ``field_key=None`` is a stream's own shape -- seconds for an interval
+    stream, an event count for an event stream -- the only metric an interval
+    stream ever has. A declared numeric field adds two more: its total
+    (extensive, stacks like a count does) and its average (not extensive --
+    see ``core/measures.py``'s module docstring on why a multi-day mean is
+    never the mean of daily means -- so :attr:`stacks` is false and the chart
+    draws it as an unstacked line instead).
+    """
+
+    label: str
+    field_key: str | None = None
+    aggregate: Aggregate = Aggregate.SUM
+    unit: str | None = None
+    """Presentation only, e.g. ``'bpm'`` -- carried here so the chart and
+    legend need no second lookup to format a field's values."""
+
+    @property
+    def stacks(self) -> bool:
+        """False only for :attr:`~minmax.core.measures.Aggregate.MEAN`: an
+        average does not add, so two categories' bands cannot be stacked one
+        atop the other the way two sums' can."""
+        return self.aggregate is not Aggregate.MEAN
+
+
+@dataclass(frozen=True, slots=True)
 class TrendSeries:
-    """One band of the stacked area: a category group across every column."""
+    """One band (or, for an average, one line) of the trends chart: a
+    category group across every column."""
 
     label: str
     swatch: Swatch
-    values: list[int]
-    """Seconds in each column, aligned index-for-index with
-    :attr:`TrendsView.columns` -- or event counts, when
-    :attr:`TrendsView.stream_kind` is ``EVENT``. Counting is summable the same
-    way seconds are, so the rest of the chart (stacking, the daily-average
-    axis) needs no change to plot one instead of the other; only the units on
-    screen differ, which is a formatting decision, not a shape one."""
+    values: list[float]
+    """The metric's extensive quantity in each column, aligned index-for-index
+    with :attr:`TrendsView.columns`: seconds, an event count, or a declared
+    numeric field's summed value. For a mean metric this is only half the
+    story -- see :attr:`weights` -- and the two are divided once, at the last
+    moment before display, rather than transporting an already-divided
+    average that could not be recombined correctly if stacked or folded into
+    "Other"."""
 
-    total_seconds: int
+    total: float
+    """Sum of :attr:`values` across every column -- not a mean's own total,
+    which does not exist; see :attr:`weights` for what a mean needs instead."""
+
+    weights: list[float] = field(default_factory=list)
+    """How many readings made up each of :attr:`values`, aligned the same
+    way. Empty unless :attr:`TrendsView.metric` is a numeric field's average
+    -- nothing else needs it, since everything else is already extensive."""
+
     is_other: bool = False
     """True for the folded tail. It carries a neutral colour, not a hue."""
 
     can_drill: bool = False
     """Whether this group has sub-categories worth focusing into."""
 
+    members: tuple[TrendSeries, ...] = ()
+    """The individual series folded into this one, set only when
+    :attr:`is_other` is true. Ranked and (if there are still more than
+    ``max_series``) folded again the same way the top level was, so an
+    "Other" nested inside another "Other" is handled by the same code path
+    rather than a special case. Populated eagerly rather than looked up on
+    demand -- see :func:`other_breakdown` -- because the data is already in
+    hand at query time and a click should never need a second round trip."""
+
 
 @dataclass(frozen=True, slots=True)
 class TrendsView:
-    """A stacked area over consecutive calendar columns.
+    """A stacked area (or, for an average metric, a set of lines) over
+    consecutive calendar columns.
 
     Three properties matter for correctness rather than looks:
 
@@ -383,12 +438,14 @@ class TrendsView:
     changes which groups exist or what colour they are -- only the percentages,
     which describe the visible window.
 
-    **A column's plotted height is its daily average, not its total.** A weekly
-    column holding seven times as many seconds as a daily one would rescale the
-    y axis by seven, so changing the interval would appear to change the data.
-    Dividing by the days the column covers keeps the axis in hours-per-day and
-    comparable across every interval -- and incidentally stops a half-week at
-    the edge of a range from reading as a collapse in activity.
+    **A column's plotted height is its daily average, not its total** -- for a
+    metric that stacks. A weekly column holding seven times as many seconds as
+    a daily one would rescale the y axis by seven, so changing the interval
+    would appear to change the data. Dividing by the days the column covers
+    keeps the axis in hours-per-day and comparable across every interval -- and
+    incidentally stops a half-week at the edge of a range from reading as a
+    collapse in activity. A mean metric is exempt: its columns are already an
+    average, so dividing again would be wrong, not just redundant.
     """
 
     columns: list[TrendColumn]
@@ -402,13 +459,25 @@ class TrendsView:
 
     since: date | None = None
     until: date | None = None
-    total_seconds: int = 0
-    peak_daily_seconds: int = 0
-    """Largest per-day average across the columns -- what sets the y ceiling."""
+    total: float = 0.0
+    peak_plot_value: float = 0.0
+    """Largest per-day average across the columns, for a stacking metric --
+    or the largest single reading average, for a mean one. What sets the y
+    ceiling either way."""
 
     stream_kind: StreamKind = StreamKind.INTERVAL
     """Whether :attr:`TrendSeries.values` (and the two totals above) hold
-    seconds or event counts."""
+    seconds or event counts, when :attr:`metric` is a stream's own shape."""
+
+    metric: TrendMetric = field(default_factory=lambda: TrendMetric(label=""))
+    """What :attr:`TrendSeries.values` means in this view."""
+
+    metric_options: tuple[TrendMetric, ...] = ()
+    """Every metric :meth:`MinmaxClient.trends` will accept for this stream,
+    in menu order -- ``(Count,)`` alone (or empty, for an interval stream)
+    means there is nothing to choose, and a caller showing a selector should
+    hide it. Built here rather than re-derived by the UI so that the menu and
+    what a chosen entry actually queries can never drift apart."""
 
     @property
     def is_empty(self) -> bool:
@@ -521,7 +590,16 @@ class MinmaxClient(Protocol):
         prefix: str | None = None,
         interval: Interval | Granularity = Granularity.AUTO,
         max_series: int = 8,
-    ) -> TrendsView: ...
+        field_key: str | None = None,
+        aggregate: Aggregate = Aggregate.SUM,
+    ) -> TrendsView:
+        """``field_key``/``aggregate`` select a metric other than the stream's
+        own shape -- a declared numeric field's total or average rather than
+        a count. ``field_key`` must name a ``NUMBER`` field on an event
+        stream (``LookupError`` otherwise); ``aggregate`` must be ``SUM`` or
+        ``MEAN`` (``ValueError`` otherwise -- ``MIN``/``MAX`` have no column
+        the chart can draw). See :attr:`TrendsView.metric_options` for the
+        full set a caller can offer without guessing."""
 
     def category_paths(self, stream_key: str) -> list[str]:
         """Every category path in the stream, sorted -- for filter completion."""
@@ -541,10 +619,20 @@ class MinmaxClient(Protocol):
     ) -> StreamSummary:
         """Declare a new stream, failing if the key is already taken."""
 
-    def inspect_csv(self, path: Path) -> CsvPreview:
+    def delete_stream(self, key: str) -> None:
+        """Permanently delete a stream and everything recorded in it.
+
+        Raises ``LookupError`` for an unknown key. Archived raw files are left
+        on disk (see ``Repository.delete_stream``); only the database rows
+        are removed, and there is no way to undo this.
+        """
+
+    def inspect_csv(self, path: Path, *, kind: StreamKind = StreamKind.EVENT) -> CsvPreview:
         """Read a CSV's header and a sample of its rows, and guess a column
         mapping -- what the new-stream dialog shows before anything is
-        created. Never raises; a missing or unreadable file comes back as
+        created. ``kind`` selects which shape is guessed (an event stream's
+        single instant column, or an interval stream's start/end pair).
+        Never raises; a missing or unreadable file comes back as
         ``CsvPreview(error=...)``."""
 
     def set_auto_fetch(self, stream_key: str, *, enabled: bool, path: Path | None = None) -> None:
@@ -570,7 +658,7 @@ class MinmaxClient(Protocol):
         top: int | None = 20,
         per_category: bool = False,
         include_fields: bool = True,
-        field_sum: bool = False,
+        field_sum: bool = True,
         max_series: int = 40,
         all_intervals: bool = False,
     ) -> CorrelationsView:
@@ -836,8 +924,11 @@ class InProcessClient:
         prefix: str | None = None,
         interval: Interval | Granularity = Granularity.AUTO,
         max_series: int = 8,
+        field_key: str | None = None,
+        aggregate: Aggregate = Aggregate.SUM,
     ) -> TrendsView:
-        """Composition over a range, as stacked series, one column per period.
+        """Composition over a range, as stacked series (or, for a mean
+        metric, unstacked lines), one column per period.
 
         Reads the daily rollup table rather than the observations, so the cost
         is proportional to (days x categories) instead of to everything ever
@@ -854,15 +945,31 @@ class InProcessClient:
         ``interval`` accepts a bare :class:`Granularity` as well as an
         :class:`Interval`, so ``interval=Granularity.WEEK`` and
         ``interval=Interval(Granularity.WEEK, 2)`` are both ordinary calls.
+
+        ``field_key``/``aggregate`` pick a metric other than the stream's own
+        shape -- see the protocol docstring for the validation they get.
         """
         requested = Interval.coerce(interval)
         stream = self._require_stream(stream_key)
         assert stream.id is not None
         stream_id = stream.id
+        numeric_fields = [
+            declared
+            for declared in self._repository.stream_fields(stream_id)
+            if declared.role is FieldRole.NUMBER
+        ]
+        metric_options = _metric_options(stream.kind, numeric_fields)
+        metric, target_field = _resolve_metric(stream, numeric_fields, field_key, aggregate)
+
         bounds = self.bounds(stream_key)
         if bounds is None:
             return TrendsView(
-                columns=[], prefix=prefix, requested_interval=requested, stream_kind=stream.kind
+                columns=[],
+                prefix=prefix,
+                requested_interval=requested,
+                stream_kind=stream.kind,
+                metric=metric,
+                metric_options=metric_options,
             )
 
         first_day = since if since is not None else bounds[0]
@@ -880,13 +987,8 @@ class InProcessClient:
             since=first_day,
             until=last_day,
             stream_kind=stream.kind,
-        )
-
-        rows = self._repository.daily_totals_by_category(
-            stream_id,
-            start_bucket=first_day.isoformat(),
-            end_bucket=last_day.isoformat(),
-            path_prefix=prefix,
+            metric=metric,
+            metric_options=metric_options,
         )
 
         # A day belongs to exactly one column, so one lookup built up front
@@ -895,60 +997,70 @@ class InProcessClient:
             day.isoformat(): index for index, column in enumerate(grouping) for day in column.days()
         }
 
-        # An event stream's rollup rows carry seconds=0 -- there is nothing to
-        # sum there -- so record_count (already summable across an event
-        # stream's buckets; see rollups.apply_events) is what a column plots.
-        is_event = stream.kind is StreamKind.EVENT
-
-        totals: dict[str, list[int]] = {}
+        totals: dict[str, list[float]] = {}
+        weights: dict[str, list[float]] = {}
         drillable: set[str] = set()
-        for row in rows:
-            index = column_of.get(row.bucket)
-            if index is None:
-                continue
-            key = _series_key(row.category_path, prefix)
-            weight = row.record_count if is_event else row.seconds
-            totals.setdefault(key, [0] * len(columns))[index] += weight
-            if row.category_path != key:
-                drillable.add(key)
+
+        if target_field is None:
+            # An event stream's rollup rows carry seconds=0 -- there is
+            # nothing to sum there -- so record_count (already summable
+            # across an event stream's buckets; see rollups.apply_events) is
+            # what a column plots.
+            is_event = stream.kind is StreamKind.EVENT
+            rows = self._repository.daily_totals_by_category(
+                stream_id,
+                start_bucket=first_day.isoformat(),
+                end_bucket=last_day.isoformat(),
+                path_prefix=prefix,
+            )
+            for row in rows:
+                index = column_of.get(row.bucket)
+                if index is None:
+                    continue
+                key = _series_key(row.category_path, prefix)
+                amount = row.record_count if is_event else row.seconds
+                totals.setdefault(key, [0.0] * len(columns))[index] += amount
+                if row.category_path != key:
+                    drillable.add(key)
+        else:
+            assert target_field.id is not None  # returned by stream_fields(), always persisted
+            field_rows = self._repository.daily_field_totals_by_category(
+                stream_id,
+                field_id=target_field.id,
+                start_bucket=first_day.isoformat(),
+                end_bucket=last_day.isoformat(),
+                path_prefix=prefix,
+            )
+            for field_row in field_rows:
+                index = column_of.get(field_row.bucket)
+                if index is None:
+                    continue
+                key = _series_key(field_row.category_path, prefix)
+                totals.setdefault(key, [0.0] * len(columns))[index] += field_row.value_sum
+                weights.setdefault(key, [0.0] * len(columns))[index] += field_row.value_count
+                if field_row.category_path != key:
+                    drillable.add(key)
 
         if not totals:
             return empty
 
-        ranked = sorted(totals.items(), key=lambda item: (-sum(item[1]), item[0]))
-        kept, folded = ranked[:max_series], ranked[max_series:]
-        swatches = self._series_swatches(stream_id, [key for key, _ in kept], prefix)
+        series = self._rank_series(
+            totals,
+            weights,
+            drillable,
+            stream_id,
+            prefix,
+            len(columns),
+            max_series,
+            metric.aggregate,
+        )
 
-        series = [
-            TrendSeries(
-                label=key,
-                swatch=swatches[key],
-                values=values,
-                total_seconds=sum(values),
-                can_drill=key in drillable,
-            )
-            for key, values in kept
-        ]
-
-        if folded:
-            merged = [sum(values[index] for _, values in folded) for index in range(len(columns))]
-            series.append(
-                TrendSeries(
-                    label=f"Other ({len(folded)})",
-                    swatch=OTHER,
-                    values=merged,
-                    total_seconds=sum(merged),
-                    is_other=True,
-                )
-            )
-
-        # The y ceiling comes from the busiest column's *daily average*, so the
-        # axis means the same thing -- hours in a day -- at every granularity.
+        peak_plot_value = (
+            _peak_reading_average(series)
+            if metric.aggregate is Aggregate.MEAN
+            else _peak_daily_stack(series, columns)
+        )
         per_column = [sum(item.values[index] for item in series) for index in range(len(columns))]
-        averages = [
-            total / max(1, column.day_count)
-            for total, column in zip(per_column, columns, strict=True)
-        ]
         return TrendsView(
             columns=columns,
             series=series,
@@ -957,9 +1069,11 @@ class InProcessClient:
             requested_interval=requested,
             since=first_day,
             until=last_day,
-            total_seconds=sum(per_column),
-            peak_daily_seconds=round(max(averages, default=0.0)),
+            total=sum(per_column),
+            peak_plot_value=peak_plot_value,
             stream_kind=stream.kind,
+            metric=metric,
+            metric_options=metric_options,
         )
 
     def category_paths(self, stream_key: str) -> list[str]:
@@ -989,12 +1103,15 @@ class InProcessClient:
             last_day=None,
         )
 
-    def inspect_csv(self, path: Path) -> CsvPreview:
+    def delete_stream(self, key: str) -> None:
+        self._repository.delete_stream(key)
+
+    def inspect_csv(self, path: Path, *, kind: StreamKind = StreamKind.EVENT) -> CsvPreview:
         if not path.is_file():
             return CsvPreview(error=f"no such file: {path}")
         try:
             header, sample = read_sample(path)
-            fields = guess_fields(header, sample)
+            fields = guess_fields(header, sample, kind=kind)
         except (OSError, UnicodeDecodeError, csv.Error) as error:
             return CsvPreview(error=str(error))
 
@@ -1062,7 +1179,7 @@ class InProcessClient:
         top: int | None = 20,
         per_category: bool = False,
         include_fields: bool = True,
-        field_sum: bool = False,
+        field_sum: bool = True,
         max_series: int = 40,
         all_intervals: bool = False,
     ) -> CorrelationsView:
@@ -1212,6 +1329,79 @@ class InProcessClient:
             )
         return records
 
+    def _rank_series(
+        self,
+        totals: dict[str, list[float]],
+        weights: dict[str, list[float]],
+        drillable: set[str],
+        stream_id: int,
+        prefix: str | None,
+        column_count: int,
+        max_series: int,
+        aggregate: Aggregate,
+    ) -> list[TrendSeries]:
+        """Rank ``totals`` (and, for a mean, ``weights``) into series, folding
+        anything past ``max_series`` into a neutral "Other".
+
+        The fold is ranked and (if it is itself bigger than ``max_series``)
+        folded again the very same way, recursively -- so a click on "Other"
+        has something to show without a second query
+        (:attr:`TrendSeries.members`, consumed by :func:`other_breakdown`),
+        and an "Other" nested inside another "Other" needs no special case.
+        """
+        # Ranked by reading count for a mean -- ranking by the sum of an
+        # average would put "the most readings" behind "one large reading" --
+        # by the sum itself for anything extensive, as before.
+        rank_by = weights if aggregate is Aggregate.MEAN else totals
+        ranked = sorted(totals.items(), key=lambda item: (-sum(rank_by[item[0]]), item[0]))
+        kept, folded = ranked[:max_series], ranked[max_series:]
+        swatches = self._series_swatches(stream_id, [key for key, _ in kept], prefix)
+
+        series = [
+            TrendSeries(
+                label=key,
+                swatch=swatches[key],
+                values=values,
+                total=sum(values),
+                weights=weights.get(key, []),
+                can_drill=key in drillable,
+            )
+            for key, values in kept
+        ]
+
+        if folded:
+            merged_values = [
+                sum(values[index] for _, values in folded) for index in range(column_count)
+            ]
+            merged_weights = (
+                [sum(weights[key][index] for key, _ in folded) for index in range(column_count)]
+                if weights
+                else []
+            )
+            members = self._rank_series(
+                dict(folded),
+                {key: weights[key] for key, _ in folded if key in weights},
+                drillable,
+                stream_id,
+                prefix,
+                column_count,
+                max_series,
+                aggregate,
+            )
+            series.append(
+                TrendSeries(
+                    label=f"Other ({len(folded)})",
+                    swatch=OTHER,
+                    values=merged_values,
+                    total=sum(merged_values),
+                    weights=merged_weights,
+                    is_other=True,
+                    members=tuple(members),
+                )
+            )
+
+        return series
+
     def _series_swatches(
         self, stream_id: int, keys: Sequence[str], prefix: str | None
     ) -> dict[str, Swatch]:
@@ -1232,6 +1422,136 @@ class InProcessClient:
         groups = {paths.top_level(path) for path in category_paths}
         slots = self._repository.ensure_group_slots(stream_id, sorted(groups))
         return {group: swatch_for_slot(slot) for group, slot in slots.items()}
+
+
+def _metric_options(
+    kind: StreamKind, numeric_fields: Sequence[StreamField]
+) -> tuple[TrendMetric, ...]:
+    """Every metric :meth:`InProcessClient.trends` will accept for a stream
+    of this shape, in menu order.
+
+    An interval stream has no competing reading of "how much" -- a duration
+    is the only shape it has, so there is nothing to choose and this is
+    empty. An event stream always offers its count, plus a total and an
+    average per declared ``NUMBER`` field.
+    """
+    if kind is not StreamKind.EVENT:
+        return ()
+    options = [_COUNT_METRIC]
+    for declared in numeric_fields:
+        options.append(
+            TrendMetric(
+                label=f"{declared.label} total",
+                field_key=declared.key,
+                aggregate=Aggregate.SUM,
+                unit=declared.unit,
+            )
+        )
+        options.append(
+            TrendMetric(
+                label=f"{declared.label} average",
+                field_key=declared.key,
+                aggregate=Aggregate.MEAN,
+                unit=declared.unit,
+            )
+        )
+    return tuple(options)
+
+
+def _resolve_metric(
+    stream: Stream,
+    numeric_fields: Sequence[StreamField],
+    field_key: str | None,
+    aggregate: Aggregate,
+) -> tuple[TrendMetric, StreamField | None]:
+    """Validate ``field_key``/``aggregate`` and turn them into a
+    :class:`TrendMetric` plus the declared field to read, if any.
+
+    Kept separate from :func:`_metric_options` -- that function enumerates
+    what a caller *may* ask for; this one checks what one particular caller
+    *did* ask for, which needs to raise on a bad combination rather than
+    silently omit it from a menu.
+    """
+    if field_key is None:
+        if aggregate is not Aggregate.SUM:
+            raise ValueError("aggregate requires field_key; there is nothing else to aggregate")
+        return (_COUNT_METRIC if stream.kind is StreamKind.EVENT else _DURATION_METRIC), None
+
+    if stream.kind is not StreamKind.EVENT:
+        raise ValueError(f"{stream.key!r} is not an event stream; it has no fields to plot")
+    if aggregate not in (Aggregate.SUM, Aggregate.MEAN):
+        raise ValueError(f"trends supports sum or mean, not {aggregate}")
+    matched = next((declared for declared in numeric_fields if declared.key == field_key), None)
+    if matched is None:
+        raise LookupError(f"{stream.key!r} has no numeric field {field_key!r}")
+
+    label = f"{matched.label} {'average' if aggregate is Aggregate.MEAN else 'total'}"
+    metric = TrendMetric(label=label, field_key=field_key, aggregate=aggregate, unit=matched.unit)
+    return metric, matched
+
+
+_COUNT_METRIC = TrendMetric(label="Count")
+_DURATION_METRIC = TrendMetric(label="Duration")
+
+
+def _peak_daily_stack(series: Sequence[TrendSeries], columns: Sequence[TrendColumn]) -> float:
+    """The busiest column's stack total, divided by its day count -- the
+    ceiling for a stacking metric, where every column is a daily average."""
+    per_column = [sum(item.values[index] for item in series) for index in range(len(columns))]
+    averages = (
+        total / max(1, column.day_count) for total, column in zip(per_column, columns, strict=True)
+    )
+    return max(averages, default=0.0)
+
+
+def _peak_reading_average(series: Sequence[TrendSeries]) -> float:
+    """The largest single series-column average -- the ceiling for a mean
+    metric, where nothing is stacked or divided by a column's day count."""
+    return max(
+        (
+            value / weight
+            for item in series
+            for value, weight in zip(item.values, item.weights, strict=True)
+            if weight
+        ),
+        default=0.0,
+    )
+
+
+def other_breakdown(view: TrendsView, other: TrendSeries) -> TrendsView:
+    """A view showing one "Other" series' own members instead of the
+    top-level series it was folded out of.
+
+    A click on "Other" has no server-side prefix to re-query with -- it is
+    not a real category, just whatever did not fit under ``max_series`` --
+    so this is a pure reshaping of data the original :meth:`MinmaxClient.trends`
+    call already fetched, not a second query. ``columns``, ``interval``,
+    ``metric``, and ``prefix`` all carry over unchanged, since drilling into
+    a fold does not change any of those, only which categories are on
+    screen; the members' ``values``/``weights`` are already aligned to
+    ``view.columns`` (every key is accumulated over the same columns before
+    ranking ever splits them into "kept" and "folded" -- see
+    ``InProcessClient._rank_series``), so nothing here needs to re-derive
+    anything.
+
+    Raises ``ValueError`` if ``other`` is not actually an "Other" series --
+    a bare precondition check, since a caller with the wrong series is a
+    programming error, not a user-facing one.
+    """
+    if not other.is_other:
+        raise ValueError(f"{other.label!r} is not an 'Other' series")
+    members = list(other.members)
+    peak_plot_value = (
+        _peak_reading_average(members)
+        if view.metric.aggregate is Aggregate.MEAN
+        else _peak_daily_stack(members, view.columns)
+    )
+    return replace(
+        view,
+        series=members,
+        total=sum(member.total for member in members),
+        peak_plot_value=peak_plot_value,
+    )
 
 
 def _trend_column(column: Column) -> TrendColumn:

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from minmax.core.models import StreamKind
 
-__all__ = ["format_clock_span", "format_duration", "format_measure"]
+__all__ = ["format_clock_span", "format_duration", "format_measure", "format_value"]
 
 
 def format_duration(seconds: int) -> str:
@@ -40,6 +40,19 @@ def format_measure(value: int, stream_kind: StreamKind) -> str:
     if stream_kind is StreamKind.EVENT:
         return f"{value} event" if value == 1 else f"{value} events"
     return format_duration(value)
+
+
+def format_value(value: float, *, unit: str | None) -> str:
+    """A declared numeric field's value the way a reader expects a plain
+    number: one decimal place if it needs one, none if it does not -- a
+    heart-rate average of exactly 72 should not read ``72.0``.
+
+    Takes a bare ``unit`` rather than a :class:`~minmax.api.client.TrendMetric`
+    so this module stays free of any import from ``client.py``, the same
+    reason :func:`format_measure` takes a bare ``StreamKind``.
+    """
+    text = f"{round(value, 1):.1f}".removesuffix(".0")
+    return f"{text} {unit}" if unit else text
 
 
 def format_clock_span(start_label: str, end_label: str) -> str:

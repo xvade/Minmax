@@ -8,15 +8,17 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from minmax.api import Granularity, InProcessClient, Interval, MinmaxClient
+from minmax.api import Granularity, InProcessClient, Interval, MinmaxClient, other_breakdown
 from minmax.core import palette
+from minmax.core.models import IntervalRecord, StreamKind
+from minmax.core.timeref import Instant
 from minmax.core.trends import (
     MAX_PIXELS_PER_COLUMN,
     MIN_PIXELS_PER_COLUMN,
     TrendsGeometry,
     clamp_column_zoom,
-    nice_count_ceiling,
     nice_seconds_ceiling,
+    nice_value_ceiling,
     stack_bands,
     tick_interval_columns,
     visible_column_range,
@@ -32,6 +34,30 @@ HOUR = 3600
 @pytest.fixture
 def client(repository: Repository, home: Path, sample_csv: Path) -> MinmaxClient:
     run_import(repository, TimecardCsvImporter(), sample_csv, home=home)
+    return InProcessClient(repository, timezone=PACIFIC)
+
+
+@pytest.fixture
+def many_categories_client(repository: Repository, home: Path) -> MinmaxClient:
+    """An interval stream with more same-day categories than any
+    ``max_series`` cap used below, each a distinct duration so ranking is
+    unambiguous -- enough to fold, and to fold the fold itself, so a nested
+    "Other" is reachable without a second stream shape to set up."""
+    stream = repository.ensure_stream("timecard", "Timecard", StreamKind.INTERVAL)
+    assert stream.id is not None
+    run = repository.begin_import(
+        stream.id, importer="test", source_name="t.csv", source_sha256="m" * 64, archived_path=None
+    )
+    records = [
+        IntervalRecord(
+            category_source_id=f"cat{i}",
+            category_path=f"cat{i}",
+            start=Instant.from_iso(f"2026-06-06T{i:02d}:00:00-07:00"),
+            end=Instant.from_iso(f"2026-06-06T{i:02d}:{59 - i:02d}:00-07:00"),
+        )
+        for i in range(8)  # cat0 the longest (59m), cat7 the shortest (52m)
+    ]
+    repository.insert_intervals(stream, run, records)
     return InProcessClient(repository, timezone=PACIFIC)
 
 
@@ -167,23 +193,24 @@ class TestAxisHelpers:
             assert tick_interval_columns(zoom) in (1, 2, 3, 7, 14, 28, 56, 91, 182, 364)
 
 
-class TestCountCeiling:
-    """The count-based analogue of :func:`nice_seconds_ceiling`, for an
-    event stream's trends chart -- same idea, but with no 24h-style cap,
-    since a count of events per day has no natural maximum."""
+class TestValueCeiling:
+    """The generic analogue of :func:`nice_seconds_ceiling`, for anything a
+    trends chart plots with no natural bound -- an event count, or a
+    declared field's total or average -- same idea, but with no 24h-style
+    cap, since none of those have a maximum the way a day's hours do."""
 
     @pytest.mark.parametrize(
         ("peak", "expected"),
         [(0, 1), (1, 1), (2, 2), (3, 5), (7, 10), (12, 20), (37, 50), (80, 100)],
     )
     def test_ceilings_snap_to_a_one_two_five_progression(self, peak: float, expected: int) -> None:
-        assert nice_count_ceiling(peak) == expected
+        assert nice_value_ceiling(peak) == expected
 
     def test_unlike_the_duration_ceiling_there_is_no_overflow_cap(self) -> None:
         # nice_seconds_ceiling clamps at 24h because a day cannot hold more;
         # a count has no such bound and must keep climbing past it.
-        assert nice_count_ceiling(200) == 200
-        assert nice_count_ceiling(9_999) == 10_000
+        assert nice_value_ceiling(200) == 200
+        assert nice_value_ceiling(9_999) == 10_000
 
 
 class TestTrendsQuery:
@@ -203,7 +230,7 @@ class TestTrendsQuery:
         # The overnight sleep run: one hour on the 5th, seven on the 6th.
         assert by_label["sleep"] == [HOUR, 7 * HOUR]
         assert by_label["social"] == [0, 679 + 3600]
-        assert view.total_seconds == 36_000
+        assert view.total == 36_000
 
     def test_empty_days_inside_the_range_are_kept(self, client: MinmaxClient) -> None:
         # A gap in tracking is information; compressing it away would claim the
@@ -215,10 +242,10 @@ class TestTrendsQuery:
 
     def test_peak_day_is_reported_for_the_axis(self, client: MinmaxClient) -> None:
         view = client.trends("timecard")
-        assert view.peak_daily_seconds == 32_400
+        assert view.peak_plot_value == 32_400
 
     def test_series_are_ordered_largest_first(self, client: MinmaxClient) -> None:
-        totals = [series.total_seconds for series in client.trends("timecard").series]
+        totals = [series.total for series in client.trends("timecard").series]
         assert totals == sorted(totals, reverse=True)
 
     def test_an_empty_stream_yields_an_empty_view(self, repository: Repository) -> None:
@@ -245,7 +272,7 @@ class TestSeriesCapping:
     def test_folding_preserves_the_total(self, client: MinmaxClient) -> None:
         capped = client.trends("timecard", max_series=1)
         full = client.trends("timecard")
-        assert capped.total_seconds == full.total_seconds
+        assert capped.total == full.total
 
     def test_never_more_than_eight_hues_on_screen(self, client: MinmaxClient) -> None:
         # Past eight, adjacent categorical hues stop being distinguishable under
@@ -266,6 +293,69 @@ class TestSeriesCapping:
             assert full[label] == swatch
 
 
+class TestOtherBreakdown:
+    """ "Other" carries its own folded members, and :func:`other_breakdown`
+    turns one into a displayable view -- a double-click on "Other" has
+    something to show without a second query."""
+
+    def test_other_carries_its_folded_members(self, many_categories_client: MinmaxClient) -> None:
+        # 8 categories, max_series=3: cat0-2 kept, cat3-7 folded -- and
+        # folding 5 items at max_series=3 itself keeps 3 and nests the rest.
+        view = many_categories_client.trends("timecard", max_series=3)
+        other = next(s for s in view.series if s.is_other)
+        assert [m.label for m in other.members] == ["cat3", "cat4", "cat5", "Other (2)"]
+        # The merged total is preserved regardless of how deep the members
+        # are nested -- the same invariant test_folding_preserves_the_total
+        # checks at the top level.
+        assert sum(m.values[0] for m in other.members) == other.values[0]
+
+    def test_a_deep_fold_nests_another_other_inside(
+        self, many_categories_client: MinmaxClient
+    ) -> None:
+        view = many_categories_client.trends("timecard", max_series=3)
+        other = next(s for s in view.series if s.is_other)
+        nested = next(m for m in other.members if m.is_other)
+        assert nested.label == "Other (2)"
+        assert [m.label for m in nested.members] == ["cat6", "cat7"]
+        assert nested.members[0].members == ()  # no third level needed here
+
+    def test_a_series_that_is_not_folded_has_no_members(
+        self, many_categories_client: MinmaxClient
+    ) -> None:
+        view = many_categories_client.trends("timecard", max_series=3)
+        kept = [s for s in view.series if not s.is_other]
+        assert kept and all(s.members == () for s in kept)
+
+    def test_other_breakdown_replaces_the_series_with_the_members(
+        self, many_categories_client: MinmaxClient
+    ) -> None:
+        view = many_categories_client.trends("timecard", max_series=3)
+        other = next(s for s in view.series if s.is_other)
+        drilled = other_breakdown(view, other)
+        assert [s.label for s in drilled.series] == [m.label for m in other.members]
+        assert drilled.columns == view.columns
+        assert drilled.interval == view.interval
+        assert drilled.metric == view.metric
+        assert drilled.prefix == view.prefix
+
+    def test_other_breakdown_rescales_the_peak(self, many_categories_client: MinmaxClient) -> None:
+        view = many_categories_client.trends("timecard", max_series=3)
+        other = next(s for s in view.series if s.is_other)
+        drilled = other_breakdown(view, other)
+        # The kept categories (59m, 58m, 57m) dwarf anything folded away
+        # (56m and under), so the axis must shrink to fit what is now
+        # actually on screen rather than staying pinned to the parent scale.
+        assert drilled.peak_plot_value < view.peak_plot_value
+
+    def test_other_breakdown_rejects_a_series_that_is_not_other(
+        self, many_categories_client: MinmaxClient
+    ) -> None:
+        view = many_categories_client.trends("timecard", max_series=3)
+        real = next(s for s in view.series if not s.is_other)
+        with pytest.raises(ValueError, match="not an 'Other'"):
+            other_breakdown(view, real)
+
+
 class TestDrillDown:
     def test_a_prefix_splits_a_group_into_its_children(self, client: MinmaxClient) -> None:
         view = client.trends("timecard", prefix="media")
@@ -278,7 +368,7 @@ class TestDrillDown:
 
     def test_a_focus_only_counts_its_own_subtree(self, client: MinmaxClient) -> None:
         view = client.trends("timecard", prefix="media")
-        assert view.total_seconds == 2921
+        assert view.total == 2921
 
     def test_focus_colours_are_stable_regardless_of_ranking(self, client: MinmaxClient) -> None:
         first = {s.label: s.swatch for s in client.trends("timecard", prefix="media").series}
@@ -318,7 +408,7 @@ class TestGranularity:
         weekly = client.trends("timecard", interval=Granularity.WEEK)
 
         assert len(weekly.columns) == 1
-        assert weekly.total_seconds == daily.total_seconds
+        assert weekly.total == daily.total
         by_label = {series.label: series for series in weekly.series}
         assert by_label["sleep"].values == [8 * HOUR]
 
@@ -329,7 +419,7 @@ class TestGranularity:
                 since=date(2026, 6, 1),
                 until=date(2026, 8, 31),
                 interval=granularity,
-            ).total_seconds
+            ).total
             for granularity in (Granularity.DAY, Granularity.WEEK, Granularity.MONTH)
         }
         assert len(set(totals.values())) == 1
@@ -350,10 +440,12 @@ class TestDailyAverages:
             interval=Granularity.WEEK,
         )
 
-        assert daily.peak_daily_seconds == 32_400  # the 6th, 9 hours
+        assert daily.peak_plot_value == 32_400  # the 6th, 9 hours
         # One week holding 10h over 7 days averages well under any single day.
         assert weekly.columns[0].day_count == 7
-        assert weekly.peak_daily_seconds == round(36_000 / 7)
+        # No longer rounded to a whole second, unlike the old peak_daily_seconds:
+        # a stacking metric's ceiling is a plain division now, not a display value.
+        assert weekly.peak_plot_value == pytest.approx(36_000 / 7)
 
     def test_daily_average_divides_by_the_days_the_column_covers(
         self, client: MinmaxClient
@@ -378,7 +470,7 @@ class TestDailyAverages:
         )
         assert weekly.columns[0].day_count == 2
         assert weekly.columns[0].clipped
-        assert weekly.peak_daily_seconds == round(36_000 / 2)
+        assert weekly.peak_plot_value == pytest.approx(36_000 / 2)
 
 
 class TestColumnLabels:
@@ -459,7 +551,7 @@ class TestCustomIntervals:
     def test_a_fortnight_sums_the_days_it_covers(self, client: MinmaxClient) -> None:
         daily = client.trends("timecard", interval=Granularity.DAY)
         fortnightly = client.trends("timecard", interval=Interval(Granularity.WEEK, 2))
-        assert fortnightly.total_seconds == daily.total_seconds
+        assert fortnightly.total == daily.total
         assert len(fortnightly.columns) < len(daily.columns)
 
     def test_the_grand_total_survives_any_count(self, client: MinmaxClient) -> None:
@@ -469,7 +561,7 @@ class TestCustomIntervals:
                 since=date(2026, 6, 1),
                 until=date(2026, 8, 31),
                 interval=Interval(Granularity.DAY, count),
-            ).total_seconds
+            ).total
             for count in (1, 2, 3, 5, 12)
         }
         assert len(set(totals.values())) == 1
@@ -507,7 +599,7 @@ class TestPinnedRange:
     def test_a_pinned_range_excludes_data_outside_it(self, client: MinmaxClient) -> None:
         view = client.trends("timecard", since=date(2026, 6, 6), until=date(2026, 6, 6))
         # The 5th's hour of sleep is outside the range and must not be counted.
-        assert view.total_seconds == 9 * HOUR
+        assert view.total == 9 * HOUR
 
     def test_the_default_range_is_everything(self, client: MinmaxClient) -> None:
         view = client.trends("timecard")

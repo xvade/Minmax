@@ -14,9 +14,24 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from minmax.api import CsvPreview, DayView, InProcessClient, MinmaxClient
+from minmax.api import (
+    Aggregate,
+    CsvPreview,
+    DayView,
+    Granularity,
+    InProcessClient,
+    Interval,
+    MinmaxClient,
+)
 from minmax.core import palette
-from minmax.core.models import EventRecord, FieldRole, FieldSpec, IntervalRecord, StreamKind
+from minmax.core.models import (
+    EventRecord,
+    FieldRole,
+    FieldSpec,
+    IntervalRecord,
+    Stream,
+    StreamKind,
+)
 from minmax.core.timeref import Instant
 from minmax.ingest import TimecardCsvImporter, run_import
 from minmax.storage.repository import Repository
@@ -540,6 +555,23 @@ class TestStreamCreation:
             client.create_stream("pickups", "Pickups Again", StreamKind.EVENT)
 
 
+class TestStreamDeletion:
+    def test_a_deleted_stream_no_longer_appears_in_streams(
+        self, repository: Repository, home: Path
+    ) -> None:
+        client = InProcessClient(repository, timezone=PACIFIC, home=home)
+        client.create_stream("pickups", "Pickups", StreamKind.EVENT)
+
+        client.delete_stream("pickups")
+
+        assert [s.key for s in client.streams()] == []
+
+    def test_an_unknown_key_raises(self, repository: Repository, home: Path) -> None:
+        client = InProcessClient(repository, timezone=PACIFIC, home=home)
+        with pytest.raises(LookupError, match="no stream"):
+            client.delete_stream("nonexistent")
+
+
 class TestAutoFetch:
     def test_a_stream_starts_with_auto_fetch_off(self, client: MinmaxClient) -> None:
         [summary] = client.streams()
@@ -735,6 +767,21 @@ class TestCsvInspection:
         assert preview.header == ()
         assert preview.suggested_fields == ()
 
+    def test_inspecting_an_interval_csv_guesses_start_and_end(
+        self, repository: Repository, home: Path, sessions_csv: Path
+    ) -> None:
+        client = InProcessClient(repository, timezone=PACIFIC, home=home)
+        preview = client.inspect_csv(sessions_csv, kind=StreamKind.INTERVAL)
+        assert preview.ok
+        start_fields = [f for f in preview.suggested_fields if f.role is FieldRole.START]
+        end_fields = [f for f in preview.suggested_fields if f.role is FieldRole.END]
+        assert [f.source_column for f in start_fields] == ["session_start"]
+        assert [f.source_column for f in end_fields] == ["session_end"]
+        # No NUMBER/TEXT columns are ever guessed for an interval stream --
+        # there is nowhere to store them.
+        other_roles = {f.role for f in preview.suggested_fields} - {FieldRole.START, FieldRole.END}
+        assert other_roles == {FieldRole.IGNORED}
+
 
 class TestEventStreamViews:
     """The point-in-time analogues of the interval day/window/range/trends
@@ -781,8 +828,8 @@ class TestEventStreamViews:
         assert len(view.columns) == 2
         [series] = view.series
         assert series.values == [2, 1]
-        assert series.total_seconds == 3
-        assert view.total_seconds == 3
+        assert series.total == 3
+        assert view.total == 3
 
     def test_a_field_less_stream_files_under_the_implicit_category(
         self, repository: Repository, home: Path
@@ -813,3 +860,131 @@ class TestEventStreamViews:
         view = client.day("pickups", date(2026, 6, 6))
         assert view.records[0].fields == ()
         assert view.records[0].category_path == "pickups"
+
+
+class TestTrendMetrics:
+    """A declared numeric field's total and average as trends metrics --
+    see ``core/measures.py`` for the value-weighted-mean invariant this
+    exists to protect, and the ``readings_stream`` fixture's docstring for
+    why it, not ``heart_rate``/``location``, is what can catch a regression
+    in it.
+    """
+
+    def test_metric_options_scale_with_declared_fields(
+        self, repository: Repository, home: Path
+    ) -> None:
+        repository.create_stream("bare", "Bare", StreamKind.EVENT)
+        repository.create_stream("empty_interval", "Empty Interval", StreamKind.INTERVAL)
+        repository.create_stream(
+            "one_field",
+            "One Field",
+            StreamKind.EVENT,
+            fields=[
+                FieldSpec(
+                    key="bpm", label="BPM", role=FieldRole.NUMBER, source_column="bpm", unit="bpm"
+                )
+            ],
+        )
+        repository.create_stream(
+            "two_fields",
+            "Two Fields",
+            StreamKind.EVENT,
+            fields=[
+                FieldSpec(key="lat", label="Lat", role=FieldRole.NUMBER, source_column="lat"),
+                FieldSpec(key="lon", label="Lon", role=FieldRole.NUMBER, source_column="lon"),
+            ],
+        )
+        client = InProcessClient(repository, timezone=PACIFIC, home=home)
+
+        # An interval stream has no competing reading of "how much" -- a
+        # duration is its only shape -- so there is nothing to choose.
+        assert client.trends("empty_interval").metric_options == ()
+        assert [o.label for o in client.trends("bare").metric_options] == ["Count"]
+        assert [o.label for o in client.trends("one_field").metric_options] == [
+            "Count",
+            "BPM total",
+            "BPM average",
+        ]
+        assert [o.label for o in client.trends("two_fields").metric_options] == [
+            "Count",
+            "Lat total",
+            "Lat average",
+            "Lon total",
+            "Lon average",
+        ]
+
+    def test_field_sum_and_mean_per_day(
+        self, repository: Repository, readings_stream: Stream, home: Path
+    ) -> None:
+        client = InProcessClient(repository, timezone=PACIFIC, home=home)
+        sums = client.trends(
+            "readings", field_key="value", aggregate=Aggregate.SUM, interval=Granularity.DAY
+        )
+        by_label = {series.label: series.values for series in sums.series}
+        assert by_label["phone"] == [30.0, 100.0, 0.0]
+        assert by_label["watch"] == [50.0, 30.0, 5.0]
+        assert sums.metric.label == "Reading total"
+        assert sums.metric.unit == "pt"
+
+        means = client.trends(
+            "readings", field_key="value", aggregate=Aggregate.MEAN, interval=Granularity.DAY
+        )
+        by_label_and_weight = {
+            series.label: (series.values, series.weights) for series in means.series
+        }
+        # Day 3: phone recorded nothing, so its weight is 0 rather than the
+        # column silently vanishing or being treated as a reading of zero.
+        assert by_label_and_weight["phone"] == ([30.0, 100.0, 0.0], [2.0, 1.0, 0.0])
+        assert by_label_and_weight["watch"] == ([50.0, 30.0, 5.0], [1.0, 3.0, 1.0])
+        assert means.metric.label == "Reading average"
+
+    def test_a_multi_day_column_is_value_weighted_not_a_mean_of_daily_means(
+        self, repository: Repository, readings_stream: Stream, home: Path
+    ) -> None:
+        """The regression this whole shape exists to prevent: a multi-day
+        mean must be ``sum(value_sum) / sum(value_count)`` over the days it
+        covers, never the mean of each day's own (already-divided) mean.
+        """
+        client = InProcessClient(repository, timezone=PACIFIC, home=home)
+        view = client.trends(
+            "readings",
+            field_key="value",
+            aggregate=Aggregate.MEAN,
+            interval=Interval(Granularity.DAY, 3),
+        )
+        assert len(view.columns) == 1
+        phone = next(series for series in view.series if series.label == "phone")
+        assert phone.values[0] == 130.0  # 10 + 20 + 100, day 3 contributing nothing
+        assert phone.weights[0] == 3.0  # 2 readings + 1 reading + 0
+        weighted_mean = phone.values[0] / phone.weights[0]
+        assert weighted_mean == pytest.approx(130 / 3)
+
+        # What a mean-of-daily-means bug would compute instead: the average
+        # of day 1's mean (15) and day 2's mean (100), skipping the empty
+        # day 3 -- a different, wrong number.
+        assert weighted_mean != pytest.approx((15.0 + 100.0) / 2)
+
+    def test_field_key_on_an_interval_stream_raises(self, client: MinmaxClient) -> None:
+        with pytest.raises(ValueError, match="not an event stream"):
+            client.trends("timecard", field_key="whatever")
+
+    def test_an_unsupported_aggregate_raises(
+        self, repository: Repository, readings_stream: Stream, home: Path
+    ) -> None:
+        client = InProcessClient(repository, timezone=PACIFIC, home=home)
+        with pytest.raises(ValueError, match="sum or mean"):
+            client.trends("readings", field_key="value", aggregate=Aggregate.MIN)
+
+    def test_an_undeclared_field_key_raises(
+        self, repository: Repository, readings_stream: Stream, home: Path
+    ) -> None:
+        client = InProcessClient(repository, timezone=PACIFIC, home=home)
+        with pytest.raises(LookupError, match="no numeric field"):
+            client.trends("readings", field_key="nonexistent")
+
+    def test_aggregate_without_a_field_key_raises(
+        self, repository: Repository, readings_stream: Stream, home: Path
+    ) -> None:
+        client = InProcessClient(repository, timezone=PACIFIC, home=home)
+        with pytest.raises(ValueError, match="requires field_key"):
+            client.trends("readings", aggregate=Aggregate.MEAN)

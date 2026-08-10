@@ -7,7 +7,14 @@ in :mod:`minmax.ingest.base`, so a new datastream needs only a parser.
 
 from minmax.core.models import StreamKind
 from minmax.ingest.base import Importer, ImportReport, ParseResult, Rejection, run_import
-from minmax.ingest.csvstream import CsvStreamImporter, guess_fields, read_sample, sniff_fields
+from minmax.ingest.csvstream import (
+    CsvStreamImporter,
+    IntervalCsvImporter,
+    guess_fields,
+    read_sample,
+    sniff_fields,
+    validate_declaration,
+)
 from minmax.ingest.timecard import TimecardCsvImporter
 from minmax.storage.repository import Repository
 
@@ -15,6 +22,7 @@ __all__ = [
     "CsvStreamImporter",
     "ImportReport",
     "Importer",
+    "IntervalCsvImporter",
     "ParseResult",
     "Rejection",
     "TimecardCsvImporter",
@@ -23,6 +31,7 @@ __all__ = [
     "read_sample",
     "run_import",
     "sniff_fields",
+    "validate_declaration",
 ]
 
 #: Hardcoded importers by the stream key they always create, e.g. 'timecard'.
@@ -50,10 +59,13 @@ def importer_for(repository: Repository, stream_key: str) -> Importer:
     stream = repository.get_stream(stream_key)
     if stream is None:
         raise LookupError(f"no stream {stream_key!r}; create it first with 'minmax stream add'")
-    if stream.kind is not StreamKind.EVENT:
-        raise ValueError(
-            f"stream {stream_key!r} is a {stream.kind} stream; only point-in-time streams can"
-            " be imported into with the generic importer today"
-        )
     assert stream.id is not None
-    return CsvStreamImporter(stream.key, stream.name, repository.stream_fields(stream.id))
+    fields = repository.stream_fields(stream.id)
+    if stream.kind is StreamKind.EVENT:
+        return CsvStreamImporter(stream.key, stream.name, fields)
+    if stream.kind is StreamKind.INTERVAL:
+        return IntervalCsvImporter(stream.key, stream.name, fields, exclusive=stream.exclusive)
+    raise ValueError(
+        f"stream {stream_key!r} is a {stream.kind} stream; only point-in-time and interval"
+        " streams can be imported into with the generic importer today"
+    )

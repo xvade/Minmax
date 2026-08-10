@@ -30,8 +30,8 @@ __all__ = [
     "TrendsGeometry",
     "clamp_column_zoom",
     "fit_column_zoom",
-    "nice_count_ceiling",
     "nice_seconds_ceiling",
+    "nice_value_ceiling",
     "stack_bands",
     "tick_interval_columns",
     "visible_column_range",
@@ -188,18 +188,20 @@ def stack_bands(
 
 
 def window_totals(
-    series_values: Sequence[Sequence[int]], first_column: int, last_column: int
-) -> list[int]:
-    """Total seconds per series over an inclusive column window.
+    series_values: Sequence[Sequence[float]], first_column: int, last_column: int
+) -> list[float]:
+    """Total per series over an inclusive column window -- seconds, event
+    counts, or a field's summed value, whichever the series holds.
 
-    This is what the legend's percentages are computed from, so they describe
-    the columns actually on screen and update as the reader scrolls or zooms.
+    This is what the legend's percentages (and a mean metric's window
+    average) are computed from, so they describe the columns actually on
+    screen and update as the reader scrolls or zooms.
     """
     if not series_values:
         return []
     column_count = len(series_values[0])
     if column_count == 0:
-        return [0] * len(series_values)
+        return [0.0] * len(series_values)
 
     low = max(0, min(first_column, column_count - 1))
     high = max(low, min(last_column, column_count - 1))
@@ -218,23 +220,25 @@ def nice_seconds_ceiling(peak_seconds: float) -> int:
     return _VALUE_STEPS[-1]
 
 
-def nice_count_ceiling(peak_count: float) -> int:
-    """A readable y-axis ceiling at or above ``peak_count``, for a
-    count-based (point-in-time stream) trends chart.
+def nice_value_ceiling(peak_value: float) -> float:
+    """A readable y-axis ceiling at or above ``peak_value``, for a trends
+    chart with no natural bound -- an event count, or a declared numeric
+    field's total or average.
 
     Not :func:`nice_seconds_ceiling`: that one tops out at 24h because a day
-    cannot hold more hours than that, but a count of events per day has no
-    such bound, so it needs its own steps rather than clamping at a fixed
-    maximum the way a duration ceiling correctly does.
+    cannot hold more hours than that, but a count (or a field value, which
+    can be anything) has no such bound, so it needs its own steps rather
+    than clamping at a fixed maximum the way a duration ceiling correctly
+    does.
     """
-    if peak_count <= 1:
-        return 1
-    magnitude = 10 ** math.floor(math.log10(peak_count))
+    if peak_value <= 1:
+        return 1.0
+    magnitude = 10 ** math.floor(math.log10(peak_value))
     for multiplier in (1, 2, 5, 10):
         candidate = magnitude * multiplier
-        if peak_count <= candidate:
-            return int(candidate)
-    return int(magnitude * 10)
+        if peak_value <= candidate:
+            return float(candidate)
+    return float(magnitude * 10)
 
 
 def tick_interval_columns(pixels_per_column: float, *, min_label_pixels: float = 64.0) -> int:
