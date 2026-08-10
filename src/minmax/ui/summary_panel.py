@@ -11,8 +11,8 @@ from PySide6.QtCore import QRectF, QSize, Qt
 from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPaintEvent
 from PySide6.QtWidgets import QScrollArea, QSizePolicy, QWidget
 
-from minmax.api import CategorySlice
-from minmax.api.format import format_duration
+from minmax.api import CategorySlice, StreamKind
+from minmax.api.format import format_measure
 from minmax.ui import theme
 
 __all__ = ["SummaryPanel"]
@@ -27,14 +27,26 @@ class _SummaryRows(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._slices: list[CategorySlice] = []
+        self._stream_kind = StreamKind.INTERVAL
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
-    def set_slices(self, slices: list[CategorySlice]) -> None:
-        # Largest first: the answer to "where did the day go" should be the top
-        # line, not something to scan for.
-        self._slices = sorted(slices, key=lambda item: item.seconds, reverse=True)
+    def set_slices(
+        self, slices: list[CategorySlice], *, stream_kind: StreamKind = StreamKind.INTERVAL
+    ) -> None:
+        self._stream_kind = stream_kind
+        # Largest first: the answer to "where did the day go" (or "what
+        # happened most") should be the top line, not something to scan for.
+        key = self._rank
+        self._slices = sorted(slices, key=key, reverse=True)
         self.updateGeometry()
         self.update()
+
+    def _rank(self, item: CategorySlice) -> int:
+        return item.record_count if self._stream_kind is StreamKind.EVENT else item.seconds
+
+    def _figure(self, item: CategorySlice) -> str:
+        magnitude = item.record_count if self._stream_kind is StreamKind.EVENT else item.seconds
+        return format_measure(magnitude, self._stream_kind)
 
     def sizeHint(self) -> QSize:
         return QSize(240, ROW_HEIGHT * max(1, len(self._slices)))
@@ -83,7 +95,7 @@ class _SummaryRows(QWidget):
             painter.drawText(
                 QRectF(row.width() - DURATION_COLUMN - PADDING, top, DURATION_COLUMN, ROW_HEIGHT),
                 int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter),
-                format_duration(item.seconds),
+                self._figure(item),
             )
 
 
@@ -98,8 +110,10 @@ class SummaryPanel(QScrollArea):
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setMinimumWidth(240)
 
-    def set_slices(self, slices: list[CategorySlice]) -> None:
-        self._rows.set_slices(slices)
+    def set_slices(
+        self, slices: list[CategorySlice], *, stream_kind: StreamKind = StreamKind.INTERVAL
+    ) -> None:
+        self._rows.set_slices(slices, stream_kind=stream_kind)
 
 
 def heading_font(base: QFont) -> QFont:

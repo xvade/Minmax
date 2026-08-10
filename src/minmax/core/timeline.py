@@ -1,4 +1,4 @@
-"""Arranging a day's observations on a vertical timeline.
+"""Arranging observations on a vertical timeline.
 
 This is the arithmetic behind the history view: where each block sits, how tall
 it is, whether it is tall enough to carry a label, and how the scroll position
@@ -6,7 +6,7 @@ must move so that zooming stays anchored under the pointer.
 
 It lives in ``core`` rather than ``ui`` on purpose. All of it is exact,
 deterministic, and easy to get subtly wrong -- an off-by-one in the label
-threshold is cosmetic, but an error in :meth:`DayGeometry.y_for_epoch` silently
+threshold is cosmetic, but an error in :meth:`TimelineGeometry.y_for_epoch` silently
 misplaces every block. Keeping it free of Qt means it is unit-tested directly
 and a future web client can reuse it rather than reimplementing it.
 
@@ -14,6 +14,10 @@ The model follows Timecard's own history screen: blocks are sized to their real
 duration so they tile without overlapping, and a run crossing midnight stays a
 single run -- clipped for drawing, but flagged so the view can mark the overhang
 instead of pretending the run ended at the boundary.
+
+The unit is a *span* of time, not a day. The timeline scrolls continuously
+across midnight the way Timecard's history does, so a view hands in whichever
+window of days it currently holds and this arithmetic is unchanged.
 """
 
 from __future__ import annotations
@@ -23,14 +27,15 @@ from dataclasses import dataclass
 
 __all__ = [
     "DEFAULT_PIXELS_PER_HOUR",
+    "MARKER_HEIGHT",
     "MAX_PIXELS_PER_HOUR",
     "MIN_PIXELS_PER_HOUR",
-    "DayGeometry",
     "LaidOutBlock",
+    "TimelineGeometry",
     "anchored_scroll_offset",
     "clamp_zoom",
     "hour_boundaries",
-    "lay_out_day",
+    "lay_out_blocks",
 ]
 
 SECONDS_PER_HOUR = 3600
@@ -51,34 +56,45 @@ DEFAULT_PIXELS_PER_HOUR = 64.0
 MIN_LABEL_HEIGHT = 15.0
 MIN_DURATION_HEIGHT = 26.0
 
+#: A point-in-time record has no duration to size a block from, so it gets a
+#: fixed height instead, centered on its instant. Tall enough to be clicked
+#: (same comfortable-target reasoning as the zoom ceiling above), short
+#: enough to still read as a moment rather than a span.
+MARKER_HEIGHT = 10.0
+
 
 @dataclass(frozen=True, slots=True)
-class DayGeometry:
-    """Maps a local day's epoch range onto vertical pixels.
+class TimelineGeometry:
+    """Maps an epoch range onto vertical pixels.
 
-    The day's bounds are passed in rather than assumed to be 24 hours, because
-    across a DST transition a local day really is 23 or 25 hours long. Sizing
-    the timeline from the actual elapsed seconds renders that correctly with no
-    special case: the short day is simply shorter.
+    The span's bounds are passed in rather than derived from a day count,
+    because across a DST transition a local day really is 23 or 25 hours long.
+    Sizing from the actual elapsed seconds renders that correctly with no
+    special case: the short day is simply shorter, and a window containing one
+    needs no adjustment at all.
+
+    Nothing here assumes the span is a single day. The timeline scrolls
+    continuously across midnight, so a window is however many days the reader
+    has scrolled through.
     """
 
-    day_start_epoch: int
-    day_end_epoch: int
+    start_epoch: int
+    end_epoch: int
     pixels_per_hour: float
 
     def __post_init__(self) -> None:
-        if self.day_end_epoch <= self.day_start_epoch:
-            raise ValueError("a day must end after it starts")
+        if self.end_epoch <= self.start_epoch:
+            raise ValueError("a span must end after it starts")
         if self.pixels_per_hour <= 0:
             raise ValueError("pixels_per_hour must be positive")
 
     @property
     def seconds(self) -> int:
-        return self.day_end_epoch - self.day_start_epoch
+        return self.end_epoch - self.start_epoch
 
     @property
     def height(self) -> float:
-        """Total pixel height of the day."""
+        """Total pixel height of the span."""
         return self.seconds / SECONDS_PER_HOUR * self.pixels_per_hour
 
     @property
@@ -86,44 +102,50 @@ class DayGeometry:
         return self.pixels_per_hour / SECONDS_PER_HOUR
 
     def y_for_epoch(self, epoch_seconds: float) -> float:
-        """Vertical position of an instant, in pixels from the day's top.
+        """Vertical position of an instant, in pixels from the span's top.
 
-        Not clamped: callers that need a value inside the day should clip, and
+        Not clamped: callers that need a value inside the span should clip, and
         callers drawing an overhanging run want the true (negative or past-end)
         position.
         """
-        return (epoch_seconds - self.day_start_epoch) * self.pixels_per_second
+        return (epoch_seconds - self.start_epoch) * self.pixels_per_second
 
     def epoch_for_y(self, y: float) -> int:
         """The instant at a vertical position -- the inverse of :meth:`y_for_epoch`."""
-        return round(self.day_start_epoch + y / self.pixels_per_second)
+        return round(self.start_epoch + y / self.pixels_per_second)
 
-    def with_zoom(self, pixels_per_hour: float) -> DayGeometry:
-        return DayGeometry(
-            day_start_epoch=self.day_start_epoch,
-            day_end_epoch=self.day_end_epoch,
+    def with_zoom(self, pixels_per_hour: float) -> TimelineGeometry:
+        return TimelineGeometry(
+            start_epoch=self.start_epoch,
+            end_epoch=self.end_epoch,
             pixels_per_hour=clamp_zoom(pixels_per_hour),
         )
 
 
 @dataclass(frozen=True, slots=True)
 class LaidOutBlock:
-    """One observation's rectangle on the day, already clipped to it."""
+    """One observation's rectangle on the span, already clipped to it."""
 
     index: int
-    """Position in the sequence handed to :func:`lay_out_day`."""
+    """Position in the sequence handed to :func:`lay_out_blocks`."""
 
     top: float
     height: float
 
     continues_before: bool
-    """The run began before this day; the view should mark the top edge."""
+    """The run began before the span; the view should mark the top edge."""
 
     continues_after: bool
-    """The run ends after this day; the view should mark the bottom edge."""
+    """The run ends after the span; the view should mark the bottom edge."""
 
     show_label: bool
     show_duration: bool
+
+    is_marker: bool = False
+    """A point-in-time record: ``height`` is the fixed :data:`MARKER_HEIGHT`,
+    centered on the instant, rather than derived from a span. Never carries
+    :attr:`continues_before`/:attr:`continues_after` -- an instant is either
+    inside the window or outside it, never overhanging an edge."""
 
     @property
     def bottom(self) -> float:
@@ -134,19 +156,28 @@ def clamp_zoom(pixels_per_hour: float) -> float:
     return max(MIN_PIXELS_PER_HOUR, min(MAX_PIXELS_PER_HOUR, pixels_per_hour))
 
 
-def lay_out_day(
+def lay_out_blocks(
     spans: Sequence[tuple[int, int]],
-    geometry: DayGeometry,
+    geometry: TimelineGeometry,
     *,
     min_label_height: float = MIN_LABEL_HEIGHT,
     min_duration_height: float = MIN_DURATION_HEIGHT,
+    marker_height: float = MARKER_HEIGHT,
 ) -> list[LaidOutBlock]:
-    """Place ``(start_epoch, end_epoch)`` spans on the day.
+    """Place ``(start_epoch, end_epoch)`` observations on the geometry's span.
 
-    Spans that do not touch the day are dropped; spans that overhang it are
-    clipped and flagged. The result preserves the input order, and each entry
+    Observations that do not touch the span are dropped; those that overhang it
+    are clipped and flagged. With a continuously scrolling timeline the span is
+    a *window* of days, so the flags now fire only at the window's outer edges
+    -- a run crossing midnight in the middle of the window is simply one block
+    that happens to be tall. The result preserves the input order, and each entry
     carries the index of the span it came from so the caller can pair it back up
     with the record's colour and label without a lookup table.
+
+    ``start_epoch == end_epoch`` (a point-in-time record) is laid out as a
+    fixed-height marker centered on the instant rather than a duration-sized
+    block, since there is no span to clip or size from -- see
+    :attr:`LaidOutBlock.is_marker`.
 
     Blocks are *not* de-overlapped: for an exclusive stream they cannot overlap,
     and for a stream that permits overlaps the honest rendering is to draw them
@@ -156,11 +187,34 @@ def lay_out_day(
     blocks: list[LaidOutBlock] = []
 
     for index, (start_epoch, end_epoch) in enumerate(spans):
-        if end_epoch <= geometry.day_start_epoch or start_epoch >= geometry.day_end_epoch:
+        if start_epoch == end_epoch:
+            # Half-open containment for a point, [window start, window end):
+            # the generic overlap check below is for spans and would wrongly
+            # drop an instant that lands exactly on the window's start (it
+            # reads "ends at-or-before start" and excludes it, correct for a
+            # span but not for a point that IS the window's first instant).
+            if not (geometry.start_epoch <= start_epoch < geometry.end_epoch):
+                continue
+            center = geometry.y_for_epoch(start_epoch)
+            blocks.append(
+                LaidOutBlock(
+                    index=index,
+                    top=center - marker_height / 2,
+                    height=marker_height,
+                    continues_before=False,
+                    continues_after=False,
+                    show_label=True,
+                    show_duration=False,
+                    is_marker=True,
+                )
+            )
             continue
 
-        clipped_start = max(start_epoch, geometry.day_start_epoch)
-        clipped_end = min(end_epoch, geometry.day_end_epoch)
+        if end_epoch <= geometry.start_epoch or start_epoch >= geometry.end_epoch:
+            continue
+
+        clipped_start = max(start_epoch, geometry.start_epoch)
+        clipped_end = min(end_epoch, geometry.end_epoch)
 
         top = geometry.y_for_epoch(clipped_start)
         height = geometry.y_for_epoch(clipped_end) - top
@@ -170,8 +224,8 @@ def lay_out_day(
                 index=index,
                 top=top,
                 height=height,
-                continues_before=start_epoch < geometry.day_start_epoch,
-                continues_after=end_epoch > geometry.day_end_epoch,
+                continues_before=start_epoch < geometry.start_epoch,
+                continues_after=end_epoch > geometry.end_epoch,
                 show_label=height >= min_label_height,
                 show_duration=height >= min_duration_height,
             )
@@ -180,11 +234,11 @@ def lay_out_day(
     return blocks
 
 
-def hour_boundaries(day_start_epoch: int, day_end_epoch: int, *, every: int = 1) -> list[int]:
-    """Instants of each hour boundary within a day, starting at its first moment.
+def hour_boundaries(start_epoch: int, end_epoch: int, *, every: int = 1) -> list[int]:
+    """Instants of each hour boundary within a span, starting at its first moment.
 
-    Walks the day's own bounds rather than assuming 24 evenly spaced hours, so a
-    23- or 25-hour DST day yields the right number of boundaries.
+    Walks the span's own bounds rather than assuming 24 evenly spaced hours per
+    day, so a 23- or 25-hour DST day yields the right number of boundaries.
 
     Only the instants are returned. Turning them into clock readings needs a
     timezone, which ``core`` deliberately does not reach for -- the client
@@ -194,7 +248,7 @@ def hour_boundaries(day_start_epoch: int, day_end_epoch: int, *, every: int = 1)
         raise ValueError(f"every must be at least 1, got {every}")
 
     step = SECONDS_PER_HOUR * every
-    return list(range(day_start_epoch, day_end_epoch, step))
+    return list(range(start_epoch, end_epoch, step))
 
 
 def anchored_scroll_offset(

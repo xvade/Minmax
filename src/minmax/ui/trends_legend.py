@@ -16,8 +16,8 @@ from PySide6.QtCore import QRectF, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QFontMetrics, QMouseEvent, QPainter, QPaintEvent
 from PySide6.QtWidgets import QSizePolicy, QWidget
 
-from minmax.api import TrendSeries
-from minmax.api.format import format_duration
+from minmax.api import StreamKind, TrendSeries
+from minmax.api.format import format_measure
 from minmax.ui import theme
 
 __all__ = ["TrendsLegend"]
@@ -27,7 +27,7 @@ SWATCH = 11
 PADDING = 12
 
 # Wide enough for a three-digit hour total ("250h 21m"), which a multi-month
-# range reaches easily.
+# range reaches easily -- also enough room for a count in the low thousands.
 DURATION_COLUMN = 82
 SHARE_COLUMN = 56
 
@@ -42,14 +42,23 @@ class TrendsLegend(QWidget):
         self._series: list[TrendSeries] = []
         self._shares: list[float] = []
         self._totals: list[int] = []
+        self._stream_kind = StreamKind.INTERVAL
         self.setMinimumWidth(300)
         self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
         self.setMouseTracking(True)
 
-    def set_series(self, series: list[TrendSeries], shares: list[float], totals: list[int]) -> None:
+    def set_series(
+        self,
+        series: list[TrendSeries],
+        shares: list[float],
+        totals: list[int],
+        *,
+        stream_kind: StreamKind = StreamKind.INTERVAL,
+    ) -> None:
         self._series = series
         self._shares = shares
         self._totals = totals
+        self._stream_kind = stream_kind
         self.update()
 
     def sizeHint(self) -> QSize:
@@ -122,7 +131,7 @@ class TrendsLegend(QWidget):
             painter.drawText(
                 QRectF(self.width() - DURATION_COLUMN - PADDING, top, DURATION_COLUMN, ROW_HEIGHT),
                 int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter),
-                format_duration(total),
+                format_measure(total, self._stream_kind),
             )
 
     def _series_at(self, y: float) -> TrendSeries | None:

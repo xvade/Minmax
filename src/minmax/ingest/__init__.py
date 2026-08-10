@@ -5,19 +5,55 @@ provenance, transactions, idempotency, and rollup maintenance are handled once
 in :mod:`minmax.ingest.base`, so a new datastream needs only a parser.
 """
 
+from minmax.core.models import StreamKind
 from minmax.ingest.base import Importer, ImportReport, ParseResult, Rejection, run_import
+from minmax.ingest.csvstream import CsvStreamImporter, guess_fields, read_sample, sniff_fields
 from minmax.ingest.timecard import TimecardCsvImporter
+from minmax.storage.repository import Repository
 
 __all__ = [
+    "CsvStreamImporter",
     "ImportReport",
     "Importer",
     "ParseResult",
     "Rejection",
     "TimecardCsvImporter",
+    "guess_fields",
+    "importer_for",
+    "read_sample",
     "run_import",
+    "sniff_fields",
 ]
 
-#: Importers by the name used on the command line.
-IMPORTERS: dict[str, type] = {
+#: Hardcoded importers by the stream key they always create, e.g. 'timecard'.
+IMPORTERS: dict[str, type[Importer]] = {
     TimecardCsvImporter.stream_key: TimecardCsvImporter,
 }
+
+
+def importer_for(repository: Repository, stream_key: str) -> Importer:
+    """The importer for one stream, whichever kind it is.
+
+    A hardcoded importer (Timecard, today) is used when the key names one, so
+    a first-ever import can still create that stream itself. Otherwise the
+    stream must already exist -- created with its column mapping via
+    :meth:`~minmax.storage.repository.Repository.create_stream` -- and a
+    config-driven importer is built from that mapping. This is the one place
+    ``cli.cmd_import`` and ``InProcessClient.import_file`` both look an
+    importer up, replacing what used to be a duplicated ``IMPORTERS.get()``
+    in each.
+    """
+    hardcoded = IMPORTERS.get(stream_key)
+    if hardcoded is not None:
+        return hardcoded()
+
+    stream = repository.get_stream(stream_key)
+    if stream is None:
+        raise LookupError(f"no stream {stream_key!r}; create it first with 'minmax stream add'")
+    if stream.kind is not StreamKind.EVENT:
+        raise ValueError(
+            f"stream {stream_key!r} is a {stream.kind} stream; only point-in-time streams can"
+            " be imported into with the generic importer today"
+        )
+    assert stream.id is not None
+    return CsvStreamImporter(stream.key, stream.name, repository.stream_fields(stream.id))

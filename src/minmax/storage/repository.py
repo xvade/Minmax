@@ -17,7 +17,7 @@ from __future__ import annotations
 import sqlite3
 import time
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from itertools import pairwise
 
 from minmax.core import palette, paths
@@ -25,11 +25,19 @@ from minmax.core.models import (
     Category,
     CategoryTotal,
     DailyCategoryTotal,
+    DailyFieldTotal,
+    EventCategoryTotal,
+    EventRecord,
+    FieldRole,
+    FieldSpec,
+    FieldValue,
     ImportRun,
     IntervalRecord,
     PeriodTotal,
+    StoredEvent,
     StoredInterval,
     Stream,
+    StreamField,
     StreamKind,
 )
 from minmax.core.timeref import Instant, Period
@@ -37,6 +45,8 @@ from minmax.storage import rollups
 from minmax.storage.database import transaction
 
 __all__ = ["InsertOutcome", "OverlapError", "Repository"]
+
+Record = IntervalRecord | EventRecord
 
 
 class OverlapError(RuntimeError):
@@ -95,6 +105,89 @@ class Repository:
     def list_streams(self) -> list[Stream]:
         rows = self._conn.execute("SELECT * FROM stream ORDER BY key").fetchall()
         return [_stream_from_row(row) for row in rows]
+
+    def create_stream(
+        self,
+        key: str,
+        name: str,
+        kind: StreamKind,
+        *,
+        exclusive: bool = False,
+        fields: Sequence[FieldSpec] = (),
+    ) -> Stream:
+        """Create a new stream and declare its fields, atomically.
+
+        Unlike :meth:`ensure_stream`, this is for a user explicitly adding a
+        stream: it fails if the key is already taken rather than silently
+        returning the existing one, because a user picking a name that turns
+        out to be in use almost certainly meant to create a new stream, not
+        fetch an old one.
+        """
+        if self.get_stream(key) is not None:
+            raise ValueError(f"a stream named {key!r} already exists")
+        with transaction(self._conn) as conn:
+            cursor = conn.execute(
+                "INSERT INTO stream (key, name, kind, exclusive, created_at)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (key, name, kind.value, int(exclusive), int(time.time())),
+            )
+            stream_id = int(cursor.lastrowid or 0)
+            for position, spec in enumerate(fields):
+                conn.execute(
+                    "INSERT INTO stream_field"
+                    " (stream_id, key, label, role, unit, position, source_column)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        stream_id,
+                        spec.key,
+                        spec.label,
+                        spec.role.value,
+                        spec.unit,
+                        position,
+                        spec.source_column,
+                    ),
+                )
+        return Stream(key=key, name=name, kind=kind, exclusive=exclusive, id=stream_id)
+
+    def set_stream_watch(self, stream_id: int, *, path: str | None, enabled: bool) -> None:
+        """Turn a stream's per-minute auto-fetch on or off.
+
+        ``path=None`` leaves the previously remembered path untouched -- the
+        only way to change it today is to give a new one, since nothing needs
+        to clear it back to unset once a stream has ever been pointed
+        somewhere.
+        """
+        with transaction(self._conn) as conn:
+            if path is None:
+                conn.execute(
+                    "UPDATE stream SET watch_enabled = ? WHERE id = ?", (int(enabled), stream_id)
+                )
+            else:
+                conn.execute(
+                    "UPDATE stream SET watch_path = ?, watch_enabled = ? WHERE id = ?",
+                    (path, int(enabled), stream_id),
+                )
+
+    def stream_fields(self, stream_id: int) -> list[StreamField]:
+        """A stream's declared column mapping, in display/import order."""
+        rows = self._conn.execute(
+            "SELECT id, stream_id, key, label, role, unit, position, source_column"
+            " FROM stream_field WHERE stream_id = ? ORDER BY position",
+            (stream_id,),
+        ).fetchall()
+        return [
+            StreamField(
+                id=int(row["id"]),
+                stream_id=int(row["stream_id"]),
+                key=row["key"],
+                label=row["label"],
+                role=FieldRole(row["role"]),
+                unit=row["unit"],
+                position=int(row["position"]),
+                source_column=row["source_column"],
+            )
+            for row in rows
+        ]
 
     # ------------------------------------------------------------------
     # Categories
@@ -321,10 +414,16 @@ class Repository:
                 raise LookupError(f"no import run with id {import_run_id}")
             stream_id = int(row["stream_id"])
 
-            cursor = conn.execute(
+            # An import run belongs to exactly one stream, so only the table
+            # matching that stream's kind ever has matching rows -- deleting
+            # from both is simpler than looking the kind up first, and costs
+            # nothing extra since the other DELETE always affects zero rows.
+            deleted = conn.execute(
                 "DELETE FROM interval_record WHERE import_run_id = ?", (import_run_id,)
-            )
-            deleted = cursor.rowcount
+            ).rowcount
+            deleted += conn.execute(
+                "DELETE FROM event_record WHERE import_run_id = ?", (import_run_id,)
+            ).rowcount
             conn.execute(
                 "UPDATE import_run SET notes = COALESCE(notes || ' | ', '') || 'reverted'"
                 " WHERE id = ?",
@@ -390,18 +489,21 @@ class Repository:
         return InsertOutcome(inserted=len(inserted), duplicates=len(records) - len(inserted))
 
     def _resolve_categories(
-        self, stream_id: int, records: Sequence[IntervalRecord]
+        self, stream_id: int, records: Sequence[Record]
     ) -> dict[tuple[str, str], int]:
         """Ensure every category the batch mentions exists, once each.
 
         Grouped first so that a category appearing in 200 records costs one
         upsert rather than 200, and so its first/last-seen window is computed
         from the whole batch instead of whichever row happened to come last.
+        Works for either record kind: only ``category_source_id``,
+        ``category_path``, and an instant to seed the seen-window are used,
+        and every kind of record carries those.
         """
         grouped: dict[tuple[str, str], tuple[str, int, int]] = {}
         for record in records:
             key = _category_key(record)
-            start = record.start.epoch_seconds
+            start = _record_instant(record).epoch_seconds
             current = grouped.get(key)
             if current is None:
                 grouped[key] = (record.category_path, start, start)
@@ -472,6 +574,122 @@ class Repository:
                     f"{record.end.local_datetime.isoformat()}) overlaps stored "
                     f"{clash['recorded_path']}; revert the earlier import to replace it"
                 )
+
+    # ------------------------------------------------------------------
+    # Point-in-time observations
+    # ------------------------------------------------------------------
+
+    def insert_events(
+        self, stream: Stream, import_run_id: int, records: Sequence[EventRecord]
+    ) -> InsertOutcome:
+        """Store point-in-time observations, resolving categories and rollups
+        atomically. The event analogue of :meth:`insert_intervals`.
+
+        The natural key additionally includes each record's payload hash, so
+        two distinct readings at the same instant both survive while a
+        re-import of the same file is still a no-op.
+        """
+        if stream.kind is not StreamKind.EVENT:
+            raise ValueError(f"stream {stream.key!r} is a {stream.kind} stream, not event")
+        if stream.id is None:
+            raise ValueError("stream must be persisted before inserting observations")
+        if not records:
+            return InsertOutcome(inserted=0, duplicates=0)
+
+        stream_id = stream.id
+        field_ids = {
+            declared.key: declared.id
+            for declared in self.stream_fields(stream_id)
+            if declared.role in (FieldRole.NUMBER, FieldRole.TEXT)
+        }
+
+        with transaction(self._conn) as conn:
+            category_ids = self._resolve_categories(stream_id, records)
+            resolved = [(category_ids[_category_key(r)], r) for r in records]
+
+            inserted_events: list[tuple[int, Instant]] = []
+            inserted_values: list[tuple[int, int, Instant, float]] = []
+            for category_id, record in resolved:
+                cursor = conn.execute(
+                    "INSERT OR IGNORE INTO event_record"
+                    " (stream_id, category_id, import_run_id, occurred_at, offset_seconds,"
+                    "  recorded_path, payload_hash)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        stream_id,
+                        category_id,
+                        import_run_id,
+                        record.at.epoch_seconds,
+                        record.at.utc_offset_seconds,
+                        record.category_path,
+                        record.payload_hash,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    continue
+
+                record_id = cursor.lastrowid
+                for field_key, value in record.values.items():
+                    field_id = field_ids.get(field_key)
+                    if field_id is None:
+                        raise ValueError(
+                            f"event carries undeclared field {field_key!r} for stream"
+                            f" {stream.key!r}"
+                        )
+                    if isinstance(value, str):
+                        conn.execute(
+                            "INSERT INTO event_value (record_id, field_id, num, txt)"
+                            " VALUES (?, ?, NULL, ?)",
+                            (record_id, field_id, value),
+                        )
+                    else:
+                        numeric = float(value)
+                        conn.execute(
+                            "INSERT INTO event_value (record_id, field_id, num, txt)"
+                            " VALUES (?, ?, ?, NULL)",
+                            (record_id, field_id, numeric),
+                        )
+                        inserted_values.append((category_id, field_id, record.at, numeric))
+                inserted_events.append((category_id, record.at))
+
+            rollups.apply_events(conn, stream_id, inserted_events)
+            rollups.apply_event_values(conn, stream_id, inserted_values)
+
+        return InsertOutcome(
+            inserted=len(inserted_events), duplicates=len(records) - len(inserted_events)
+        )
+
+    def insert_records(
+        self, stream: Stream, import_run_id: int, records: Sequence[Record]
+    ) -> InsertOutcome:
+        """Store observations, routing to the table that matches the stream's kind.
+
+        The *stream's* kind decides the table, not whatever happens to be in
+        ``records`` -- feeding an event through the interval path (or an
+        interval through the event path) raises rather than silently storing
+        nothing, which is what an interval importer handed to the wrong
+        stream would otherwise do (a zero-length span produces no rollup
+        buckets and no error).
+        """
+        if stream.kind is StreamKind.INTERVAL:
+            intervals: list[IntervalRecord] = []
+            for record in records:
+                if not isinstance(record, IntervalRecord):
+                    raise ValueError(
+                        f"stream {stream.key!r} is interval; got a {type(record).__name__}"
+                    )
+                intervals.append(record)
+            return self.insert_intervals(stream, import_run_id, intervals)
+        if stream.kind is StreamKind.EVENT:
+            events: list[EventRecord] = []
+            for record in records:
+                if not isinstance(record, EventRecord):
+                    raise ValueError(
+                        f"stream {stream.key!r} is event; got a {type(record).__name__}"
+                    )
+                events.append(record)
+            return self.insert_events(stream, import_run_id, events)
+        raise ValueError(f"no insert path for stream kind {stream.kind}")
 
     # ------------------------------------------------------------------
     # Retrieval
@@ -630,16 +848,172 @@ class Repository:
             for row in rows
         ]
 
+    def daily_field_totals_by_category(
+        self,
+        stream_id: int,
+        *,
+        field_id: int | None = None,
+        start_bucket: str | None = None,
+        end_bucket: str | None = None,
+        path_prefix: str | None = None,
+    ) -> list[DailyFieldTotal]:
+        """A numeric field's sum/count/min/max per (local day, category).
+
+        The ``field_rollup`` analogue of :meth:`daily_totals_by_category` --
+        same bucket-bound and prefix-matching rules, same rationale (a scan of
+        precomputed aggregates rather than of every event). Never derives a
+        mean here: a caller wanting a multi-day mean must sum ``value_sum`` and
+        ``value_count`` themselves and divide once, the way
+        :class:`~minmax.core.models.DailyFieldTotal` documents, since deriving
+        one per row and averaging *those* would silently be the wrong number
+        the moment two days have different counts.
+        """
+        clause, params = _prefix_clause(path_prefix)
+        bounds = ""
+        bound_params: list[str | int] = []
+        if field_id is not None:
+            bounds += " AND fr.field_id = ?"
+            bound_params.append(field_id)
+        if start_bucket is not None:
+            bounds += " AND fr.bucket >= ?"
+            bound_params.append(start_bucket)
+        if end_bucket is not None:
+            bounds += " AND fr.bucket <= ?"
+            bound_params.append(end_bucket)
+
+        rows = self._conn.execute(
+            "SELECT fr.bucket, c.id AS category_id, c.path AS category_path,"
+            "       f.id AS field_id, f.key AS field_key,"
+            "       fr.value_sum, fr.value_count, fr.value_min, fr.value_max"
+            " FROM field_rollup fr"
+            " JOIN category c ON c.id = fr.category_id"
+            " JOIN stream_field f ON f.id = fr.field_id"
+            " WHERE fr.stream_id = ? AND fr.period = 'day'"
+            + bounds
+            + clause
+            + " ORDER BY fr.bucket, c.path, f.key",
+            (stream_id, *bound_params, *params),
+        ).fetchall()
+
+        return [
+            DailyFieldTotal(
+                bucket=row["bucket"],
+                category_id=int(row["category_id"]),
+                category_path=row["category_path"],
+                field_id=int(row["field_id"]),
+                field_key=row["field_key"],
+                value_sum=float(row["value_sum"]),
+                value_count=int(row["value_count"]),
+                value_min=None if row["value_min"] is None else float(row["value_min"]),
+                value_max=None if row["value_max"] is None else float(row["value_max"]),
+            )
+            for row in rows
+        ]
+
     def observed_range(self, stream_id: int) -> tuple[int, int] | None:
-        """Epoch bounds of everything stored for a stream, or None if empty."""
+        """Epoch bounds of everything stored for a stream, or None if empty.
+
+        Unions both observation tables rather than assuming a kind, so this
+        keeps working (and so does everything built on it -- window-loading
+        policy included) for a point-in-time stream, which has nothing in
+        ``interval_record`` at all.
+        """
         row = self._conn.execute(
-            "SELECT MIN(started_at) AS lo, MAX(ended_at) AS hi FROM interval_record"
-            " WHERE stream_id = ?",
-            (stream_id,),
+            "SELECT MIN(lo) AS lo, MAX(hi) AS hi FROM ("
+            "  SELECT MIN(started_at) AS lo, MAX(ended_at) AS hi FROM interval_record"
+            "  WHERE stream_id = ?"
+            "  UNION ALL"
+            "  SELECT MIN(occurred_at), MAX(occurred_at) FROM event_record WHERE stream_id = ?"
+            ")",
+            (stream_id, stream_id),
         ).fetchone()
         if row is None or row["lo"] is None:
             return None
         return int(row["lo"]), int(row["hi"])
+
+    def events_in_range(
+        self,
+        stream_id: int,
+        start_epoch: int,
+        end_epoch: int,
+        *,
+        path_prefix: str | None = None,
+    ) -> list[StoredEvent]:
+        """Observations landing in the half-open range ``[start, end)``.
+
+        Contained, not overlapping, unlike :meth:`intervals_in_range`: a
+        point-in-time observation has no span to spill across the boundary.
+        """
+        clause, params = _prefix_clause(path_prefix)
+        rows = self._conn.execute(
+            "SELECT e.id, e.stream_id, e.category_id, e.import_run_id, e.recorded_path,"
+            "       e.occurred_at, e.offset_seconds, c.path AS category_path"
+            " FROM event_record e JOIN category c ON c.id = e.category_id"
+            " WHERE e.stream_id = ? AND e.occurred_at >= ? AND e.occurred_at < ?"
+            + clause
+            + " ORDER BY e.occurred_at",
+            (stream_id, start_epoch, end_epoch, *params),
+        ).fetchall()
+        events = [_event_from_row(row) for row in rows]
+        if not events:
+            return events
+
+        values_by_record = self._values_for(stream_id, [event.id for event in events])
+        return [replace(event, values=values_by_record.get(event.id, ())) for event in events]
+
+    def counts_by_category(
+        self,
+        stream_id: int,
+        start_epoch: int,
+        end_epoch: int,
+        *,
+        path_prefix: str | None = None,
+    ) -> list[EventCategoryTotal]:
+        """Event counts per category over a range, exact for any bounds.
+
+        The event analogue of :meth:`totals_by_category`: an instant either
+        falls in ``[start, end)`` or it does not, so there is no clipped
+        arithmetic to do.
+        """
+        clause, params = _prefix_clause(path_prefix)
+        rows = self._conn.execute(
+            "SELECT c.id AS category_id, c.path AS category_path, COUNT(*) AS record_count"
+            " FROM event_record e JOIN category c ON c.id = e.category_id"
+            " WHERE e.stream_id = ? AND e.occurred_at >= ? AND e.occurred_at < ?"
+            + clause
+            + " GROUP BY c.id, c.path ORDER BY record_count DESC, c.path",
+            (stream_id, start_epoch, end_epoch, *params),
+        ).fetchall()
+        return [
+            EventCategoryTotal(
+                category_id=int(row["category_id"]),
+                category_path=row["category_path"],
+                record_count=int(row["record_count"]),
+            )
+            for row in rows
+        ]
+
+    def _values_for(
+        self, stream_id: int, record_ids: Sequence[int]
+    ) -> dict[int, tuple[FieldValue, ...]]:
+        """Declared-field values for a batch of events, in declared order."""
+        if not record_ids:
+            return {}
+        placeholders = ",".join("?" for _ in record_ids)
+        rows = self._conn.execute(
+            "SELECT v.record_id, f.key, f.label, f.unit, v.num, v.txt"
+            " FROM event_value v JOIN stream_field f ON f.id = v.field_id"
+            f" WHERE f.stream_id = ? AND v.record_id IN ({placeholders})"
+            " ORDER BY v.record_id, f.position",
+            (stream_id, *record_ids),
+        ).fetchall()
+        grouped: dict[int, list[FieldValue]] = {}
+        for row in rows:
+            value: float | str = row["txt"] if row["txt"] is not None else float(row["num"])
+            grouped.setdefault(int(row["record_id"]), []).append(
+                FieldValue(key=row["key"], label=row["label"], unit=row["unit"], value=value)
+            )
+        return {record_id: tuple(values) for record_id, values in grouped.items()}
 
 
 # ----------------------------------------------------------------------
@@ -647,10 +1021,14 @@ class Repository:
 # ----------------------------------------------------------------------
 
 
-def _category_key(record: IntervalRecord) -> tuple[str, str]:
+def _category_key(record: Record) -> tuple[str, str]:
     if record.category_source_id is not None:
         return ("source", record.category_source_id)
     return ("path", record.category_path)
+
+
+def _record_instant(record: Record) -> Instant:
+    return record.start if isinstance(record, IntervalRecord) else record.at
 
 
 def _prefix_clause(path_prefix: str | None) -> tuple[str, tuple[str, ...]]:
@@ -680,6 +1058,8 @@ def _stream_from_row(row: sqlite3.Row) -> Stream:
         name=row["name"],
         kind=StreamKind(row["kind"]),
         exclusive=bool(row["exclusive"]),
+        watch_path=row["watch_path"],
+        watch_enabled=bool(row["watch_enabled"]),
     )
 
 
@@ -692,6 +1072,18 @@ def _interval_from_row(row: sqlite3.Row) -> StoredInterval:
         recorded_path=row["recorded_path"],
         start=Instant(int(row["started_at"]), int(row["start_offset_seconds"])),
         end=Instant(int(row["ended_at"]), int(row["end_offset_seconds"])),
+        import_run_id=int(row["import_run_id"]),
+    )
+
+
+def _event_from_row(row: sqlite3.Row) -> StoredEvent:
+    return StoredEvent(
+        id=int(row["id"]),
+        stream_id=int(row["stream_id"]),
+        category_id=int(row["category_id"]),
+        category_path=row["category_path"],
+        recorded_path=row["recorded_path"],
+        at=Instant(int(row["occurred_at"]), int(row["offset_seconds"])),
         import_run_id=int(row["import_run_id"]),
     )
 

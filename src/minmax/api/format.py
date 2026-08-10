@@ -7,7 +7,9 @@ if they diverge, the same data appears to disagree with itself.
 
 from __future__ import annotations
 
-__all__ = ["format_clock_span", "format_duration"]
+from minmax.core.models import StreamKind
+
+__all__ = ["format_clock_span", "format_duration", "format_measure"]
 
 
 def format_duration(seconds: int) -> str:
@@ -23,6 +25,21 @@ def format_duration(seconds: int) -> str:
     if hours == 0:
         return f"{minutes}m"
     return f"{hours}h {minutes:02d}m" if minutes else f"{hours}h"
+
+
+def format_measure(value: int, stream_kind: StreamKind) -> str:
+    """A total the way its stream's shape reads.
+
+    An interval stream's total is a duration; a point-in-time stream has no
+    duration to report, only how many -- see ``docs/architecture.md``'s note
+    on reusing the seconds-shaped trends machinery for counts. The one place
+    this branches, so the day summary, the trends axis, and its legend all
+    agree on how a count reads rather than each reimplementing the plural
+    check.
+    """
+    if stream_kind is StreamKind.EVENT:
+        return f"{value} event" if value == 1 else f"{value} events"
+    return format_duration(value)
 
 
 def format_clock_span(start_label: str, end_label: str) -> str:

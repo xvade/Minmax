@@ -32,12 +32,11 @@ from __future__ import annotations
 
 import csv
 from collections import Counter
-from datetime import datetime
 from pathlib import Path
 
-from minmax.core.models import IntervalRecord, StreamKind
-from minmax.core.timeref import Instant
+from minmax.core.models import EventRecord, IntervalRecord, StreamKind
 from minmax.ingest.base import ParseResult, Rejection
+from minmax.ingest.rows import RowError, parse_instant, parse_optional_int, render_row
 
 __all__ = ["TimecardCsvImporter"]
 
@@ -59,7 +58,7 @@ class TimecardCsvImporter:
     MAX_DURATION_DRIFT_SECONDS = 2
 
     def parse(self, path: Path) -> ParseResult:
-        records: list[IntervalRecord] = []
+        records: list[IntervalRecord | EventRecord] = []
         rejections: list[Rejection] = []
         notes: list[str] = []
         drift_counts: Counter[int] = Counter()
@@ -79,8 +78,8 @@ class TimecardCsvImporter:
                 line = reader.line_num
                 try:
                     record = self._record_from_row(row)
-                except _RowError as error:
-                    rejections.append(Rejection(line=line, reason=str(error), raw=_render_row(row)))
+                except RowError as error:
+                    rejections.append(Rejection(line=line, reason=str(error), raw=render_row(row)))
                     continue
 
                 drift = record.source_duration_drift
@@ -100,24 +99,24 @@ class TimecardCsvImporter:
     def _record_from_row(self, row: dict[str, str | None]) -> IntervalRecord:
         timer_name = (row.get("timer_name") or "").strip()
         if not timer_name:
-            raise _RowError("timer_name is empty")
+            raise RowError("timer_name is empty")
 
         # A blank id is tolerated (the category then keys on its path) because
         # losing a run is worse than losing the ability to track it across a
         # rename. Timecard itself always supplies one.
         timer_id = (row.get("timer_id") or "").strip() or None
 
-        start = _parse_instant(row.get("started_at"), "started_at")
-        end = _parse_instant(row.get("stopped_at"), "stopped_at")
+        start = parse_instant(row.get("started_at"), "started_at")
+        end = parse_instant(row.get("stopped_at"), "stopped_at")
         if end.epoch_seconds < start.epoch_seconds:
-            raise _RowError("stopped_at is before started_at")
+            raise RowError("stopped_at is before started_at")
 
-        source_duration = _parse_optional_int(row.get("duration_seconds"), "duration_seconds")
+        source_duration = parse_optional_int(row.get("duration_seconds"), "duration_seconds")
         if source_duration is not None:
             derived = end.epoch_seconds - start.epoch_seconds
             drift = source_duration - derived
             if abs(drift) > self.MAX_DURATION_DRIFT_SECONDS:
-                raise _RowError(
+                raise RowError(
                     f"duration_seconds {source_duration} disagrees with the timestamps "
                     f"({derived}s) by {drift}s, beyond the "
                     f"{self.MAX_DURATION_DRIFT_SECONDS}s truncation tolerance"
@@ -132,35 +131,6 @@ class TimecardCsvImporter:
         )
 
 
-class _RowError(ValueError):
-    """A single row is unusable; the rest of the file is still fine."""
-
-
-def _parse_instant(raw: str | None, column: str) -> Instant:
-    text = (raw or "").strip()
-    if not text:
-        raise _RowError(f"{column} is empty")
-    try:
-        parsed = datetime.fromisoformat(text)
-    except ValueError as error:
-        raise _RowError(f"{column} {text!r} is not an ISO 8601 timestamp") from error
-    if parsed.utcoffset() is None:
-        raise _RowError(
-            f"{column} {text!r} has no UTC offset; the local reading would be ambiguous"
-        )
-    return Instant.from_datetime(parsed)
-
-
-def _parse_optional_int(raw: str | None, column: str) -> int | None:
-    text = (raw or "").strip()
-    if not text:
-        return None
-    try:
-        return int(text)
-    except ValueError as error:
-        raise _RowError(f"{column} {text!r} is not an integer") from error
-
-
 def _drift_note(drift_counts: Counter[int]) -> str:
     total = sum(drift_counts.values())
     exact = drift_counts.get(0, 0)
@@ -171,7 +141,3 @@ def _drift_note(drift_counts: Counter[int]) -> str:
         f"{total - exact} of {total} rows had an exported duration differing from the "
         f"timestamps ({spread}); durations were derived from the timestamps"
     )
-
-
-def _render_row(row: dict[str, str | None]) -> str:
-    return ",".join(f"{key}={value!r}" for key, value in row.items())

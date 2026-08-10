@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
-from minmax.core.models import IntervalRecord, StreamKind
+from minmax.core.models import EventRecord, IntervalRecord, StreamKind
 from minmax.ingest.archive import archive_file, sha256_of
 from minmax.storage.repository import Repository
 
@@ -36,7 +36,7 @@ class Rejection:
 
 @dataclass(frozen=True, slots=True)
 class ParseResult:
-    records: list[IntervalRecord] = field(default_factory=list)
+    records: list[IntervalRecord | EventRecord] = field(default_factory=list)
     rejections: list[Rejection] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
 
@@ -144,7 +144,7 @@ def run_import(
     )
 
     try:
-        outcome = repository.insert_intervals(stream, import_run_id, parsed.records)
+        outcome = repository.insert_records(stream, import_run_id, parsed.records)
     except Exception as error:
         repository.fail_import(import_run_id, str(error))
         raise

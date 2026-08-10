@@ -128,8 +128,10 @@ src/minmax/
 ├── core/            # Domain model. Pure. No I/O, no SQL, no framework imports.
 │   ├── models.py    #   Stream, Category, IntervalRecord, StreamKind, ImportRun
 │   ├── timeref.py   #   Instant, local-period bucketing, offset-aware conversions
-│   ├── timeline.py  #   Day-timeline layout arithmetic (§8) — no Qt
+│   ├── timeline.py  #   Timeline layout arithmetic over a span (§8) — no Qt
 │   ├── trends.py    #   Stacked-area layout arithmetic (§8) — no Qt
+│   ├── columns.py   #   Grouping a date range into anchored chart columns (§8.2)
+│   ├── measures.py  #   Duration/count/field-aggregate abstraction (§7.1) — no Qt
 │   ├── palette.py   #   Validated categorical palette and slot assignment
 │   └── paths.py     #   Category path parsing, prefix matching, tree derivation
 │
@@ -144,20 +146,37 @@ src/minmax/
 │   ├── archive.py   #   Byte-for-byte raw file archiving + content hashing
 │   └── timecard.py  #   Timecard CSV → IntervalRecord
 │
-├── analysis/        # Statistics over stored data. Reads; never writes history.
-│                    #   (correlation engine, then forecasting — see §9)  [not yet built]
+├── analysis/        # Statistics over stored data. Reads rollups; never writes history.
+│   ├── catalog.py   #   Candidate Measures and pairs worth testing (§7.1)
+│   ├── series.py    #   Measure -> per-day values, via the repository
+│   ├── sweep.py     #   Period bucketing (reuses core/columns.py) and alignment
+│   ├── stats.py     #   Pearson's r + Benjamini-Hochberg — the only scipy import
+│   ├── correlate.py #   Orchestrates the above into a ranked CorrelationReport
+│   └── models.py    #   Correlation/PairResult/CorrelationReport value objects
+│                    #   (forecasting is a later goal — see §9)  [not yet built]
 │
 ├── api/             # The facade the UI talks to.
 │   ├── client.py    #   MinmaxClient protocol + InProcessClient + transfer objects
+│   │                #   (including import_file, which wraps ingest.run_import,
+│   │                #   and correlations, which wraps analysis.correlate)
 │   └── format.py    #   Formatting every client must render identically
 │
 ├── ui/              # PySide6 desktop app. Imports `api` and nothing else.
 │   ├── app.py       #   Event loop entry point
-│   ├── main_window.py#  Window, navigation, the keyboard shortcut table
-│   ├── timeline_view.py# Day timeline: paint and input only
-│   ├── summary_panel.py# Category totals for the shown day
-│   ├── trends_view.py# Stacked area over days: paint and input only
-│   ├── trends_legend.py# Per-group share of the visible days
+│   ├── main_window.py#  Window, screens, stream picker, navigation,
+│                    #   window-loading policy, the one place a
+│                    #   dropped/dialog-picked file is handed to import_file,
+│                    #   and the once-a-minute auto-fetch timer (§6.2)
+│   ├── shortcuts.py #   Every binding, the config file, the conflict rules — no Qt
+│   ├── dialogs.py   #   Filter, trends range, column interval, new-stream
+│                    #   column-role assignment, shortcut remapping
+│   ├── timeline_view.py# Continuous timeline: blocks and point-in-time
+│                    #   markers, paint and input, edge loading
+│   ├── summary_panel.py# Category totals for the day under the viewport,
+│                    #   duration or count depending on the stream's kind
+│   ├── record_inspector.py# Full detail and provenance for one record
+│   ├── trends_view.py# Stacked area over columns: paint and input only
+│   ├── trends_legend.py# Per-group share of the visible columns
 │   └── theme.py     #   Colours derived from the system palette (light/dark)
 │
 └── cli.py           # Command-line entry point. A thin shell over the layers
@@ -187,18 +206,23 @@ Each layer's hard rule:
 The schema is organised around the three stream kinds:
 
 - `stream` — one row per datastream (`timecard`, `focused_app`), carrying its
-  kind and whether it is *exclusive* (at most one observation true at a time).
+  kind, whether it is *exclusive* (at most one observation true at a time),
+  and, since migration `0005`, the path and on/off flag behind auto-fetch
+  ([§6.2](#62-auto-fetch-a-remembered-path-re-imported-on-a-timer)).
 - `category` — categories within a stream, keyed by stable source id, holding the
   current path.
 - `interval_record` — interval observations, indexed on `(stream_id, started_at)`.
-  The `event_record` and `sample_record` tables follow the same pattern and are
-  added by a migration when the first such stream lands; creating them empty now
-  would only mean untested, unused schema.
+- `event_record` / `event_value` — point-in-time observations and their
+  payload, added in migration `0004` when the first such stream landed. See
+  [§6.1](#61-point-in-time-streams-an-eav-schema).
+- `stream_field` — the column-role mapping a user declares once for a
+  point-in-time stream, reused for every later import into it.
 - `import_run` — provenance: which file (by SHA-256), when, how many rows
   inserted/skipped. Every observation row carries its `import_run_id`, which is
   what makes an import reversible.
-- `rollup` — derived aggregates, keyed by `(stream, category, period, bucket)`
-  where `period` is `hour` or `day` ([§7](#7-rollups)).
+- `rollup` / `field_rollup` — derived aggregates, keyed by `(stream, category,
+  period, bucket)` and, for numeric fields, additionally by field
+  ([§7](#7-rollups)).
 
 Migrations live in `storage/migrations/` as numbered SQL files and are tracked
 by SQLite's own `user_version`, so a fresh database needs no bootstrapping and
@@ -213,12 +237,104 @@ what was skipped rather than discovering duplicates itself.
 it is the seam that lets the analytics engine change later ([§10](#key-decisions))
 without touching a single caller.
 
+### 6.1 Point-in-time streams: an EAV schema
+
+An interval stream's payload is fixed — a category and a span — so one table
+with fixed columns fits every source. A point-in-time stream's payload does
+not: a phone-pickup log carries nothing beyond the instant, a heart-rate
+stream carries one number, a location stream carries two numbers and a label.
+Fixing the column set to any one of those would make the others a bad fit, and
+a stream cannot be picked in advance for a user who has not created it yet.
+
+The schema handles this as entity-attribute-value rather than as a JSON
+payload column:
+
+```
+stream_field(stream_id, key, label, role, unit, position, source_column)
+event_record(id, stream_id, category_id, import_run_id, occurred_at, offset_seconds, payload_hash)
+event_value(record_id, field_id, num, txt)   -- CHECK ((num IS NULL) <> (txt IS NULL))
+```
+
+`stream_field` is the mapping a user declares once, in the GUI's new-stream
+dialog, by pointing at the CSV's actual header — which column is the category,
+which (if any) is a stable source id, which are values, and which is the
+timestamp. It is stored and reused for every later import into that stream, so
+the mapping is asked once, not per file.
+
+**Why EAV and not a JSON column:** the whole storage layer's posture is that
+the database rejects malformed data rather than trusting the producer
+([§2](#2-design-principles), point 3) — a JSON blob cannot participate in that,
+since a corrupt or wrongly-shaped value has nowhere to fail loudly, and
+aggregating inside one (`AVG(json_extract(...))`) is a full scan with no index
+to use. `event_value`'s `CHECK` makes "exactly one of a number or text" a
+property the database enforces, not a convention parsers are trusted to
+follow. The row multiplication (one to three value rows per event) costs
+nothing at the scale event streams actually run at (10³–10⁵ rows/year,
+[§4.1](#41-three-stream-kinds)).
+
+**A stream declaring no category column** files every record under one
+implicit category whose path is the stream's own key, created lazily the
+first time it is seen. A sentinel path like `(all)` would need excluding from
+the filter dialog, the drill-down stack, and the palette; the stream key needs
+excluding from nothing, because it is already how the stream is addressed
+everywhere else.
+
+**The natural key is `(stream, category, occurred_at, payload_hash)`**, not
+just `(stream, category, occurred_at)`. Two distinct readings at the same
+instant — two GPS fixes a millisecond apart, truncated to the same second —
+must both survive; hashing the row's own field values (not the timestamp)
+lets that happen while re-importing the same file is still a no-op. The named
+limitation this leaves: a stream with *no* declared fields has a constant
+hash, so two field-less events landing in the same second collapse into one.
+The fix, if it is ever needed, is to declare a field that distinguishes them —
+not a schema change.
+
+### 6.2 Auto-fetch: a remembered path, re-imported on a timer
+
+A stream can opt in to being re-imported from a filesystem path once a
+minute, so a live feed (a phone's location log, appended to continuously)
+stays current without a manual re-import each time. It is deliberately built
+from parts that already existed rather than as a new pipeline:
+
+- `stream.watch_path` / `stream.watch_enabled` (`storage/repository.py`'s
+  `set_stream_watch`) are the only new state. Everything else — archiving,
+  hashing, parsing, the natural-key merge — is the same `run_import` an
+  interactive import goes through, called again by `MainWindow`'s `QTimer`
+  instead of by a file dialog.
+- **Re-importing a growing file is a merge, not a duplication**, for the same
+  reason a re-import already was: the natural-key constraint on
+  `interval_record` / `event_record` recognises rows it has already stored, so
+  reading the whole file fresh each minute only ever inserts what is new.
+  Nothing incremental needed building.
+- **Backing up is a side effect of the existing archive step**, not new
+  behaviour either: `run_import` hashes before archiving and skips the archive
+  entirely when the content matches the last import, so an unattended feed
+  that has not grown since the last tick costs one query, not one more
+  archived copy — see [§6](#6-storage)'s idempotency paragraph.
+- **Opt-in per stream, not automatic for every one that has ever been
+  imported into.** Two reasons: not every source is a live feed worth polling
+  every minute, and there would be nothing to resume from for most existing
+  streams regardless — `import_run.source_name` has only ever stored a
+  filename, never the full original path, so `watch_path` only starts
+  existing once a stream is (re-)pointed at a file after this feature.
+- **A failure — the file has moved, or the merge itself raises
+  (`OverlapError`, or a column-shape mismatch) — prompts for a replacement
+  path exactly once, then pauses that stream's auto-fetch if the reader
+  cancels**, rather than either popping a file picker every minute
+  indefinitely or silently giving up. `MainWindow._auto_fetch_one` is the one
+  place that decides this; `_run_auto_fetch` (the timer's target) also skips
+  the whole tick while a modal dialog is already open, so a background fetch
+  can never interrupt a reader mid-dialog with a second one.
+- This is a GUI concern, not a CLI or storage one: nothing under
+  `storage/` or `ingest/` knows auto-fetch exists, and the CLI has no
+  equivalent command today (a deliberate scope cut — see `TODO.md`).
+
 ## 7. Rollups
 
-The correlation engine will ask questions like "minutes of `media/*` per day" and
-"mean heart rate per hour." Answering those from raw rows means scanning
-everything, every time; answering them from precomputed aggregates is a
-bounded-size lookup.
+The correlation engine asks questions like "minutes of `media/*` per day" and
+"mean heart rate per hour" ([§7.1](#71-the-correlation-engine-measures-and-a-period-sweep)).
+Answering those from raw rows means scanning everything, every time;
+answering them from precomputed aggregates is a bounded-size lookup.
 
 So aggregates are a first-class stored table, refreshed transactionally as part
 of each import:
@@ -247,7 +363,72 @@ Maintenance has two paths on purpose. `apply_intervals` folds newly inserted
 rows in incrementally, at a cost proportional to the insert rather than the table
 size. `rebuild` recomputes from the observation tables, and is both the repair
 path after a revert and the oracle the incremental path is tested against — a
-test asserts the two agree, so aggregate drift cannot go unnoticed.
+test asserts the two agree, so aggregate drift cannot go unnoticed. `rebuild`
+dispatches per stream by kind, so it is not just intervals that get repaired.
+
+**A point-in-time stream reuses `rollup` for "how many," and needs a second
+table for its numeric fields.** `apply_events` upserts `seconds = 0,
+record_count = 1` per event into the same `rollup` table `apply_intervals`
+already writes to — an event stream's `record_count` is unlike an interval
+stream's in one respect worth flagging wherever it is touched: it is summable
+*across* buckets (ten pickups today plus ten yesterday is twenty), where an
+interval stream's is only meaningful *within* one, since one long run touches
+several buckets without becoming several observations. A numeric field (heart
+rate, a GPS coordinate) does not fit `rollup`'s columns at all — there is
+nothing to key a specific field on — so it gets its own table,
+`field_rollup(stream_id, category_id, field_id, period, bucket, sum, count,
+min, max)`. A **mean is never stored**, only derived as `sum / count` at read
+time: storing it would make a multi-day column's mean the mean of daily means
+rather than the correct value-weighted one, silently wrong the moment two days
+have different counts.
+
+### 7.1 The correlation engine: measures and a period sweep
+
+`analysis/` answers "when X increases in a period, does Y tend to also
+increase" — swept over many period lengths (a day, a week, a month, ...)
+rather than one fixed one, since the interesting period for any given pair of
+streams is not known in advance.
+
+**A `Measure`** (`core/measures.py`) is what gets compared: a stream's
+duration or event count (from `rollup`), or a declared numeric field's
+sum/mean/min/max (from `field_rollup`). This is the abstraction decision
+**D6** sketched and deliberately left unbuilt — see D6 and **D7** below for
+why now was the right time and what was actually built, which differs from
+what D6 sketched in one respect worth knowing up front: `field_rollup` had
+never had a reader anywhere in the codebase until this closed that gap
+(`Repository.daily_field_totals_by_category`).
+
+**Alignment reuses `core/columns.py`'s anchoring, unchanged.** Two series
+bucketed independently at the same `Interval` land on identical period
+boundaries (the anchor is a fixed epoch, not either series' own range), so
+pairing them is a plain key intersection, not a calendar computation —
+[§8.2](#82-columns-and-why-they-are-plotted-as-averages) already relies on
+the same guarantee for the trends chart, and the correlation engine is simply
+a second, more demanding consumer of it.
+
+**A period is only used if it is complete and the stream was not in a total
+blackout.** A partial period at the edge of a series' data (`Column.clipped`)
+is dropped rather than rescaled, since rescaling is only valid for a sum, not
+for a mean or an extreme. A period where a stream recorded nothing at all is
+treated as *missing*, not zero — deliberately different from how the trends
+chart treats the identical gap (it draws an honest zero, since compressing a
+tracking gap away would misrepresent "I stopped tracking" as "these days were
+adjacent"). A correlation has a failure mode the chart does not: two
+unrelated streams that both happened to be switched off at once would
+otherwise look like they moved together, when neither was actually observed.
+
+**Every (pair, period-length) test performed feeds one Benjamini-Hochberg
+correction** (`analysis/stats.py`), computed over the whole sweep before
+anything is filtered for display, and reported as a q-value rather than
+enforced as a hard cutoff — this is hypothesis generation for one person
+deciding what to try next month, not a publication, and a strict cutoff would
+return an empty table against the amount of data Minmax has today. A pair's
+*stability* across the sweep (does the relationship hold at several period
+lengths, or only the one the sweep happened to find) is treated as the more
+trustworthy signal.
+
+This is a CLI feature today (`minmax correlate`) — no GUI screen, and nothing
+in `api/client.trends()` or `ui/` changed to build it (see **D7**).
 
 ## 8. The UI boundary
 
@@ -268,7 +449,11 @@ The protocol is therefore designed as though it were already a network API:
 coarse-grained operations, serializable arguments and return values, no leaking
 of live database objects across it. A test walks `ui/` and fails if any module
 there mentions `storage`, `ingest`, or `analysis`, so the boundary is checked
-mechanically rather than by discipline.
+mechanically rather than by discipline. Importing a file from the desktop app
+(a file dialog, or a drop onto the window) is not an exception: `ui/` hands the
+path to `MinmaxClient.import_file()`, and it is `InProcessClient` — in `api`,
+not `ui` — that calls `ingest.run_import`. A future `HttpClient` implements the
+same method as an upload request; the UI's code does not change.
 
 **Anything the UI would otherwise have to compute lives below it.** Three kinds
 of thing get pushed down, each for the same reason — a second client must not be
@@ -278,10 +463,19 @@ logic:
 - *Layout arithmetic* → `core/timeline.py`. Block positions, label thresholds,
   and the scroll offset that keeps zoom anchored under the pointer. Free of Qt,
   and unit-tested directly.
+- *Calendar grouping* → `core/columns.py`. Which days a chart column covers, for
+  any interval from one day to a year. Anchored to the calendar rather than
+  chopped from the range's first day, so the same Tuesday always lands in the
+  same column; clipped rather than reaching outside the range, so a column never
+  reports days that were not asked for.
 - *Timezone-dependent labels* → `api`. Turning an hour boundary into a clock
-  reading needs a timezone, so `DayView` carries labelled `hour_marks`. A view
-  deriving labels from elapsed time would count to `24:00` on a fall-back day
-  when the clock actually read `01:00` twice.
+  reading needs a timezone, so a view carries labelled `hour_marks` and
+  `day_marks`. A view deriving labels from elapsed time would count to `24:00`
+  on a fall-back day when the clock actually read `01:00` twice. Column labels
+  (`5 Jun`, `June 2026`) are attached here for the same reason.
+- *Provenance* → `api`. Each `TimelineRecord` carries the id and filename of the
+  import that produced it, resolved when the records are fetched rather than
+  when one is clicked, so inspecting a block is not a second round trip.
 - *Colours* → `core/palette.py` plus the `group_color` table. Timecard gives
   colour to a top-level folder so a whole branch reads as one colour, and Minmax
   keeps that model. Colours are *assigned from the palette and stored*, not
@@ -312,9 +506,87 @@ is read by people and a plausible-looking wrong one is worse than none:
   detail.
 - **Solid hairline gridlines**, never dashed (dashing reads as a threshold), and
   a 2px surface gap between stacked bands rather than borders around them.
-- **Empty days are drawn as empty.** Days with no data keep their column, and in
-  percentage mode they stay at zero rather than being stretched to fill — an
-  untracked day has no composition to show.
+- **Empty periods are drawn as empty.** A period with no data keeps its column,
+  and in percentage mode it stays at zero rather than being stretched to fill —
+  an untracked day has no composition to show.
+
+### 8.2 Columns, and why they are plotted as averages
+
+The trends chart is indexed by *column*, never by day. A column covers an
+`Interval` — a unit (day, week, or month) and a count, so a fortnight and a
+quarter are as sayable as a week (`core/columns.py`). The pixel arithmetic in
+`core/trends.py` does not know how much time a column holds, which is what makes
+aggregation a data change rather than a rendering change.
+
+**Multi-unit intervals are anchored to a fixed epoch**, for the same reason
+single ones are aligned to the calendar. A fortnight column that started
+wherever the range started would be a different fortnight every time the range
+moved, and two charts of the same interval could not be compared. Counting from
+an epoch makes the grouping a property of the calendar rather than of the query:
+`Interval(MONTH, 3)` is always calendar quarters, `Interval(MONTH, 12)` always
+calendar years, and — because the epoch is a Monday — `Interval(DAY, 7)` lands
+exactly where `Interval(WEEK)` does rather than a day off it.
+
+The count is capped (`MAX_INTERVAL_COUNT`) so a slipped keystroke cannot ask for
+a column measured in centuries, and `AUTO` cannot carry a count, because it picks
+its own unit and would have nothing to multiply.
+
+**A column is plotted as its daily average, not its total.** A weekly column
+holds roughly seven times the seconds of a daily one, so plotting totals would
+rescale the y axis by seven the moment the granularity changed, and the same
+data would appear to describe a different life. Dividing by the days a column
+covers keeps the axis in hours-per-day at every granularity, and the axis
+ceiling — capped at 24h, since a day cannot hold more — keeps meaning the same
+thing. It also removes a second problem for free: a half-week at the edge of a
+range would otherwise read as a collapse in activity rather than as a shorter
+column.
+
+Totals are still what the legend and the tooltip report, because "how much" is
+the question those answer. Only the plotted height is an average.
+
+**Granularity is chosen automatically by default.** A reader opening ten years
+of history should not have to discover that monthly columns exist before the
+chart becomes legible, so `Granularity.AUTO` resolves against the span. The
+resolved value is always reported back, and the screen names it in the title —
+under AUTO especially, since the reader did not choose it.
+
+**"Fit all" is not subject to the zoom ceiling.** `MAX_PIXELS_PER_COLUMN` bounds
+manual zoom so that holding `+` cannot leave one column filling the screen with
+nothing to compare it to. But a quarterly interval over a year is four columns
+and a yearly one can be a single column; any ceiling low enough to keep manual
+zoom sensible would strand those against the left edge with the rest of the plot
+blank, which reads as missing data. `fit_column_zoom` is therefore floored but
+not capped — "fit" means fit.
+
+### 8.3 The timeline is a window, not a day
+
+The day timeline scrolls continuously through midnight, so its unit is a run of
+consecutive days rather than a single one. `MinmaxClient.window()` returns that
+run — records, hour marks, day marks, and per-day totals in one call — and the
+pane extends it as the reader approaches either end, anchoring the scroll
+position on an instant so that growing the window is invisible.
+
+Three consequences worth knowing:
+
+- **A midnight-crossing run is one record with no seam.** The clipping and
+  continuation flags in `lay_out_blocks` now fire only at the window's outer
+  edges, where they honestly mean "there is more of this than has been loaded".
+- **Per-day totals travel with the records**, so scrolling from one day to the
+  next repaints the totals panel without a second round trip.
+- **The window is capped** (`MAX_WINDOW_DAYS`), and extension is bounded by the
+  recorded range. Scrolling into a decade of empty days is not navigation.
+  Explicit navigation — "go to date" — is deliberately *not* bounded by it, and
+  widens the limits so the reader can scroll back from wherever they landed.
+
+**A point-in-time record shares the same window and the same `lay_out_blocks`
+call**, not a parallel code path. `start_epoch == end_epoch` (see
+`TimelineRecord.is_instant`, [§6.1](#61-point-in-time-streams-an-eav-schema))
+lays out as a fixed-height marker centered on the instant instead of a
+duration-sized block, but it is still one entry in the same list, clipped to
+the same window, hit-tested by the same rect. Half-open containment needed its
+own branch for the zero-width case — the span-overlap check that correctly
+excludes a run ending exactly at a window's start would also (incorrectly)
+exclude a point landing exactly there.
 
 ## 9. Roadmap → structure
 
@@ -324,12 +596,12 @@ How each goal in `AGENTS.md` lands in the structure above.
 |---|---|---|
 | Import/store/retrieve timetracking ✅ | `ingest/timecard.py`, `storage/` | — |
 | UI for timetracking ✅ | `ui/`, `api/client.py` | — |
-| Trends over time ✅ | `ui/trends_view.py`, `core/trends.py` | reads `rollup` (day) |
-| Correlation engine + recommendations | `analysis/` | reads `rollup_daily` |
-| Streams beyond timetracking | one new module in `ingest/` each | — |
-| Multi-stream timeline | `ui/`, one new `api` query | — |
-| Cross-stream correlation | `analysis/` | — |
-| "Increase X" → advice queries | `analysis/` | ranks existing correlations |
+| Trends over time ✅ | `ui/trends_view.py`, `core/trends.py`, `core/columns.py` | reads `rollup` (day); every interval from a fortnight to a year is summed from it, so no second rollup period is needed |
+| Correlation engine ✅ (level correlations, CLI) | `analysis/`, `minmax correlate` | reads `rollup`/`field_rollup` (day), via `core/measures.py` (§7.1) |
+| Streams beyond timetracking ✅ | `ingest/csvstream.py`, `storage/` (§6.1) | a point-in-time stream is user-declared, not a new module per source -- see D5 |
+| Multi-stream timeline | `ui/`, one new `api` query | still one stream on screen at a time -- the picker switches between streams, not several overlaid |
+| Cross-stream correlation ✅ | `analysis/catalog.py` | came for free: a `Measure` doesn't know or care which stream it reads from |
+| Recommendations / "Increase X" → advice queries | `analysis/` | ranks existing correlations; needs a query interface on top, not a new engine |
 | DL forecasting model | `analysis/` submodule | training data comes from rollups |
 
 Every later goal is additive. Nothing above requires the storage schema or the
@@ -350,6 +622,11 @@ Per the invariants, tests exist to protect the data and the experience:
 - **`analysis`** — statistical results checked against hand-computed fixtures.
 - **`api`** — the facade tested through its protocol, which doubles as the
   contract the future `HttpClient` must satisfy.
+- **`ui`** — only wiring, run headless on Qt's offscreen platform: that the
+  window asks for the right days, that scrolling loads more of them, that every
+  binding names a method that exists, and that no module in `ui/` mentions a
+  backend package. The two pieces of `ui/` with rules rather than pixels —
+  `shortcuts.py` and the layout arithmetic — are tested without Qt at all.
 
 Time is injected, never read from the system clock inside logic, so every
 time-dependent rule is deterministic.
@@ -406,16 +683,26 @@ language, and Qt's painting is well suited to the zoomable timeline goal.
 toolchain and a forced HTTP boundary from day one); Textual (excellent
 keyboard story, weakest fit for the dense timeline).
 
-*As built:* the day timeline is a custom-painted `QWidget` inside a
-`QScrollArea` rather than a `QGraphicsView`. One day is a single column of
-non-overlapping blocks, which needs neither a scene graph nor item picking, and
-direct painting keeps the widget to paint-and-input with all arithmetic in
-`core/timeline.py`. `QGraphicsView` remains the natural choice for the
-multi-stream timeline, where many lanes and per-item interaction do earn a
-scene.
+*As built:* the timeline is a custom-painted `QWidget` inside a `QScrollArea`
+rather than a `QGraphicsView`. Even scrolling continuously across days it stays
+a single column of non-overlapping blocks, which needs neither a scene graph nor
+item picking, and direct painting keeps the widget to paint-and-input with all
+arithmetic in `core/timeline.py`. The bounded window (§8.3) is what keeps that
+true: cost is proportional to what is loaded, not to history. The trends chart
+goes further and paints only the visible column range rather than living in a
+scroll area at all — ten years at maximum zoom would otherwise be a
+290,000px-wide widget.
 
-*Revisit if:* the multi-stream timeline arrives, or a day's rendering stops
-being smooth at maximum zoom.
+`QGraphicsView` remains the natural choice for the multi-stream timeline, where
+many lanes and per-item interaction do earn a scene.
+
+The remappable-shortcut promise is delivered in `ui/shortcuts.py`, which is
+deliberately Qt-free: the actions, the editing dialog, and the config file are
+built from one table, and the rules about what a valid binding is are testable
+without a display.
+
+*Revisit if:* the multi-stream timeline arrives, or rendering stops being smooth
+at maximum zoom.
 
 ### D4 — Facade now, HTTP later
 
@@ -430,3 +717,100 @@ invariant `AGENTS.md` is most explicit about).
 
 *Revisit if:* a second client appears — at that point the `HttpClient` gets
 written, which is the planned path rather than a change of course.
+
+### D5 — EAV over a JSON payload for point-in-time streams
+
+A user-defined stream's payload shape cannot be known in advance — nothing,
+one number, several numbers, or text, per [§6.1](#61-point-in-time-streams-an-eav-schema).
+`event_value(record_id, field_id, num, txt)` with a `CHECK` keeps the database
+able to reject a malformed value the way it already rejects a bad interval;
+a JSON column would move that responsibility onto every reader instead, with
+no index able to help an aggregate query.
+
+*Rejected:* a JSON payload column (no constraint, no indexed aggregation —
+directly conflicts with the "the database rejects bad data" posture the rest
+of the schema follows); one fixed wide table with `value1..valueN` columns
+(caps the payload shape at N and wastes space on every stream using fewer).
+
+*Revisit if:* a stream needs a payload shape EAV cannot express cleanly —
+nested or repeating structure, for instance — at which point a per-stream
+typed table (closer to `interval_record`'s fixed-columns approach) is likely
+worth the migration.
+
+### D6 — Reuse the seconds-shaped trends machinery for counts; no `Measure` type yet
+
+Once a point-in-time stream exists, the trends chart needs to plot something
+other than seconds. The design originally drafted here was a full `(stream,
+measure)` pair — duration, count, or a numeric field aggregated by sum, mean,
+min, or max, with a `Measure.extensive` property deciding whether categories
+could be stacked and whether a column divided by the days it covers. That
+was not built. What shipped instead is narrower: an event stream's "how
+much" is its **count**, and a count is extensive in exactly the way a
+duration is — it sums over disjoint sets, stacks the same way, and a
+multi-day column's daily average means the same thing. So every trends field
+that held seconds (`TrendsView.total_seconds`, `TrendSeries.values`,
+`DayView.tracked_seconds`, …) now dual-purposes as a count when
+`stream_kind` is `EVENT`, and exactly one function, `api.format.format_measure`,
+decides how a total reads — a duration or "N events" — everywhere a total is
+shown. No second chart mode, no stacking decision, because a count never
+raises the question a mean would.
+
+The one place that could not be reused as-is: `core/trends.nice_seconds_ceiling`
+intentionally tops out at 24h, since a duration's daily average cannot exceed
+a day's hours. A count has no such ceiling, so it gets its own
+`nice_count_ceiling` with the same "round to a readable step" shape but no
+artificial cap.
+
+*Rejected:* the full `Measure` abstraction described above, before anything
+needed it — `field_rollup` ([§6.1](#61-point-in-time-streams-an-eav-schema))
+already stores what a numeric field's sum/mean/min/max would read from,
+untouched by this decision, so building the abstraction now would mean
+guessing at a shape for a chart mode (an unstacked line, since a mean cannot
+stack) that has no caller yet.
+
+*Revisit if:* a numeric field's own aggregate (mean heart rate per day, not
+just how many readings) needs to reach the chart. At that point the count
+reuse stops working — a mean genuinely cannot stack — and the `Measure`
+abstraction sketched above (or something like it) becomes worth building
+against a real second caller instead of a guessed one. The one-axis rule
+([§8.1](#81-chart-rules)) still applies regardless: two measures of different
+units is small multiples or an indexed comparison, never a second axis.
+
+### D7 — The `Measure` abstraction, built for the correlation engine
+
+D6's stated trigger was a numeric field's own aggregate reaching *the trends
+chart*. That has not happened — `api/client.trends()` and everything under
+`ui/` are unchanged by this decision. What actually fired is the same
+underlying condition D6 named (a numeric field's mean/sum/min/max needing to
+reach a real consumer, not a guessed one): the correlation engine
+([§7.1](#71-the-correlation-engine-measures-and-a-period-sweep)) needs to
+compare a duration, an event count, and a heart-rate mean side by side, which
+is exactly the shape D6 declined to guess at. `core/measures.py`'s `Measure`
+is close to what D6 sketched — `MeasureKind` (duration/count/field) plus
+`Aggregate` (sum/mean/min/max), with `summable_across_periods` standing in
+for the sketched `Measure.extensive` — built against this real caller instead.
+
+Two things worth naming precisely, since a future reader comparing this to D6
+could otherwise conclude more was unified than actually was:
+
+- **`Repository.daily_field_totals_by_category` is new.** `field_rollup` had
+  been write-only since migration `0004` — nothing anywhere in the codebase
+  had ever read it before this. Closing that gap was the first step of this
+  work and is useful on its own, independent of everything after it.
+- **The trends chart's count-reuse hack (D6) is untouched.** `Measure` was
+  deliberately not retrofitted onto `TrendSeries`/`TrendColumn` in this pass
+  — that would be a UI-facing refactor in front of an unproven engine, and
+  the existing reuse is still correct for what the chart does today.
+  `summable_across_periods` is shaped so the chart *could* adopt it later
+  (it is exactly the question a mean-valued axis would need answered before
+  plotting a daily average), but nothing forces that now.
+
+*Rejected:* generalising `Measure` to also describe text-field aggregates
+(mode, distinct count) — no caller needs one yet, and the two-value shape
+(`num`/`txt`, mutually exclusive) `event_value` already enforces would need
+its own reduction rules that would be guessed at, the exact mistake D6 was
+about not repeating.
+
+*Revisit if:* the trends chart ever needs to plot a numeric field's own
+aggregate (not just an event count) — at that point `Measure` has two real
+callers and unifying the chart onto it stops being speculative.

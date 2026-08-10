@@ -14,9 +14,13 @@ from PySide6.QtGui import QColor, QPalette
 
 __all__ = [
     "block_border",
+    "chip_background",
+    "day_rule",
+    "day_rule_text",
     "grid_line",
     "gutter_text",
     "is_dark",
+    "selection_ring",
     "subdued_text",
     "surface",
 ]
@@ -49,6 +53,34 @@ def subdued_text(palette: QPalette) -> QColor:
     colour = QColor(palette.color(QPalette.ColorRole.Text))
     colour.setAlpha(110)
     return colour
+
+
+def day_rule(palette: QPalette) -> QColor:
+    """The line at local midnight on a continuously scrolling timeline.
+
+    Deliberately much stronger than :func:`grid_line`: with no page boundary to
+    separate one day from the next, this is the only thing that says where the
+    reader is, and it has to stay legible drawn across a saturated block.
+    """
+    colour = QColor(palette.color(QPalette.ColorRole.Text))
+    colour.setAlpha(180)
+    return colour
+
+
+def day_rule_text(palette: QPalette) -> QColor:
+    return palette.color(QPalette.ColorRole.Text)
+
+
+def chip_background(palette: QPalette) -> QColor:
+    """Backing for a label that must stay readable over arbitrary content."""
+    colour = QColor(palette.color(QPalette.ColorRole.Base))
+    colour.setAlpha(235)
+    return colour
+
+
+def selection_ring(palette: QPalette) -> QColor:
+    """Outline on the selected block. Uses the system accent, as a selection should."""
+    return palette.color(QPalette.ColorRole.Highlight)
 
 
 def block_border(palette: QPalette) -> QColor:

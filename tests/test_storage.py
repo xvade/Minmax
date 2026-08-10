@@ -16,7 +16,15 @@ from pathlib import Path
 
 import pytest
 
-from minmax.core.models import IntervalRecord, Stream, StreamKind
+from minmax.core.models import (
+    EventRecord,
+    FieldRole,
+    FieldSpec,
+    IntervalRecord,
+    Stream,
+    StreamKind,
+    implicit_category_path,
+)
 from minmax.core.timeref import Instant, Period
 from minmax.storage import rollups
 from minmax.storage.database import migrate, open_database
@@ -38,6 +46,21 @@ def record(path: str, start: str, end: str, *, source_id: str | None = None) -> 
     )
 
 
+def event(
+    path: str,
+    when: str,
+    *,
+    source_id: str | None = None,
+    values: dict[str, float | str] | None = None,
+) -> EventRecord:
+    return EventRecord(
+        category_source_id=source_id,
+        category_path=path,
+        at=at(when),
+        values=values or {},
+    )
+
+
 @pytest.fixture
 def stream(repository: Repository) -> Stream:
     return repository.ensure_stream("timecard", "Timecard", StreamKind.INTERVAL, exclusive=True)
@@ -51,6 +74,39 @@ def run_id(repository: Repository, stream: Stream) -> int:
         importer="test",
         source_name="test.csv",
         source_sha256="0" * 64,
+        archived_path=None,
+    )
+
+
+@pytest.fixture
+def heart_rate_stream(repository: Repository) -> Stream:
+    """One numeric field: the shape a bare measurement stream takes."""
+    return repository.create_stream(
+        "heart_rate",
+        "Heart Rate",
+        StreamKind.EVENT,
+        fields=[
+            FieldSpec(
+                key="bpm", label="BPM", role=FieldRole.NUMBER, source_column="bpm", unit="bpm"
+            )
+        ],
+    )
+
+
+@pytest.fixture
+def pickups_stream(repository: Repository) -> Stream:
+    """No declared fields at all: the shape a bare "it happened" stream takes."""
+    return repository.create_stream("pickups", "Phone Pickups", StreamKind.EVENT)
+
+
+@pytest.fixture
+def event_run_id(repository: Repository, heart_rate_stream: Stream) -> int:
+    assert heart_rate_stream.id is not None
+    return repository.begin_import(
+        heart_rate_stream.id,
+        importer="test",
+        source_name="test.csv",
+        source_sha256="e" * 64,
         archived_path=None,
     )
 
@@ -133,6 +189,46 @@ class TestStreamsAndCategories:
         second = repository.ensure_stream("timecard", "Renamed", StreamKind.INTERVAL)
         assert first.id == second.id
         assert len(repository.list_streams()) == 1
+
+    def test_a_new_stream_has_no_watch_configured(self, repository: Repository) -> None:
+        stream = repository.ensure_stream("timecard", "Timecard", StreamKind.INTERVAL)
+        assert stream.watch_path is None
+        assert stream.watch_enabled is False
+
+    def test_set_stream_watch_persists_the_path_and_enabled_flag(
+        self, repository: Repository, stream: Stream
+    ) -> None:
+        assert stream.id is not None
+        repository.set_stream_watch(stream.id, path="/data/feed.csv", enabled=True)
+
+        reloaded = repository.get_stream(stream.key)
+        assert reloaded is not None
+        assert reloaded.watch_path == "/data/feed.csv"
+        assert reloaded.watch_enabled is True
+
+    def test_set_stream_watch_with_no_path_leaves_the_remembered_one_alone(
+        self, repository: Repository, stream: Stream
+    ) -> None:
+        assert stream.id is not None
+        repository.set_stream_watch(stream.id, path="/data/feed.csv", enabled=True)
+
+        # Pausing (or resuming) auto-fetch should not require re-stating the path.
+        repository.set_stream_watch(stream.id, path=None, enabled=False)
+
+        reloaded = repository.get_stream(stream.key)
+        assert reloaded is not None
+        assert reloaded.watch_path == "/data/feed.csv"
+        assert reloaded.watch_enabled is False
+
+    def test_list_streams_carries_the_watch_state_too(
+        self, repository: Repository, stream: Stream
+    ) -> None:
+        assert stream.id is not None
+        repository.set_stream_watch(stream.id, path="/data/feed.csv", enabled=True)
+
+        (reloaded,) = [s for s in repository.list_streams() if s.key == stream.key]
+        assert reloaded.watch_path == "/data/feed.csv"
+        assert reloaded.watch_enabled is True
 
     def test_a_renamed_category_keeps_its_identity(
         self, repository: Repository, stream: Stream, run_id: int
@@ -562,3 +658,473 @@ class TestRevert:
     def test_reverting_an_unknown_import_raises(self, repository: Repository) -> None:
         with pytest.raises(LookupError):
             repository.revert_import(12345)
+
+
+class TestEventStreams:
+    """Point-in-time streams: the schema added for migration 0004.
+
+    Mirrors the interval test classes above wherever the same invariant
+    applies, plus the invariants unique to a payload-hash natural key and a
+    per-field rollup.
+    """
+
+    def test_migration_lands_at_version_4(self, connection: sqlite3.Connection) -> None:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] >= 4
+
+    def test_create_stream_declares_its_fields_in_order(
+        self, repository: Repository, heart_rate_stream: Stream
+    ) -> None:
+        assert heart_rate_stream.id is not None
+        fields = repository.stream_fields(heart_rate_stream.id)
+        assert [f.key for f in fields] == ["bpm"]
+        assert fields[0].role is FieldRole.NUMBER
+        assert fields[0].unit == "bpm"
+
+    def test_create_stream_rejects_a_duplicate_key(
+        self, repository: Repository, heart_rate_stream: Stream
+    ) -> None:
+        with pytest.raises(ValueError, match="already exists"):
+            repository.create_stream("heart_rate", "Heart Rate Again", StreamKind.EVENT)
+
+    def test_a_stream_with_no_category_column_files_under_the_stream_key(
+        self, repository: Repository, pickups_stream: Stream
+    ) -> None:
+        assert pickups_stream.id is not None
+        run = repository.begin_import(
+            pickups_stream.id,
+            importer="test",
+            source_name="pickups.csv",
+            source_sha256="p" * 64,
+            archived_path=None,
+        )
+        implicit = implicit_category_path("pickups")
+        repository.insert_events(
+            pickups_stream, run, [event(implicit, "2026-06-06T09:00:00-07:00")]
+        )
+        categories = repository.list_categories(pickups_stream.id)
+        assert [c.path for c in categories] == [implicit]
+
+    def test_two_distinct_readings_at_the_same_instant_both_survive(
+        self, repository: Repository, heart_rate_stream: Stream, event_run_id: int
+    ) -> None:
+        # Two GPS fixes (or heart-rate readings) at the same second are
+        # different observations; the payload distinguishes them.
+        outcome = repository.insert_events(
+            heart_rate_stream,
+            event_run_id,
+            [
+                event("heart_rate", "2026-06-06T09:00:00-07:00", values={"bpm": 61.0}),
+                event("heart_rate", "2026-06-06T09:00:00-07:00", values={"bpm": 62.0}),
+            ],
+        )
+        assert (outcome.inserted, outcome.duplicates) == (2, 0)
+
+    def test_reimporting_identical_events_inserts_nothing(
+        self, repository: Repository, heart_rate_stream: Stream, event_run_id: int
+    ) -> None:
+        records = [event("heart_rate", "2026-06-06T09:00:00-07:00", values={"bpm": 61.0})]
+        first = repository.insert_events(heart_rate_stream, event_run_id, records)
+        second = repository.insert_events(heart_rate_stream, event_run_id, records)
+        assert (first.inserted, first.duplicates) == (1, 0)
+        assert (second.inserted, second.duplicates) == (0, 1)
+
+    def test_field_less_events_at_the_same_instant_collapse(
+        self, repository: Repository, pickups_stream: Stream
+    ) -> None:
+        # Named limitation (docs/architecture.md §6.1): with no declared
+        # fields the payload hash is constant, so two field-less events at
+        # the same instant are indistinguishable under the natural key.
+        assert pickups_stream.id is not None
+        run = repository.begin_import(
+            pickups_stream.id,
+            importer="test",
+            source_name="pickups.csv",
+            source_sha256="q" * 64,
+            archived_path=None,
+        )
+        implicit = implicit_category_path("pickups")
+        outcome = repository.insert_events(
+            pickups_stream,
+            run,
+            [
+                event(implicit, "2026-06-06T09:00:00-07:00"),
+                event(implicit, "2026-06-06T09:00:00-07:00"),
+            ],
+        )
+        assert (outcome.inserted, outcome.duplicates) == (1, 1)
+
+    def test_event_value_requires_exactly_one_of_number_or_text(
+        self, connection: sqlite3.Connection, repository: Repository, heart_rate_stream: Stream
+    ) -> None:
+        assert heart_rate_stream.id is not None
+        category_id = repository.ensure_category(
+            heart_rate_stream.id, source_id=None, path="heart_rate", first_seen_at=0, last_seen_at=0
+        )
+        run = repository.begin_import(
+            heart_rate_stream.id,
+            importer="test",
+            source_name="x.csv",
+            source_sha256="z" * 64,
+            archived_path=None,
+        )
+        cursor = connection.execute(
+            "INSERT INTO event_record (stream_id, category_id, import_run_id, occurred_at,"
+            " offset_seconds, recorded_path, payload_hash)"
+            " VALUES (?, ?, ?, 0, 0, 'heart_rate', 'h')",
+            (heart_rate_stream.id, category_id, run),
+        )
+        field_id = repository.stream_fields(heart_rate_stream.id)[0].id
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "INSERT INTO event_value (record_id, field_id, num, txt) VALUES (?, ?, NULL, NULL)",
+                (cursor.lastrowid, field_id),
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "INSERT INTO event_value (record_id, field_id, num, txt) VALUES (?, ?, 1.0, 'x')",
+                (cursor.lastrowid, field_id),
+            )
+
+    def test_deleting_an_event_cascades_to_its_values(
+        self, repository: Repository, heart_rate_stream: Stream, event_run_id: int
+    ) -> None:
+        repository.insert_events(
+            heart_rate_stream,
+            event_run_id,
+            [event("heart_rate", "2026-06-06T09:00:00-07:00", values={"bpm": 61.0})],
+        )
+        conn = repository.connection
+        record_id = conn.execute("SELECT id FROM event_record").fetchone()[0]
+        conn.execute("DELETE FROM event_record WHERE id = ?", (record_id,))
+        assert conn.execute("SELECT COUNT(*) FROM event_value").fetchone()[0] == 0
+
+    def test_events_in_range_returns_declared_field_values_in_order(
+        self, repository: Repository
+    ) -> None:
+        location = repository.create_stream(
+            "location",
+            "Location",
+            StreamKind.EVENT,
+            fields=[
+                FieldSpec(key="lat", label="Latitude", role=FieldRole.NUMBER, source_column="lat"),
+                FieldSpec(key="lon", label="Longitude", role=FieldRole.NUMBER, source_column="lon"),
+                FieldSpec(key="note", label="Note", role=FieldRole.TEXT, source_column="note"),
+            ],
+        )
+        assert location.id is not None
+        run = repository.begin_import(
+            location.id,
+            importer="test",
+            source_name="loc.csv",
+            source_sha256="l" * 64,
+            archived_path=None,
+        )
+        repository.insert_events(
+            location,
+            run,
+            [
+                event(
+                    "location",
+                    "2026-06-06T09:00:00-07:00",
+                    values={"lat": 47.6, "lon": -122.3, "note": "home"},
+                )
+            ],
+        )
+        [found] = repository.events_in_range(location.id, 0, 2**31)
+        assert [(v.key, v.value) for v in found.values] == [
+            ("lat", 47.6),
+            ("lon", -122.3),
+            ("note", "home"),
+        ]
+
+    def test_counts_by_category_is_exact_for_any_bounds(
+        self, repository: Repository, heart_rate_stream: Stream, event_run_id: int
+    ) -> None:
+        repository.insert_events(
+            heart_rate_stream,
+            event_run_id,
+            [
+                event("heart_rate", "2026-06-06T09:00:00-07:00", values={"bpm": 61.0}),
+                event("heart_rate", "2026-06-06T10:00:00-07:00", values={"bpm": 63.0}),
+                event("heart_rate", "2026-06-07T09:00:00-07:00", values={"bpm": 65.0}),
+            ],
+        )
+        assert heart_rate_stream.id is not None
+        day_start = at("2026-06-06T00:00:00-07:00").epoch_seconds
+        day_end = at("2026-06-07T00:00:00-07:00").epoch_seconds
+        [total] = repository.counts_by_category(heart_rate_stream.id, day_start, day_end)
+        assert total.record_count == 2
+
+    def test_field_rollup_folds_sum_count_min_max(
+        self, repository: Repository, heart_rate_stream: Stream, event_run_id: int
+    ) -> None:
+        repository.insert_events(
+            heart_rate_stream,
+            event_run_id,
+            [
+                event("heart_rate", "2026-06-06T09:00:00-07:00", values={"bpm": 60.0}),
+                event("heart_rate", "2026-06-06T10:00:00-07:00", values={"bpm": 80.0}),
+                event("heart_rate", "2026-06-06T11:00:00-07:00", values={"bpm": 70.0}),
+            ],
+        )
+        row = repository.connection.execute(
+            "SELECT value_sum, value_count, value_min, value_max FROM field_rollup"
+            " WHERE period = 'day' AND bucket = '2026-06-06'"
+        ).fetchone()
+        assert (row["value_sum"], row["value_count"], row["value_min"], row["value_max"]) == (
+            210.0,
+            3,
+            60.0,
+            80.0,
+        )
+
+    def test_incremental_field_rollups_match_a_full_rebuild(
+        self, repository: Repository, heart_rate_stream: Stream, event_run_id: int
+    ) -> None:
+        for hour in range(8, 20, 2):
+            repository.insert_events(
+                heart_rate_stream,
+                event_run_id,
+                [
+                    event(
+                        "heart_rate",
+                        f"2026-06-06T{hour:02d}:15:00-07:00",
+                        values={"bpm": float(60 + hour)},
+                    )
+                ],
+            )
+        repository.insert_events(
+            heart_rate_stream,
+            event_run_id,
+            [event("heart_rate", "2026-06-07T09:00:00-07:00", values={"bpm": 72.0})],
+        )
+
+        def snapshot(table: str) -> list[tuple[object, ...]]:
+            return [
+                tuple(row)
+                for row in repository.connection.execute(
+                    f"SELECT * FROM {table} ORDER BY period, bucket, category_id"
+                ).fetchall()
+            ]
+
+        rollup_before, field_before = snapshot("rollup"), snapshot("field_rollup")
+        assert heart_rate_stream.id is not None
+        rollups.rebuild(repository.connection, heart_rate_stream.id)
+        assert snapshot("rollup") == rollup_before
+        assert snapshot("field_rollup") == field_before
+        assert field_before, "expected some field_rollup rows"
+
+    def test_reverting_an_event_import_removes_events_and_rebuilds_both_rollups(
+        self, repository: Repository, heart_rate_stream: Stream, event_run_id: int
+    ) -> None:
+        repository.insert_events(
+            heart_rate_stream,
+            event_run_id,
+            [event("heart_rate", "2026-06-06T09:00:00-07:00", values={"bpm": 61.0})],
+        )
+        assert heart_rate_stream.id is not None
+        assert repository.revert_import(event_run_id) == 1
+        assert repository.events_in_range(heart_rate_stream.id, 0, 2**31) == []
+        assert repository.connection.execute("SELECT COUNT(*) FROM rollup").fetchone()[0] == 0
+        assert repository.connection.execute("SELECT COUNT(*) FROM field_rollup").fetchone()[0] == 0
+
+    def test_observed_range_works_for_an_event_only_stream(
+        self, repository: Repository, heart_rate_stream: Stream, event_run_id: int
+    ) -> None:
+        repository.insert_events(
+            heart_rate_stream,
+            event_run_id,
+            [
+                event("heart_rate", "2026-06-06T09:00:00-07:00", values={"bpm": 61.0}),
+                event("heart_rate", "2026-06-07T09:00:00-07:00", values={"bpm": 65.0}),
+            ],
+        )
+        assert heart_rate_stream.id is not None
+        bounds = repository.observed_range(heart_rate_stream.id)
+        assert bounds == (
+            at("2026-06-06T09:00:00-07:00").epoch_seconds,
+            at("2026-06-07T09:00:00-07:00").epoch_seconds,
+        )
+
+    def test_insert_records_dispatches_by_stream_kind(
+        self,
+        repository: Repository,
+        stream: Stream,
+        run_id: int,
+        heart_rate_stream: Stream,
+        event_run_id: int,
+    ) -> None:
+        interval_records = [
+            record("admin", "2026-06-06T09:00:00-07:00", "2026-06-06T10:00:00-07:00")
+        ]
+        outcome = repository.insert_records(stream, run_id, interval_records)
+        assert outcome.inserted == 1
+
+        event_records = [event("heart_rate", "2026-06-06T09:00:00-07:00", values={"bpm": 61.0})]
+        outcome = repository.insert_records(heart_rate_stream, event_run_id, event_records)
+        assert outcome.inserted == 1
+
+    def test_insert_records_rejects_a_kind_mismatch_instead_of_silently_dropping(
+        self, repository: Repository, stream: Stream, run_id: int
+    ) -> None:
+        # The real failure mode this guards: an event fed through the interval
+        # path would otherwise vanish silently, since a zero-length span
+        # produces no rollup bucket and no error.
+        misrouted = [event("admin", "2026-06-06T09:00:00-07:00")]
+        with pytest.raises(ValueError, match="interval"):
+            repository.insert_records(stream, run_id, misrouted)  # type: ignore[arg-type]
+
+
+class TestDailyFieldTotals:
+    """``daily_field_totals_by_category`` is the first reader ``field_rollup``
+    has ever had -- it was write-only from migration 0004 until now."""
+
+    def test_returns_sum_count_min_max_per_day(
+        self, repository: Repository, heart_rate_stream: Stream, event_run_id: int
+    ) -> None:
+        repository.insert_events(
+            heart_rate_stream,
+            event_run_id,
+            [
+                event("heart_rate", "2026-06-06T09:00:00-07:00", values={"bpm": 60.0}),
+                event("heart_rate", "2026-06-06T10:00:00-07:00", values={"bpm": 80.0}),
+                event("heart_rate", "2026-06-07T09:00:00-07:00", values={"bpm": 65.0}),
+            ],
+        )
+        assert heart_rate_stream.id is not None
+        totals = repository.daily_field_totals_by_category(heart_rate_stream.id)
+
+        by_bucket = {t.bucket: t for t in totals}
+        assert by_bucket["2026-06-06"].value_sum == 140.0
+        assert by_bucket["2026-06-06"].value_count == 2
+        assert by_bucket["2026-06-06"].value_min == 60.0
+        assert by_bucket["2026-06-06"].value_max == 80.0
+        assert by_bucket["2026-06-07"].value_sum == 65.0
+        assert by_bucket["2026-06-07"].value_count == 1
+        assert all(t.field_key == "bpm" for t in totals)
+
+    def test_never_derives_a_mean(
+        self, repository: Repository, heart_rate_stream: Stream, event_run_id: int
+    ) -> None:
+        # Two readings averaging 70 one day, one reading of 100 the next: the
+        # correct multi-day mean is value-weighted (240 / 3 = 80), which is
+        # only computable from sum/count kept separate -- so nothing here may
+        # precompute a mean that would silently be the wrong one.
+        repository.insert_events(
+            heart_rate_stream,
+            event_run_id,
+            [
+                event("heart_rate", "2026-06-06T09:00:00-07:00", values={"bpm": 60.0}),
+                event("heart_rate", "2026-06-06T10:00:00-07:00", values={"bpm": 80.0}),
+                event("heart_rate", "2026-06-07T09:00:00-07:00", values={"bpm": 100.0}),
+            ],
+        )
+        assert heart_rate_stream.id is not None
+        totals = repository.daily_field_totals_by_category(heart_rate_stream.id)
+        assert sum(t.value_sum for t in totals) / sum(t.value_count for t in totals) == 80.0
+
+    def test_bucket_bounds_are_inclusive(
+        self, repository: Repository, heart_rate_stream: Stream, event_run_id: int
+    ) -> None:
+        repository.insert_events(
+            heart_rate_stream,
+            event_run_id,
+            [
+                event("heart_rate", "2026-06-05T09:00:00-07:00", values={"bpm": 60.0}),
+                event("heart_rate", "2026-06-06T09:00:00-07:00", values={"bpm": 70.0}),
+                event("heart_rate", "2026-06-07T09:00:00-07:00", values={"bpm": 80.0}),
+            ],
+        )
+        assert heart_rate_stream.id is not None
+        totals = repository.daily_field_totals_by_category(
+            heart_rate_stream.id, start_bucket="2026-06-05", end_bucket="2026-06-06"
+        )
+        assert {t.bucket for t in totals} == {"2026-06-05", "2026-06-06"}
+
+    def test_path_prefix_matches_component_wise(self, repository: Repository) -> None:
+        stream = repository.create_stream(
+            "location",
+            "Location",
+            StreamKind.EVENT,
+            fields=[
+                FieldSpec(
+                    key="device", label="Device", role=FieldRole.CATEGORY, source_column="device"
+                ),
+                FieldSpec(key="lat", label="Latitude", role=FieldRole.NUMBER, source_column="lat"),
+            ],
+        )
+        assert stream.id is not None
+        run = repository.begin_import(
+            stream.id,
+            importer="test",
+            source_name="t.csv",
+            source_sha256="f" * 64,
+            archived_path=None,
+        )
+        repository.insert_events(
+            stream,
+            run,
+            [
+                event("device", "2026-06-06T09:00:00-07:00", values={"lat": 1.0}),
+                event("deviceX", "2026-06-06T09:00:00-07:00", values={"lat": 2.0}),
+            ],
+        )
+        # "device" must not also match "deviceX" -- the same rule
+        # _prefix_clause already enforces for durations/counts.
+        totals = repository.daily_field_totals_by_category(stream.id, path_prefix="device")
+        assert [t.value_sum for t in totals] == [1.0]
+
+    def test_field_id_isolates_one_field(self, repository: Repository) -> None:
+        stream = repository.create_stream(
+            "location",
+            "Location",
+            StreamKind.EVENT,
+            fields=[
+                FieldSpec(key="lat", label="Latitude", role=FieldRole.NUMBER, source_column="lat"),
+                FieldSpec(key="lon", label="Longitude", role=FieldRole.NUMBER, source_column="lon"),
+            ],
+        )
+        assert stream.id is not None
+        run = repository.begin_import(
+            stream.id,
+            importer="test",
+            source_name="t.csv",
+            source_sha256="a" * 64,
+            archived_path=None,
+        )
+        repository.insert_events(
+            stream,
+            run,
+            [event("location", "2026-06-06T09:00:00-07:00", values={"lat": 1.0, "lon": 2.0})],
+        )
+        [lat_field, _lon_field] = repository.stream_fields(stream.id)
+
+        lat_totals = repository.daily_field_totals_by_category(stream.id, field_id=lat_field.id)
+        assert [t.field_key for t in lat_totals] == ["lat"]
+        assert [t.value_sum for t in lat_totals] == [1.0]
+
+    def test_empty_for_a_stream_with_no_numeric_fields(
+        self, repository: Repository, stream: Stream
+    ) -> None:
+        # `stream` is an INTERVAL stream (the `timecard` fixture): it never
+        # writes to field_rollup at all, so this must return nothing rather
+        # than raise.
+        assert stream.id is not None
+        assert repository.daily_field_totals_by_category(stream.id) == []
+
+    def test_agrees_with_a_rollups_rebuild_round_trip(
+        self, repository: Repository, heart_rate_stream: Stream, event_run_id: int
+    ) -> None:
+        repository.insert_events(
+            heart_rate_stream,
+            event_run_id,
+            [
+                event("heart_rate", "2026-06-06T09:00:00-07:00", values={"bpm": 60.0}),
+                event("heart_rate", "2026-06-07T09:00:00-07:00", values={"bpm": 70.0}),
+            ],
+        )
+        assert heart_rate_stream.id is not None
+        before = repository.daily_field_totals_by_category(heart_rate_stream.id)
+        rollups.rebuild(repository.connection, heart_rate_stream.id)
+        after = repository.daily_field_totals_by_category(heart_rate_stream.id)
+        assert before == after

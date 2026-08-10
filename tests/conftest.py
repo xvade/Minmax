@@ -57,6 +57,25 @@ def malformed_csv() -> Path:
     return FIXTURES / "timecard_malformed.csv"
 
 
+@pytest.fixture
+def pickups_csv() -> Path:
+    """A point-in-time stream with no payload beyond the instant."""
+    return FIXTURES / "pickups.csv"
+
+
+@pytest.fixture
+def heart_rate_csv() -> Path:
+    """A point-in-time stream with one numeric field, plus one bad row."""
+    return FIXTURES / "heart_rate.csv"
+
+
+@pytest.fixture
+def location_csv() -> Path:
+    """A point-in-time stream with a category, a source id, two numbers, and
+    an optional text field left blank on one row."""
+    return FIXTURES / "location.csv"
+
+
 def data_snapshot(conn: sqlite3.Connection) -> dict[str, list[tuple[object, ...]]]:
     """Everything that must be identical after a redundant re-import.
 
@@ -71,6 +90,12 @@ def data_snapshot(conn: sqlite3.Connection) -> dict[str, list[tuple[object, ...]
         " recorded_path FROM interval_record ORDER BY started_at, ended_at",
         "rollup": "SELECT category_id, period, bucket, seconds, record_count"
         " FROM rollup ORDER BY period, bucket, category_id",
+        "event_record": "SELECT category_id, occurred_at, offset_seconds, recorded_path,"
+        " payload_hash FROM event_record ORDER BY occurred_at, payload_hash",
+        "event_value": "SELECT record_id, field_id, num, txt"
+        " FROM event_value ORDER BY record_id, field_id",
+        "field_rollup": "SELECT category_id, field_id, period, bucket, value_sum, value_count,"
+        " value_min, value_max FROM field_rollup ORDER BY period, bucket, field_id, category_id",
     }
     return {
         name: [tuple(row) for row in conn.execute(query).fetchall()]

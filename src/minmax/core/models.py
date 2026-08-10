@@ -11,22 +11,33 @@ special case per source.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from enum import StrEnum
 
 from minmax.core import paths
+from minmax.core.payload import payload_hash
 from minmax.core.timeref import Instant
 
 __all__ = [
     "Category",
     "CategoryTotal",
     "DailyCategoryTotal",
+    "DailyFieldTotal",
+    "EventCategoryTotal",
+    "EventRecord",
+    "FieldRole",
+    "FieldSpec",
+    "FieldValue",
     "ImportRun",
     "IntervalRecord",
     "PeriodTotal",
+    "StoredEvent",
     "StoredInterval",
     "Stream",
+    "StreamField",
     "StreamKind",
+    "implicit_category_path",
 ]
 
 
@@ -67,6 +78,11 @@ class Stream:
     kind: StreamKind
     exclusive: bool = False
     id: int | None = None
+    watch_path: str | None = None
+    """The filesystem path Minmax re-imports from once a minute, if
+    ``watch_enabled``. Remembered per stream so auto-fetch survives a
+    restart; see ``docs/architecture.md`` §6.2."""
+    watch_enabled: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,6 +172,142 @@ class StoredInterval:
         return self.end.epoch_seconds - self.start.epoch_seconds
 
 
+class FieldRole(StrEnum):
+    """What a declared column contributes to a point-in-time record.
+
+    ``AT`` is the column read as the record's instant -- structural, like
+    ``CATEGORY`` and ``SOURCE_ID``, so none of the three ever becomes an
+    :class:`EventRecord` value. ``CATEGORY`` and ``SOURCE_ID`` feed the same
+    category-resolution machinery interval streams already use. ``NUMBER``
+    and ``TEXT`` become values, keyed by the field's :attr:`StreamField.key`.
+    Exactly one column must declare ``AT``; at most one may declare each of
+    ``CATEGORY`` and ``SOURCE_ID``; any number may declare ``NUMBER``/``TEXT``.
+    """
+
+    AT = "at"
+    CATEGORY = "category"
+    SOURCE_ID = "source_id"
+    NUMBER = "number"
+    TEXT = "text"
+
+
+@dataclass(frozen=True, slots=True)
+class FieldSpec:
+    """A field as declared before its stream exists.
+
+    What a new-stream dialog (or ``minmax stream add``) builds from a CSV's
+    header, and what :meth:`~minmax.storage.repository.Repository.create_stream`
+    turns into stored :class:`StreamField` rows -- there is no ``stream_id`` or
+    ``position`` yet because the stream does not exist yet either; position is
+    the order the specs are given in.
+    """
+
+    key: str
+    label: str
+    role: FieldRole
+    source_column: str
+    unit: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class StreamField:
+    """One declared column of a point-in-time stream, and where it reads from.
+
+    Declared once -- the new-stream dialog, or ``minmax stream add`` -- and
+    reused for every later import into that stream, so a CSV's header can be
+    read once rather than mapped by hand each time. See
+    ``docs/architecture.md`` §6.1.
+    """
+
+    stream_id: int
+    key: str
+    """Slug identifying this field within its stream; how a value is looked
+    up in :attr:`EventRecord.values` and how a measure names it
+    (``field:heart_rate:mean``)."""
+
+    label: str
+    role: FieldRole
+    source_column: str
+    """The CSV header this field reads from. Matched by name on every
+    import, so reordering the source file's columns does not break it."""
+
+    unit: str | None = None
+    position: int = 0
+    id: int | None = None
+
+
+def implicit_category_path(stream_key: str) -> str:
+    """Where a point-in-time stream with no declared category column files
+    everything.
+
+    A sentinel path like ``"(all)"`` would need excluding from the filter
+    dialog, the drill-down stack, and the palette; the stream key needs
+    excluding from nothing, since it already identifies the stream everywhere
+    else. The category is created lazily, the first time an import sees it --
+    no special-case code is needed downstream of that.
+    """
+    return stream_key
+
+
+@dataclass(frozen=True, slots=True)
+class EventRecord:
+    """One point-in-time observation, as produced by an importer before storage.
+
+    Unlike :class:`IntervalRecord`, the payload beyond the instant is not
+    fixed -- a stream may declare nothing, one number, several numbers, or
+    text (see ``docs/architecture.md`` §6.1). ``values`` holds whatever the
+    stream declared, keyed by field slug (:attr:`StreamField.key`).
+    """
+
+    category_source_id: str | None
+    category_path: str
+    at: Instant
+    values: Mapping[str, float | str] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.category_source_id is None and not self.category_path:
+            raise ValueError("an event needs either a category source id or a path")
+        # Normalizing here means a stray space in a source file cannot
+        # silently create a near-duplicate category -- same rule as
+        # IntervalRecord, for the same reason.
+        object.__setattr__(self, "category_path", paths.normalize(self.category_path))
+
+    @property
+    def payload_hash(self) -> str:
+        """Digest of :attr:`values`, part of the natural key at storage time.
+
+        Computed here rather than only in the repository so a caller
+        constructing an :class:`EventRecord` can already tell whether two of
+        them collide, without a database round trip.
+        """
+        return payload_hash(self.values)
+
+
+@dataclass(frozen=True, slots=True)
+class FieldValue:
+    """One field's value on a stored record, carrying enough to display it
+    without a second lookup against :class:`StreamField`."""
+
+    key: str
+    label: str
+    unit: str | None
+    value: float | str
+
+
+@dataclass(frozen=True, slots=True)
+class StoredEvent:
+    """A point-in-time observation as read back from storage."""
+
+    id: int
+    stream_id: int
+    category_id: int
+    category_path: str
+    recorded_path: str
+    at: Instant
+    import_run_id: int
+    values: tuple[FieldValue, ...] = ()
+
+
 @dataclass(frozen=True, slots=True)
 class ImportRun:
     """Provenance for one import: which file, when, and what it did.
@@ -196,6 +348,20 @@ class CategoryTotal:
 
 
 @dataclass(frozen=True, slots=True)
+class EventCategoryTotal:
+    """How many events landed in one category over a queried range.
+
+    The event analogue of :class:`CategoryTotal`: an instant either falls in
+    the range or it does not, so there is no clipped-duration arithmetic to
+    do -- just a count.
+    """
+
+    category_id: int
+    category_path: str
+    record_count: int
+
+
+@dataclass(frozen=True, slots=True)
 class DailyCategoryTotal:
     """Time attributed to one category on one local day.
 
@@ -208,6 +374,29 @@ class DailyCategoryTotal:
     category_path: str
     seconds: int
     record_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class DailyFieldTotal:
+    """A numeric declared field's aggregate for one category on one local day.
+
+    The ``field_rollup`` analogue of :class:`DailyCategoryTotal`. ``value_sum``
+    and ``value_count`` are carried separately rather than as a precomputed
+    mean -- a multi-day mean is ``sum(value_sum) / sum(value_count)``, the
+    correct value-weighted mean, and is not the mean of these rows' own means.
+    See ``docs/architecture.md`` §6.1 and migration ``0004``'s comment on
+    ``field_rollup``.
+    """
+
+    bucket: str
+    category_id: int
+    category_path: str
+    field_id: int
+    field_key: str
+    value_sum: float
+    value_count: int
+    value_min: float | None
+    value_max: float | None
 
 
 @dataclass(frozen=True, slots=True)

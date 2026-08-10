@@ -7,6 +7,8 @@ starting one.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from PySide6.QtWidgets import QApplication
 
 from minmax.api import MinmaxClient
@@ -15,15 +17,24 @@ from minmax.ui.main_window import MainWindow
 __all__ = ["run"]
 
 
-def run(client: MinmaxClient, *, stream_key: str = "timecard") -> int:
+def run(
+    client: MinmaxClient,
+    *,
+    stream_key: str = "timecard",
+    config_path: Path | None = None,
+) -> int:
     """Show the window and run the event loop until it closes.
 
     An existing ``QApplication`` is reused if one is already running, so this
     can be called from a host that owns the event loop itself.
+
+    ``config_path`` is where remapped shortcuts live. It is passed in rather
+    than computed here because working out the data directory is the storage
+    layer's job, and the UI is not permitted to ask it.
     """
     app = QApplication.instance() or QApplication([])
 
-    window = MainWindow(client, stream_key=stream_key)
+    window = MainWindow(client, stream_key=stream_key, config_path=config_path)
     window.show()
     window.raise_()
     window.activateWindow()

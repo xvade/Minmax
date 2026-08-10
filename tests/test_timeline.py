@@ -12,13 +12,14 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from minmax.core.timeline import (
+    MARKER_HEIGHT,
     MAX_PIXELS_PER_HOUR,
     MIN_PIXELS_PER_HOUR,
-    DayGeometry,
+    TimelineGeometry,
     anchored_scroll_offset,
     clamp_zoom,
     hour_boundaries,
-    lay_out_day,
+    lay_out_blocks,
 )
 from minmax.core.timeref import Instant, local_day_bounds
 
@@ -26,16 +27,16 @@ PACIFIC = ZoneInfo("America/Los_Angeles")
 HOUR = 3600
 
 
-def geometry_for(day: str, pixels_per_hour: float = 60.0) -> DayGeometry:
+def geometry_for(day: str, pixels_per_hour: float = 60.0) -> TimelineGeometry:
     start, end = local_day_bounds(date.fromisoformat(day), PACIFIC)
-    return DayGeometry(start, end, pixels_per_hour)
+    return TimelineGeometry(start, end, pixels_per_hour)
 
 
 def at(text: str) -> int:
     return Instant.from_iso(text).epoch_seconds
 
 
-class TestDayGeometry:
+class TestTimelineGeometry:
     def test_an_ordinary_day_is_twenty_four_hours_tall(self) -> None:
         geometry = geometry_for("2026-06-06", pixels_per_hour=60.0)
         assert geometry.seconds == 24 * HOUR
@@ -43,9 +44,9 @@ class TestDayGeometry:
 
     def test_positions_are_proportional_to_elapsed_time(self) -> None:
         geometry = geometry_for("2026-06-06", pixels_per_hour=60.0)
-        assert geometry.y_for_epoch(geometry.day_start_epoch) == pytest.approx(0.0)
+        assert geometry.y_for_epoch(geometry.start_epoch) == pytest.approx(0.0)
         assert geometry.y_for_epoch(at("2026-06-06T06:00:00-07:00")) == pytest.approx(360.0)
-        assert geometry.y_for_epoch(geometry.day_end_epoch) == pytest.approx(geometry.height)
+        assert geometry.y_for_epoch(geometry.end_epoch) == pytest.approx(geometry.height)
 
     def test_epoch_for_y_inverts_y_for_epoch(self) -> None:
         geometry = geometry_for("2026-06-06", pixels_per_hour=97.0)
@@ -64,11 +65,11 @@ class TestDayGeometry:
 
     def test_a_day_must_have_positive_length(self) -> None:
         with pytest.raises(ValueError, match="must end after it starts"):
-            DayGeometry(1000, 1000, 60.0)
+            TimelineGeometry(1000, 1000, 60.0)
 
     def test_zoom_must_be_positive(self) -> None:
         with pytest.raises(ValueError, match="must be positive"):
-            DayGeometry(0, HOUR, 0.0)
+            TimelineGeometry(0, HOUR, 0.0)
 
 
 class TestClampZoom:
@@ -96,7 +97,7 @@ class TestClampZoom:
 class TestLayOutDay:
     def test_a_block_is_sized_to_its_real_duration(self) -> None:
         geometry = geometry_for("2026-06-06", pixels_per_hour=60.0)
-        [block] = lay_out_day(
+        [block] = lay_out_blocks(
             [(at("2026-06-06T09:00:00-07:00"), at("2026-06-06T11:30:00-07:00"))], geometry
         )
         assert block.top == pytest.approx(9 * 60.0)
@@ -106,7 +107,7 @@ class TestLayOutDay:
         # 325 of 337 adjacent runs in the real export share an exact boundary,
         # so any rounding here would show up as visible seams.
         geometry = geometry_for("2026-06-06", pixels_per_hour=73.0)
-        blocks = lay_out_day(
+        blocks = lay_out_blocks(
             [
                 (at("2026-06-06T09:00:00-07:00"), at("2026-06-06T10:17:00-07:00")),
                 (at("2026-06-06T10:17:00-07:00"), at("2026-06-06T11:03:00-07:00")),
@@ -117,7 +118,7 @@ class TestLayOutDay:
 
     def test_a_run_from_the_previous_night_is_clipped_and_flagged(self) -> None:
         geometry = geometry_for("2026-06-06", pixels_per_hour=60.0)
-        [block] = lay_out_day(
+        [block] = lay_out_blocks(
             [(at("2026-06-05T23:00:00-07:00"), at("2026-06-06T07:00:00-07:00"))], geometry
         )
         assert block.top == pytest.approx(0.0)
@@ -126,7 +127,7 @@ class TestLayOutDay:
 
     def test_a_run_into_the_next_day_is_clipped_and_flagged(self) -> None:
         geometry = geometry_for("2026-06-06", pixels_per_hour=60.0)
-        [block] = lay_out_day(
+        [block] = lay_out_blocks(
             [(at("2026-06-06T22:00:00-07:00"), at("2026-06-07T06:00:00-07:00"))], geometry
         )
         assert block.bottom == pytest.approx(geometry.height)
@@ -134,7 +135,7 @@ class TestLayOutDay:
 
     def test_a_run_spanning_the_whole_day_is_flagged_both_ways(self) -> None:
         geometry = geometry_for("2026-06-06")
-        [block] = lay_out_day(
+        [block] = lay_out_blocks(
             [(at("2026-06-05T20:00:00-07:00"), at("2026-06-07T04:00:00-07:00"))], geometry
         )
         assert block.continues_before and block.continues_after
@@ -143,7 +144,7 @@ class TestLayOutDay:
     def test_runs_outside_the_day_are_dropped(self) -> None:
         geometry = geometry_for("2026-06-06")
         assert (
-            lay_out_day(
+            lay_out_blocks(
                 [
                     (at("2026-06-04T09:00:00-07:00"), at("2026-06-04T10:00:00-07:00")),
                     (at("2026-06-08T09:00:00-07:00"), at("2026-06-08T10:00:00-07:00")),
@@ -157,12 +158,12 @@ class TestLayOutDay:
         # Ranges are half-open: a run ending exactly at midnight belongs to the
         # previous day, not this one.
         geometry = geometry_for("2026-06-06")
-        span = [(at("2026-06-05T22:00:00-07:00"), geometry.day_start_epoch)]
-        assert lay_out_day(span, geometry) == []
+        span = [(at("2026-06-05T22:00:00-07:00"), geometry.start_epoch)]
+        assert lay_out_blocks(span, geometry) == []
 
     def test_blocks_keep_the_index_of_their_source_record(self) -> None:
         geometry = geometry_for("2026-06-06")
-        blocks = lay_out_day(
+        blocks = lay_out_blocks(
             [
                 (at("2026-06-01T09:00:00-07:00"), at("2026-06-01T10:00:00-07:00")),  # dropped
                 (at("2026-06-06T09:00:00-07:00"), at("2026-06-06T10:00:00-07:00")),
@@ -173,7 +174,7 @@ class TestLayOutDay:
 
     def test_labels_appear_only_when_a_block_is_tall_enough(self) -> None:
         geometry = geometry_for("2026-06-06", pixels_per_hour=60.0)
-        blocks = lay_out_day(
+        blocks = lay_out_blocks(
             [
                 (at("2026-06-06T09:00:00-07:00"), at("2026-06-06T09:02:00-07:00")),  # 2px
                 (at("2026-06-06T10:00:00-07:00"), at("2026-06-06T10:20:00-07:00")),  # 20px
@@ -187,35 +188,83 @@ class TestLayOutDay:
 
     def test_zooming_in_reveals_labels_on_short_runs(self) -> None:
         span = [(at("2026-06-06T09:00:00-07:00"), at("2026-06-06T09:02:00-07:00"))]
-        assert not lay_out_day(span, geometry_for("2026-06-06", 60.0))[0].show_label
-        assert lay_out_day(span, geometry_for("2026-06-06", MAX_PIXELS_PER_HOUR))[0].show_label
+        assert not lay_out_blocks(span, geometry_for("2026-06-06", 60.0))[0].show_label
+        assert lay_out_blocks(span, geometry_for("2026-06-06", MAX_PIXELS_PER_HOUR))[0].show_label
+
+
+class TestMarkers:
+    """A point-in-time record (``start_epoch == end_epoch``) has no span to
+    size a block from, so it lays out as a fixed-height marker instead."""
+
+    def test_a_point_in_time_record_gets_a_fixed_height_centered_on_it(self) -> None:
+        geometry = geometry_for("2026-06-06", pixels_per_hour=60.0)
+        instant = at("2026-06-06T09:00:00-07:00")
+        [marker] = lay_out_blocks([(instant, instant)], geometry)
+        assert marker.is_marker
+        assert marker.height == pytest.approx(MARKER_HEIGHT)
+        center = (marker.top + marker.bottom) / 2
+        assert center == pytest.approx(geometry.y_for_epoch(instant))
+
+    def test_a_marker_never_carries_overhang_flags(self) -> None:
+        geometry = geometry_for("2026-06-06", pixels_per_hour=60.0)
+        instant = at("2026-06-06T00:00:00-07:00")  # exactly the window's start
+        [marker] = lay_out_blocks([(instant, instant)], geometry)
+        assert not marker.continues_before
+        assert not marker.continues_after
+
+    def test_a_marker_always_shows_its_label_regardless_of_zoom(self) -> None:
+        geometry = geometry_for("2026-06-06", pixels_per_hour=MIN_PIXELS_PER_HOUR)
+        instant = at("2026-06-06T09:00:00-07:00")
+        [marker] = lay_out_blocks([(instant, instant)], geometry)
+        assert marker.show_label
+        assert not marker.show_duration
+
+    def test_markers_and_blocks_coexist_in_one_layout(self) -> None:
+        geometry = geometry_for("2026-06-06", pixels_per_hour=60.0)
+        instant = at("2026-06-06T09:00:00-07:00")
+        span = (at("2026-06-06T10:00:00-07:00"), at("2026-06-06T11:00:00-07:00"))
+        blocks = lay_out_blocks([(instant, instant), span], geometry)
+        assert [b.is_marker for b in blocks] == [True, False]
+        assert [b.index for b in blocks] == [0, 1]
+
+    def test_a_marker_outside_the_window_is_dropped(self) -> None:
+        geometry = geometry_for("2026-06-06")
+        instant = at("2026-06-08T09:00:00-07:00")
+        assert lay_out_blocks([(instant, instant)], geometry) == []
+
+    def test_a_marker_at_the_windows_start_is_included_but_not_its_end(self) -> None:
+        # Half-open containment, [window start, window end), matching every
+        # other half-open range in the codebase (local_day_bounds, events_in_range).
+        geometry = geometry_for("2026-06-06")
+        assert len(lay_out_blocks([(geometry.start_epoch, geometry.start_epoch)], geometry)) == 1
+        assert lay_out_blocks([(geometry.end_epoch, geometry.end_epoch)], geometry) == []
 
 
 class TestHourBoundaries:
     def test_an_ordinary_day_has_one_boundary_per_hour(self) -> None:
         geometry = geometry_for("2026-06-06", pixels_per_hour=60.0)
-        marks = hour_boundaries(geometry.day_start_epoch, geometry.day_end_epoch)
+        marks = hour_boundaries(geometry.start_epoch, geometry.end_epoch)
         assert len(marks) == 24
-        assert marks[0] == geometry.day_start_epoch
+        assert marks[0] == geometry.start_epoch
         assert geometry.y_for_epoch(marks[6]) == pytest.approx(360.0)
 
     def test_a_fall_back_day_gets_twenty_five_boundaries(self) -> None:
         geometry = geometry_for("2026-11-01")
-        assert len(hour_boundaries(geometry.day_start_epoch, geometry.day_end_epoch)) == 25
+        assert len(hour_boundaries(geometry.start_epoch, geometry.end_epoch)) == 25
 
     def test_a_spring_forward_day_gets_twenty_three_boundaries(self) -> None:
         geometry = geometry_for("2026-03-08")
-        assert len(hour_boundaries(geometry.day_start_epoch, geometry.day_end_epoch)) == 23
+        assert len(hour_boundaries(geometry.start_epoch, geometry.end_epoch)) == 23
 
     def test_boundaries_can_be_thinned_when_zoomed_out(self) -> None:
         geometry = geometry_for("2026-06-06")
-        marks = hour_boundaries(geometry.day_start_epoch, geometry.day_end_epoch, every=6)
+        marks = hour_boundaries(geometry.start_epoch, geometry.end_epoch, every=6)
         assert len(marks) == 4
 
     def test_every_must_be_positive(self) -> None:
         geometry = geometry_for("2026-06-06")
         with pytest.raises(ValueError, match="at least 1"):
-            hour_boundaries(geometry.day_start_epoch, geometry.day_end_epoch, every=0)
+            hour_boundaries(geometry.start_epoch, geometry.end_epoch, every=0)
 
 
 class TestAnchoredScrollOffset:
@@ -224,9 +273,9 @@ class TestAnchoredScrollOffset:
         old, new = 60.0, 120.0
         offset, anchor = 300.0, 200.0
 
-        before = DayGeometry(0, 24 * HOUR, old).epoch_for_y(offset + anchor)
+        before = TimelineGeometry(0, 24 * HOUR, old).epoch_for_y(offset + anchor)
         after_offset = anchored_scroll_offset(offset, anchor, old, new)
-        after = DayGeometry(0, 24 * HOUR, new).epoch_for_y(after_offset + anchor)
+        after = TimelineGeometry(0, 24 * HOUR, new).epoch_for_y(after_offset + anchor)
         assert before == pytest.approx(after, abs=1)
 
     def test_zooming_at_the_top_of_the_viewport_keeps_the_top_fixed(self) -> None:

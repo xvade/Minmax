@@ -8,8 +8,9 @@ from pathlib import Path
 import pytest
 
 from conftest import data_snapshot
+from minmax.core.models import FieldRole, FieldSpec, StreamKind
 from minmax.core.timeref import Instant, Period
-from minmax.ingest import TimecardCsvImporter, run_import
+from minmax.ingest import CsvStreamImporter, TimecardCsvImporter, importer_for, run_import
 from minmax.ingest.archive import sha256_of
 from minmax.storage.repository import OverlapError, Repository
 
@@ -274,3 +275,179 @@ class TestEndToEndTotals:
         }
         assert totals["sleep/night"] == 7 * HOUR
         assert sum(totals.values()) == 32_400
+
+
+class TestCsvStreamImporter:
+    """The generic, config-driven importer for user-declared point-in-time streams."""
+
+    def test_a_bare_instant_only_stream_parses_with_the_implicit_category(
+        self, repository: Repository, pickups_csv: Path
+    ) -> None:
+        stream = repository.create_stream(
+            "pickups",
+            "Pickups",
+            StreamKind.EVENT,
+            fields=[
+                FieldSpec(key="at", label="Time", role=FieldRole.AT, source_column="occurred_at")
+            ],
+        )
+        assert stream.id is not None
+        importer = CsvStreamImporter(stream.key, stream.name, repository.stream_fields(stream.id))
+        result = importer.parse(pickups_csv)
+        assert len(result.records) == 3
+        assert result.rejections == []
+        assert all(r.category_path == "pickups" and not r.values for r in result.records)
+
+    def test_a_numeric_field_is_read_and_bad_cells_are_rejected(
+        self, repository: Repository, heart_rate_csv: Path
+    ) -> None:
+        stream = repository.create_stream(
+            "heart_rate",
+            "Heart Rate",
+            StreamKind.EVENT,
+            fields=[
+                FieldSpec(key="at", label="Time", role=FieldRole.AT, source_column="measured_at"),
+                FieldSpec(
+                    key="bpm", label="BPM", role=FieldRole.NUMBER, source_column="bpm", unit="bpm"
+                ),
+            ],
+        )
+        assert stream.id is not None
+        importer = CsvStreamImporter(stream.key, stream.name, repository.stream_fields(stream.id))
+        result = importer.parse(heart_rate_csv)
+        assert [r.values["bpm"] for r in result.records] == [58.0, 62.0, 71.0]
+        assert len(result.rejections) == 1
+        assert "not a number" in result.rejections[0].reason
+
+    def test_category_source_id_and_optional_text_round_trip(
+        self, repository: Repository, location_csv: Path
+    ) -> None:
+        stream = repository.create_stream(
+            "location",
+            "Location",
+            StreamKind.EVENT,
+            fields=[
+                FieldSpec(key="at", label="Time", role=FieldRole.AT, source_column="captured_at"),
+                FieldSpec(
+                    key="device", label="Device", role=FieldRole.CATEGORY, source_column="device"
+                ),
+                FieldSpec(
+                    key="fix", label="Fix id", role=FieldRole.SOURCE_ID, source_column="fix_id"
+                ),
+                FieldSpec(key="lat", label="Latitude", role=FieldRole.NUMBER, source_column="lat"),
+                FieldSpec(key="lon", label="Longitude", role=FieldRole.NUMBER, source_column="lon"),
+                FieldSpec(key="note", label="Note", role=FieldRole.TEXT, source_column="note"),
+            ],
+        )
+        assert stream.id is not None
+        importer = CsvStreamImporter(stream.key, stream.name, repository.stream_fields(stream.id))
+        result = importer.parse(location_csv)
+        assert [r.category_path for r in result.records] == ["phone", "watch"]
+        assert [r.category_source_id for r in result.records] == ["F1", "F2"]
+        assert result.records[0].values == {"lat": 47.6062, "lon": -122.3321, "note": "home"}
+        # The second row's note was blank -- omitted, not stored as "".
+        assert "note" not in result.records[1].values
+
+    def test_a_missing_declared_column_rejects_the_whole_file(
+        self, repository: Repository, tmp_path: Path
+    ) -> None:
+        stream = repository.create_stream(
+            "heart_rate",
+            "Heart Rate",
+            StreamKind.EVENT,
+            fields=[
+                FieldSpec(key="at", label="Time", role=FieldRole.AT, source_column="measured_at"),
+                FieldSpec(key="bpm", label="BPM", role=FieldRole.NUMBER, source_column="bpm"),
+            ],
+        )
+        wrong = tmp_path / "wrong.csv"
+        wrong.write_text("timestamp,value\n2026-06-06T08:00:00-07:00,58\n", encoding="utf-8")
+        assert stream.id is not None
+        importer = CsvStreamImporter(stream.key, stream.name, repository.stream_fields(stream.id))
+        with pytest.raises(ValueError, match="missing"):
+            importer.parse(wrong)
+
+    def test_the_generic_path_agrees_with_timecard_on_the_same_shape_of_data(
+        self, repository: Repository, sample_csv: Path
+    ) -> None:
+        # Not a golden-file test of Timecard's own quirks (duration-drift
+        # tolerance stays hand-written) -- just proof the generic parser reads
+        # a Timecard-shaped file the same way for the fields both share.
+        stream = repository.create_stream(
+            "focused_app",
+            "Focused App",
+            StreamKind.EVENT,
+            fields=[
+                FieldSpec(key="at", label="Time", role=FieldRole.AT, source_column="started_at"),
+                FieldSpec(
+                    key="app", label="App", role=FieldRole.CATEGORY, source_column="timer_name"
+                ),
+                FieldSpec(key="id", label="Id", role=FieldRole.SOURCE_ID, source_column="timer_id"),
+            ],
+        )
+        assert stream.id is not None
+        importer = CsvStreamImporter(stream.key, stream.name, repository.stream_fields(stream.id))
+        generic = importer.parse(sample_csv)
+        timecard = TimecardCsvImporter().parse(sample_csv)
+        assert [r.category_path for r in generic.records] == [
+            r.category_path for r in timecard.records
+        ]
+        assert [r.at.epoch_seconds for r in generic.records] == [
+            r.start.epoch_seconds for r in timecard.records
+        ]
+
+    def test_import_twice_leaves_the_database_byte_identical(
+        self, repository: Repository, home: Path, heart_rate_csv: Path
+    ) -> None:
+        repository.create_stream(
+            "heart_rate",
+            "Heart Rate",
+            StreamKind.EVENT,
+            fields=[
+                FieldSpec(key="at", label="Time", role=FieldRole.AT, source_column="measured_at"),
+                FieldSpec(
+                    key="bpm", label="BPM", role=FieldRole.NUMBER, source_column="bpm", unit="bpm"
+                ),
+            ],
+        )
+        run_import(repository, importer_for(repository, "heart_rate"), heart_rate_csv, home=home)
+        before = data_snapshot(repository.connection)
+        run_import(
+            repository,
+            importer_for(repository, "heart_rate"),
+            heart_rate_csv,
+            home=home,
+            force=True,
+        )
+        assert data_snapshot(repository.connection) == before
+
+
+class TestImporterFor:
+    def test_a_hardcoded_stream_resolves_without_being_created_first(
+        self, repository: Repository
+    ) -> None:
+        assert isinstance(importer_for(repository, "timecard"), TimecardCsvImporter)
+
+    def test_an_undeclared_stream_raises(self, repository: Repository) -> None:
+        with pytest.raises(LookupError, match="create it first"):
+            importer_for(repository, "nonexistent")
+
+    def test_an_interval_stream_is_refused_by_the_generic_path(
+        self, repository: Repository
+    ) -> None:
+        repository.ensure_stream("calendar", "Calendar", StreamKind.INTERVAL)
+        with pytest.raises(ValueError, match="point-in-time"):
+            importer_for(repository, "calendar")
+
+    def test_a_declared_event_stream_resolves_to_the_generic_importer(
+        self, repository: Repository
+    ) -> None:
+        repository.create_stream(
+            "pickups",
+            "Pickups",
+            StreamKind.EVENT,
+            fields=[
+                FieldSpec(key="at", label="Time", role=FieldRole.AT, source_column="occurred_at")
+            ],
+        )
+        assert isinstance(importer_for(repository, "pickups"), CsvStreamImporter)

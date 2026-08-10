@@ -14,30 +14,37 @@ worked on next is in [`TODO.md`](TODO.md).
 |---|---|
 | Import, store, and retrieve timetracking data | **working** |
 | Command-line access to all of it | **working** |
-| Desktop UI: day timeline and totals | **working** |
-| Desktop UI: trends chart over days | **working** |
-| Correlation engine | not started |
-| Streams beyond timetracking | not started |
+| Desktop UI: continuous timeline, totals, and record inspection | **working** |
+| Desktop UI: trends chart by day, week, or month | **working** |
+| User-defined point-in-time streams (create, import, view) | **working** |
+| Auto-fetch: re-import a stream from a remembered path once a minute | **working** |
+| Correlation engine: level correlations across many period lengths (CLI) | **working** |
 
-Today Minmax ingests [Timecard](/Users/xvade/dev/Misc/Timecard) CSV exports.
-Because the storage layer models *stream shapes* rather than sources, adding
-another interval-shaped stream later means writing a parser and nothing else.
+Minmax ingests [Timecard](/Users/xvade/dev/Misc/Timecard) CSV exports out of
+the box, and any other CSV you point it at: a period-of-time stream needs a
+hand-written parser (Timecard is the only one so far, since the storage layer
+models *stream shapes* rather than sources), but a point-in-time stream —
+something that happened at an instant, with any payload from nothing to
+several numbers and a label — is declared entirely from the GUI or the CLI,
+no code required. See [Defining your own datastreams](#defining-your-own-datastreams).
 
 ## Getting started
 
 Requires Python 3.11+ and [uv](https://docs.astral.sh/uv/).
 
 ```sh
-uv sync --extra ui                        # create the environment (with the desktop app)
+uv sync --extra ui --extra analysis       # create the environment (desktop app + correlate)
 uv run minmax import ~/Downloads/Timecard-20260805-112422.csv
 uv run minmax ui                          # open the day timeline
 ```
 
-Leave off `--extra ui` for a headless install; every command except `minmax ui`
-works without it.
+Both extras are optional and independent: leave off `--extra ui` for a
+headless install, or `--extra analysis` if you don't need `minmax correlate`.
+Every other command works without either.
 
-Data lives in `~/.minmax` by default — a SQLite database plus an archive of
-every file ever imported. Override with `$MINMAX_HOME` or `--home`.
+Data lives in `~/.minmax` by default — a SQLite database, an archive of every
+file ever imported, and `shortcuts.json` if you have remapped any keys. Override
+with `$MINMAX_HOME` or `--home`.
 
 To back Minmax up, copy that directory. That is the whole procedure, and it is
 one of the reasons SQLite was chosen.
@@ -56,7 +63,8 @@ imported Timecard-20260805-112422.csv into timecard: 338 new, 0 already present,
   note: 92 of 338 rows had an exported duration differing from the timestamps (-1s x45, +1s x47); durations were derived from the timestamps
 ```
 
-- `--stream KEY` — which importer to use (default `timecard`).
+- `--stream KEY` — which stream to import into (default `timecard`). `timecard`
+  is built in; any other key must already exist — see `minmax stream add`.
 - `--force` — re-read a file whose content was already imported.
 
 **Importing is idempotent.** Re-importing the same export inserts nothing, and
@@ -65,6 +73,50 @@ as often as you like and import all of them without thinking about it.
 
 **A malformed row is dropped, never guessed at.** The row and the reason are
 reported; the rest of the file still imports.
+
+### `minmax stream add`
+
+Declares a new point-in-time stream — one instant per row, with any payload
+from nothing to several numbers and a label — and its column mapping, guessed
+from a sample CSV's header and overridden where the guess is wrong.
+
+```
+$ minmax stream add --key heart_rate --name "Heart Rate" --from readings.csv
+created stream 'heart_rate' (event) with fields:
+  measured_at          -> at      [measured_at]
+  bpm                  -> number  [bpm]  (bpm)
+import into it with: minmax import <file> --stream heart_rate
+```
+
+- `--key` / `--name` — the stream's stable slug and display name.
+- `--from <csv>` — a sample file to read the header and a few rows from.
+- `--role COLUMN=ROLE` — override a guessed role (`at`, `category`,
+  `source_id`, `number`, `text`); repeatable.
+
+The timestamp column is guessed with confidence — every sampled value must
+parse as an ISO 8601 instant with a UTC offset. Everything else defaults to
+`number` only if every sampled value parses as one, else `text`; a column
+identifying the row (`category`, `source_id`) is never guessed, since nothing
+about a column's *values* says "this is an identifier" — override it
+explicitly. Exactly one column must end up with role `at`.
+
+A stream with no `category` column files every record under one implicit
+category named after the stream itself.
+
+**Only point-in-time streams can be declared this way today.** A second
+period-of-time source (Timecard-shaped, with a start and an end) still needs a
+hand-written importer — see [`docs/architecture.md`](docs/architecture.md) §6.1.
+
+### `minmax streams`
+
+Lists every declared stream and, for a point-in-time one, its fields.
+
+```
+$ minmax streams
+timecard  (interval, exclusive)  2026-06-05 -> 2026-08-05
+heart_rate  (event)  2026-08-01 -> 2026-08-05
+    number     BPM (bpm)
+```
 
 ### `minmax status`
 
@@ -79,7 +131,8 @@ timecard  (interval, exclusive)
 
 ### `minmax totals`
 
-Time per category over a range, largest first.
+Time per category over a range, largest first. **Interval streams only** — a
+point-in-time stream has no duration to total; use `periods` instead.
 
 ```
 $ minmax totals --prefix media
@@ -102,7 +155,8 @@ days.
 
 ### `minmax day <YYYY-MM-DD>`
 
-Every record on one local day, in order.
+Every record on one local day, in order. **Interval streams only**, for the
+same reason as `totals`.
 
 ```
 $ minmax day 2026-08-04
@@ -120,63 +174,234 @@ block with the day boundary through it.
 
 ### `minmax periods`
 
-Totals per local hour or day, read from the precomputed rollup table.
+Totals per local hour or day, read from the precomputed rollup table. Works
+for both stream kinds: an interval stream's bar is a duration, a point-in-time
+stream's is a plain count (its rollup rows carry no duration to show).
 
 - `--period day|hour`, `--since`, `--until`, `--prefix`.
+
+### `minmax correlate`
+
+Sweeps for "when X increases in a period, does Y tend to also increase" —
+across every declared stream, tested at a ladder of period lengths (a day,
+a few days, a week, a fortnight, a month) rather than one fixed one, since
+the interesting period for any given pair isn't known ahead of time.
+
+```
+$ minmax correlate --per-category
+2026-02-07 -> 2026-08-05  (16 series, 440 combinations tested)
+
+  +0.93* q=0.03  n=8   3 weeks    maintain duration  ~  sleep duration
+      consistent at 62% of the periods tested
+      'timecard' is an exclusive stream (at most one category is ever active at
+      once), so these two categories' durations mechanically compete for one
+      shared time budget.
+
+  not tested:
+    day: 52 combination(s) skipped (best case had 2 usable period(s))
+    ...
+
+  q is a Benjamini-Hochberg false-discovery rate over every combination tested.
+  These are leads to test, not findings.
+```
+
+Each row is one pair's *best*-fitting period length (`--all-intervals` shows
+every length tested instead); `*` marks `q <= 0.10`. Read `n` before the `r`:
+eight aligned periods is the floor before a correlation means anything at
+all, and the tool will tell you plainly when a period length simply doesn't
+have enough data yet rather than pretend otherwise.
+
+By default only a stream's grand total is tested. `--per-category` also
+tests each stream's top-level categories against everything else — this is
+usually what you want once you're past a first look, since "gaming" and
+"sleep" moving together is a more specific, more actionable claim than
+"timecard as a whole" and "sleep" moving together. A point-in-time stream's
+declared numeric fields (heart rate, say) are tested by their daily mean;
+`--field-sum` also tests the sum.
+
+A pair is not filtered out for a low `q` by default — with the amount of
+data most streams have today, a strict filter would return nothing on the
+very first run. `--min-r` (default `0.5`) is what actually narrows the list;
+`--max-q` is there if you want the stricter view. **These are leads to test
+against your own judgment, not findings** — the tool does not know about
+shared trends, day-of-week effects, or which of two correlated things (if
+either) causes the other.
+
+- `--stream KEY` (repeatable), `--since`, `--until` — restrict what's compared and over what range.
+- `--interval UNIT[:COUNT][,...]` — test specific period lengths (e.g. `week:2,month`) instead of the built-in ladder.
+- `--min-periods` (default `8`), `--min-r` (default `0.5`), `--max-q`, `--top` (default `20`, `0` for no limit).
+- `--per-category`, `--no-fields`, `--field-sum`, `--all-intervals`, `--max-series` (default `40`).
+- `--json` for machine-readable output.
+
+Needs the `analysis` extra (`uv sync --extra analysis`) — scipy is optional,
+like the desktop UI's PySide6, so installing Minmax to only import and query
+data does not pull it in. Every other command works without it.
 
 ### `minmax ui`
 
 Opens the desktop app on the most recent day with data.
 
-The main view is a day timeline modelled on Timecard's history screen: blocks
-sized to their real duration so they tile without gaps, coloured by their
-top-level category so a whole branch reads as one colour, labelled once tall
-enough and carrying their length once there is room for both. A run that crosses
-midnight is marked with a dashed edge rather than clipped silently, so an
-overnight sleep run reads as continuing rather than as having ended at 00:00.
-Beside it, the day's categories with their share of the day.
+#### Defining your own datastreams
+
+A picker above the day and trends screens (`Ctrl`+`K`) lists every declared
+stream; switching resets whatever was specific to the one you left (a filter,
+a drill-down, a pinned range) since none of it means anything in the new one.
+
+`Ctrl`+`N` opens "New stream…": pick a CSV, and Minmax reads its header and
+guesses a role for each column — confidently for the timestamp, more
+cautiously (number vs. text) for everything else. Every guess is an ordinary
+dropdown you can change before anything is created; a category or
+source-id role is never guessed, since nothing about a column's *values* says
+"this identifies the row" rather than "this is text." Creating the stream
+imports the same file immediately and switches to it, so the loop is one
+dialog: pick a file, check the roles, see it on screen.
+
+Only point-in-time streams — one instant per row, with any payload from
+nothing to a few numbers and a label — can be declared this way today. This is
+the same thing `minmax stream add` does from the terminal; see that section
+for the CLI form and its `--role` overrides.
+
+#### Importing
+
+A new export does not need the CLI: press `Ctrl`+`I` (or "Import…") for a file
+dialog, or drag a file onto the window. Either way it goes through the same
+archiving, provenance, and idempotency as `minmax import` — re-importing an
+export you already have offers to force it rather than silently doing nothing,
+and a file the importer does not recognise (or one that overlaps stored data)
+is reported rather than crashing the app. New rows refresh whatever is on
+screen; a duplicate-only re-import leaves it untouched.
+
+#### Auto-fetch
+
+The "Auto-fetch every minute" checkbox beside the stream picker re-imports the
+current stream from a remembered CSV path once a minute — for a source that
+keeps growing (a phone's location log appended to continuously, say), rather
+than a one-off export. It is opt-in per stream: switching it on for a stream
+with no remembered path yet asks you to pick the file, tries it immediately
+(so a bad choice is reported now, not up to a minute later), and remembers it
+from then on. Re-importing a growing file merges rather than duplicates, and
+backs it up, the same way any import does — see
+[How the data is stored](#how-the-data-is-stored) — so nothing new was built
+for either; the timer just calls the same path a manual import would.
+
+If the file goes missing, or the merge itself fails (say it now conflicts
+with something already stored), you are asked once for a replacement; cancel
+and that stream's auto-fetch pauses rather than asking again every minute.
+This is a desktop-app feature only — it has no CLI equivalent today.
+
+#### The timeline
+
+Modelled on Timecard's history screen: blocks sized to their real duration so
+they tile without gaps, coloured by their top-level category so a whole branch
+reads as one colour, labelled once tall enough and carrying their length once
+there is room for both. Beside it, the day's categories with their share of the
+day.
+
+**The timeline scrolls continuously through midnight**, rather than stepping
+one day at a time. Days are ruled and named where they begin, and more are
+loaded as you approach either end. A run that crosses midnight is therefore
+drawn as the single run it is, with the day boundary through it — the same way
+Timecard draws it. The dashed continuation edge still exists, but it now means
+"there is more of this run than has been loaded yet", which is only ever true at
+the two outer edges.
 
 The window opens with the whole day fitted to it. Zooming in is for inspecting
 short runs — at maximum zoom a one-minute run is comfortably selectable.
 
-Press `2` for the **trends** screen: a side-scrolling stacked area, one column
-per day, stacked by top-level category. It answers "what has the shape of my
-time been" rather than "what happened on Tuesday".
+- **`/` filters to a category and everything under it.** Matching is
+  component-wise, so `media` does not also catch `mediation`. The header says
+  what is being filtered; `Esc` clears it.
+- **Click a block to inspect it.** The panel shows both category paths (they
+  differ when a timer has been renamed), the exact start and end with seconds
+  and UTC offset, and which import the row came from — by id *and* filename, so
+  a suspicious block is traceable without opening the database.
 
+A point-in-time stream draws each record as a small dot at its instant instead
+of a block, with its category and any declared fields (a number and its unit,
+a text value) written beside it. Clicking one shows a single "at" reading in
+the inspector rather than a started/ended/duration triple, since there is only
+an instant to report.
+
+#### The trends screen
+
+Press `2`: a side-scrolling stacked area, one column per period, stacked by
+top-level category. It answers "what has the shape of my time been" rather than
+"what happened on Tuesday".
+
+- **A column covers whatever interval you want.** `D` cycles the common ones —
+  automatic, daily, weekly, monthly — and `Shift`+`D` opens a dialog for the
+  rest: five days, a fortnight, a quarter, a year. Automatic is the default and
+  picks from the span, so opening ten years of history does not require knowing
+  that monthly columns exist.
+- **Columns are anchored to the calendar, not to your range.** Weeks start on
+  Monday, months on the 1st, quarters in January; a fortnight or a five-day
+  column counts from a fixed epoch. A given Tuesday therefore lands in the same
+  column whatever range you asked for, and two charts of the same interval are
+  comparable. The one at each end is clipped to your range rather than reaching
+  outside it, and its tooltip names the days it really covers.
+- **The y axis is always hours per day**, whatever the interval, because a column
+  is plotted as its daily average rather than its total. Widening the interval
+  therefore changes the resolution and nothing else; if totals were plotted, a
+  weekly view would rescale the axis by seven and the same data would look like a
+  different life.
+- **`R` pins the chart to a fixed range** (last 30/90/180 days, last year, or
+  custom dates); `Shift`+`R` returns to all history. Presets count back from the
+  last day with data rather than from today, so "last 30 days" means thirty days
+  of data even if an import is overdue.
 - The header always names the **first and last day on screen** and how many days
   that is, and both endpoints are labelled on the axis whatever the tick spacing
   works out to.
-- The legend gives each group's **share of the visible days**, updating live as
-  you scroll and zoom — so the percentages always describe what you are looking
-  at, not the whole dataset.
-- `N` switches between hours per day and each day's composition as a percentage.
+- The legend gives each group's **share of the visible columns**, updating live
+  as you scroll and zoom — so the percentages always describe what you are
+  looking at, not the whole dataset.
+- `N` switches between hours per day and each column's composition as a
+  percentage.
 - **Double-click a band or a legend row to focus that group**, splitting it into
   its own sub-categories (`media` becomes `media/anime`, `media/gaming`, …).
   `Esc` backs out. This is how per-timer detail is reached without ever putting
   more than eight colours on screen at once.
-- Days with no tracking stay empty rather than being skipped, so a gap in your
-  history reads as a gap.
+- Periods with no tracking stay empty rather than being skipped, so a gap in
+  your history reads as a gap.
 
-**Keyboard shortcuts** (press `?` in the app for this list):
+For a point-in-time stream the same chart plots **how many, per day**, instead
+of hours per day — stacked and daily-averaged exactly the same way, since a
+count sums over a set the same way a duration does. The axis, the tooltip, and
+the legend all read as counts ("14 events") rather than durations; nothing
+about the interactions above changes.
 
-| Key | Action |
-|---|---|
-| `←` / `→` (or `H` / `L`) | Previous / next day |
-| `T` | Today |
-| `Home` / `End` | Earliest / latest day with data |
-| `G` | Go to a date |
-| `+` / `-` | Zoom in / out |
-| `F` | Fit the whole day to the window |
-| `0` | Reset zoom to the default |
-| `1` / `2` | Day view / trends view |
-| `?` | Show the shortcut list |
+#### Keyboard shortcuts
 
-On the trends screen `←`/`→` scroll through time, `+`/`-` change how many days
-are shown, `F` fits the entire recorded span, `N` toggles the percentage view,
-and `Esc` leaves a focused group. The same key can mean different things on each
-screen because actions are scoped to the screen that owns them.
+Press `?` (or `Ctrl`+`,`) for the full list, which is also where you change
+them.
+
+| Key | Day view | Trends view |
+|---|---|---|
+| `←` / `→` | Previous / next day | Scroll earlier / later |
+| `Home` / `End` | Earliest / latest day with data | Start / end of the range |
+| `+` / `-` | Zoom in / out | Fewer / more columns |
+| `F` | Fit the whole day to the window | Fit the whole range |
+| `Esc` | Close the inspector, then clear the filter | Leave the focused group |
+| `T` | Today | — |
+| `G` | Go to a date | — |
+| `0` | Reset zoom to the default | — |
+| `/` | Filter to a category | — |
+| `N` | — | Percentage view |
+| `D` / `Shift`+`D` | — | Cycle the interval / set any interval |
+| `R` / `Shift`+`R` | — | Pin / unpin the range |
+
+`1` and `2` switch screens, `?` shows the list, `Ctrl`+`I` imports a file,
+`Ctrl`+`K` switches streams, and `Ctrl`+`N` declares a new one — all anywhere.
+The same key means different things on each screen because actions are
+scoped to the screen that owns them.
 
 `Ctrl`/`Cmd` + scroll zooms around the pointer rather than the centre.
+
+**Every binding is remappable.** The Shortcuts dialog edits them and saves the
+ones you changed to `~/.minmax/shortcuts.json`, keyed by action rather than by
+key, so a file written today still means the same thing after a default
+changes. A conflicting, unknown, or unparseable binding is reported and skipped
+rather than applied — losing one customization is a far better failure than
+losing every shortcut in the app.
 
 The app follows the system light/dark appearance, since everything but the
 category colours is drawn from semantic system colours.
@@ -224,6 +449,15 @@ recognizable as the same data under a different filename.
 **Raw files are kept forever.** Imports are archived byte-for-byte before
 parsing. If a parser turns out to be wrong, the fix is to revert and re-import,
 never to hand-edit the database.
+
+**A point-in-time stream's payload is columns, not a blob.** Its declared
+fields (`stream_field`) and their values (`event_value`) are ordinary rows
+with a `CHECK` the database enforces, not a JSON column trusted to be
+well-formed — the same posture as everywhere else in the schema, that bad
+data is rejected rather than accepted and sorted out later. The natural key
+that makes a re-import a no-op includes a hash of a row's own field values,
+not just its instant, so two distinct readings landing in the same second
+(two GPS fixes, say) both survive.
 
 **Category colours are assigned once and stored.** Colour belongs to a
 top-level group, as in Timecard. What is stored is a *palette slot*, not a hex
@@ -282,7 +516,8 @@ assertions so that re-exporting cannot break the build.
 
 ```
 src/minmax/
-├── core/       domain model, timeline and chart arithmetic — pure, no I/O, no Qt
+├── core/       domain model, timeline/chart arithmetic, calendar grouping,
+│               palette — all pure, no I/O, no Qt
 ├── storage/    SQLite schema, migrations, repository, rollups
 ├── ingest/     importers and the shared import pipeline
 ├── api/        the facade the UI talks to

@@ -13,16 +13,26 @@ from __future__ import annotations
 import argparse
 import sys
 from collections.abc import Sequence
+from dataclasses import replace
 from datetime import date, datetime, timedelta
 from datetime import time as time_of_day
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from minmax.api.format import format_duration
+from minmax.core.columns import Granularity, Interval
+from minmax.core.models import FieldRole, StreamKind
 from minmax.core.timeref import Period
-from minmax.ingest import IMPORTERS, run_import
+from minmax.ingest import importer_for, run_import, sniff_fields
 from minmax.storage.database import default_home, open_database
 from minmax.storage.repository import OverlapError, Repository
 from minmax.storage.rollups import rebuild
+
+if TYPE_CHECKING:
+    # Only for type hints -- kept out of the runtime import graph so that
+    # `minmax.api` (which pulls in `analysis`) is not loaded by commands that
+    # never touch it. `cmd_correlate` imports the real thing lazily below.
+    from minmax.api import CorrelationRow, CorrelationsView
 
 __all__ = ["format_duration", "main"]
 
@@ -37,6 +47,33 @@ def _parse_date(text: str) -> date:
         return date.fromisoformat(text)
     except ValueError as error:
         raise argparse.ArgumentTypeError(f"{text!r} is not a YYYY-MM-DD date") from error
+
+
+def _parse_interval(text: str) -> Interval:
+    """``'week'`` or ``'week:2'`` -> an :class:`Interval`, for ``--interval``."""
+    unit_text, sep, count_text = text.strip().partition(":")
+    count = 1
+    if sep:
+        try:
+            count = int(count_text)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"{text!r} is not UNIT or UNIT:COUNT") from None
+    try:
+        unit = Granularity(unit_text)
+    except ValueError:
+        known = ", ".join(g.value for g in Granularity if g is not Granularity.AUTO)
+        raise argparse.ArgumentTypeError(
+            f"unknown interval unit {unit_text!r} in {text!r}; known units: {known}"
+        ) from None
+    try:
+        return Interval(unit, count)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from None
+
+
+def _parse_sweep(text: str) -> list[Interval]:
+    """``'day:3,week:1'`` -> the intervals to test, for ``--interval``."""
+    return [_parse_interval(part) for part in text.split(",") if part.strip()]
 
 
 def _local_bounds(first_day: date, last_day: date) -> tuple[int, int]:
@@ -56,10 +93,10 @@ def _local_bounds(first_day: date, last_day: date) -> tuple[int, int]:
 
 
 def cmd_import(args: argparse.Namespace, repository: Repository) -> int:
-    importer_class = IMPORTERS.get(args.stream)
-    if importer_class is None:
-        known = ", ".join(sorted(IMPORTERS))
-        print(f"unknown stream {args.stream!r}; known streams: {known}", file=sys.stderr)
+    try:
+        importer = importer_for(repository, args.stream)
+    except (LookupError, ValueError) as error:
+        print(str(error), file=sys.stderr)
         return 2
 
     source = Path(args.path).expanduser()
@@ -68,7 +105,7 @@ def cmd_import(args: argparse.Namespace, repository: Repository) -> int:
         return 2
 
     try:
-        report = run_import(repository, importer_class(), source, home=args.home, force=args.force)
+        report = run_import(repository, importer, source, home=args.home, force=args.force)
     except OverlapError as error:
         print(f"import aborted, nothing was stored:\n  {error}", file=sys.stderr)
         return 1
@@ -89,6 +126,105 @@ def cmd_import(args: argparse.Namespace, repository: Repository) -> int:
         print(f"  rejected line {rejection.line}: {rejection.reason}", file=sys.stderr)
     if len(report.rejections) > 10:
         print(f"  ...and {len(report.rejections) - 10} more", file=sys.stderr)
+    return 0
+
+
+def _parse_role_overrides(role_args: Sequence[str]) -> dict[str, FieldRole]:
+    overrides: dict[str, FieldRole] = {}
+    for item in role_args:
+        column, sep, role_text = item.partition("=")
+        if not sep:
+            raise ValueError(f"{item!r} is not COLUMN=ROLE")
+        try:
+            overrides[column] = FieldRole(role_text)
+        except ValueError:
+            known = ", ".join(role.value for role in FieldRole)
+            raise ValueError(
+                f"unknown role {role_text!r} for column {column!r}; known roles: {known}"
+            ) from None
+    return overrides
+
+
+def cmd_stream_add(args: argparse.Namespace, repository: Repository) -> int:
+    """Declare a new point-in-time stream and its column mapping.
+
+    The mapping is guessed from ``--from``'s header and sample rows --
+    confidently for the timestamp column, conservatively (number vs. text)
+    for everything else -- then any ``--role`` overrides are applied on top.
+    Nothing is guessed for category or source-id columns, since nothing about
+    a column's values distinguishes "this identifies the row" from "this is
+    just text"; those need an explicit ``--role``.
+    """
+    if args.kind != "event":
+        print(
+            "only --kind event is supported today; interval-shaped custom streams"
+            " are not yet implemented (see TODO.md)",
+            file=sys.stderr,
+        )
+        return 2
+    if repository.get_stream(args.key) is not None:
+        print(f"a stream named {args.key!r} already exists", file=sys.stderr)
+        return 2
+
+    try:
+        overrides = _parse_role_overrides(args.role)
+    except ValueError as error:
+        print(str(error), file=sys.stderr)
+        return 2
+
+    fields = sniff_fields(args.from_csv)
+    unknown_columns = sorted(set(overrides) - {f.source_column for f in fields})
+    if unknown_columns:
+        print(
+            f"--role names column(s) not in the CSV: {', '.join(unknown_columns)}", file=sys.stderr
+        )
+        return 2
+    fields = [
+        replace(f, role=overrides[f.source_column]) if f.source_column in overrides else f
+        for f in fields
+    ]
+
+    at_fields = [f for f in fields if f.role is FieldRole.AT]
+    if len(at_fields) != 1:
+        print(
+            f"exactly one column must have role 'at' (found {len(at_fields)});"
+            " override the guess with --role COLUMN=at",
+            file=sys.stderr,
+        )
+        return 2
+
+    stream = repository.create_stream(args.key, args.name, StreamKind.EVENT, fields=fields)
+    print(f"created stream {stream.key!r} ({stream.kind}) with fields:")
+    for declared in fields:
+        unit = f" ({declared.unit})" if declared.unit else ""
+        print(f"  {declared.source_column:<20} -> {declared.role.value}{unit}  [{declared.key}]")
+    print(f"import into it with: minmax import <file> --stream {stream.key}")
+    return 0
+
+
+def cmd_streams(args: argparse.Namespace, repository: Repository) -> int:
+    streams = repository.list_streams()
+    if not streams:
+        print("no streams yet; run `minmax stream add` or `minmax import <file>`")
+        return 0
+
+    for stream in streams:
+        assert stream.id is not None
+        bounds = repository.observed_range(stream.id)
+        span = ""
+        if bounds is not None:
+            low, high = (
+                datetime.fromtimestamp(bounds[0]).date(),
+                datetime.fromtimestamp(bounds[1]).date(),
+            )
+            span = f"  {low} -> {high}"
+        print(f"{stream.key}  ({stream.kind}{', exclusive' if stream.exclusive else ''}){span}")
+        if stream.kind is StreamKind.EVENT:
+            for declared in repository.stream_fields(stream.id):
+                if declared.role is FieldRole.AT:
+                    continue
+                unit = f" ({declared.unit})" if declared.unit else ""
+                print(f"    {declared.role.value:<10} {declared.label}{unit}")
     return 0
 
 
@@ -134,6 +270,13 @@ def cmd_totals(args: argparse.Namespace, repository: Repository) -> int:
     if stream is None or stream.id is None:
         print(f"no stream {args.stream!r}; import something first", file=sys.stderr)
         return 2
+    if stream.kind is not StreamKind.INTERVAL:
+        print(
+            f"{args.stream!r} is a {stream.kind} stream; 'totals' only supports interval"
+            " streams today -- try 'periods'",
+            file=sys.stderr,
+        )
+        return 2
 
     bounds = repository.observed_range(stream.id)
     if bounds is None:
@@ -164,6 +307,13 @@ def cmd_day(args: argparse.Namespace, repository: Repository) -> int:
     stream = repository.get_stream(args.stream)
     if stream is None or stream.id is None:
         print(f"no stream {args.stream!r}; import something first", file=sys.stderr)
+        return 2
+    if stream.kind is not StreamKind.INTERVAL:
+        print(
+            f"{args.stream!r} is a {stream.kind} stream; 'day' only supports interval streams"
+            " today",
+            file=sys.stderr,
+        )
         return 2
 
     start, end = _local_bounds(args.date, args.date)
@@ -208,6 +358,16 @@ def cmd_periods(args: argparse.Namespace, repository: Repository) -> int:
     if not totals:
         print("no rollup data in this range")
         return 0
+
+    # An event stream's rollup rows carry seconds=0 -- there is no duration to
+    # report -- so the bar and the figure are drawn from record_count instead.
+    if stream.kind is StreamKind.EVENT:
+        widest = max(item.record_count for item in totals)
+        for item in totals:
+            bar = "#" * max(1, round(40 * item.record_count / widest))
+            print(f"  {item.bucket:<14} {item.record_count:>9}  {bar}")
+        return 0
+
     widest = max(item.seconds for item in totals)
     for item in totals:
         bar = "#" * max(1, round(40 * item.seconds / widest))
@@ -237,7 +397,13 @@ def cmd_ui(args: argparse.Namespace, repository: Repository) -> int:
 
     from minmax.api import InProcessClient
 
-    return run_ui(InProcessClient(repository), stream_key=args.stream)
+    # The UI is not allowed to reach for the data directory itself, so the
+    # location of its config is resolved out here and handed in.
+    return run_ui(
+        InProcessClient(repository, home=args.home),
+        stream_key=args.stream,
+        config_path=args.home / "shortcuts.json",
+    )
 
 
 def cmd_revert(args: argparse.Namespace, repository: Repository) -> int:
@@ -250,6 +416,108 @@ def cmd_rebuild_rollups(args: argparse.Namespace, repository: Repository) -> int
     rebuild(repository.connection)
     print("rollups rebuilt from observations")
     return 0
+
+
+def cmd_correlate(args: argparse.Namespace, repository: Repository) -> int:
+    """Sweep for correlations between streams across many period lengths.
+
+    scipy is an optional dependency (see ``pyproject.toml``), checked here
+    rather than left to fail deep inside the engine -- the same reason
+    ``cmd_ui`` checks for PySide6 up front instead of importing ``ui.app``
+    and letting the traceback speak for itself.
+    """
+    try:
+        import scipy  # noqa: F401
+    except ImportError:
+        print(
+            "the correlation engine needs scipy, which is not installed.\n"
+            "  install it with:  uv sync --extra analysis",
+            file=sys.stderr,
+        )
+        return 2
+
+    for key in args.stream or ():
+        if repository.get_stream(key) is None:
+            print(f"no stream {key!r}; import something first", file=sys.stderr)
+            return 2
+
+    from minmax.api import InProcessClient
+
+    client = InProcessClient(repository)
+    view = client.correlations(
+        stream_keys=args.stream,
+        since=args.since,
+        until=args.until,
+        sweep=args.interval,
+        min_periods=args.min_periods,
+        min_r=args.min_r,
+        max_q=args.max_q,
+        top=None if args.top == 0 else args.top,
+        per_category=args.per_category,
+        include_fields=not args.no_fields,
+        field_sum=args.field_sum,
+        max_series=args.max_series,
+        all_intervals=args.all_intervals,
+    )
+
+    if args.json:
+        _print_correlations_json(view)
+    else:
+        _print_correlations(view)
+    return 0
+
+
+def _print_correlations(view: CorrelationsView) -> None:
+    span = f"{view.first_day} -> {view.last_day}  " if view.first_day and view.last_day else ""
+    print(f"{span}({view.series_count} series, {view.tests_performed} combinations tested)")
+    if view.truncated_series:
+        print(f"  ({view.truncated_series} series left out; raise --max-series to include them)")
+    print()
+
+    if not view.rows:
+        print("  nothing cleared --min-r with the data available")
+    for row in view.rows:
+        flag = "*" if row.q_value <= 0.10 else " "
+        print(
+            f"  {row.r:+.2f}{flag} q={row.q_value:.2f}  n={row.n:<3} "
+            f"{row.interval_label:<10} {row.x_label}  ~  {row.y_label}"
+        )
+        if row.stability < 1.0 or not row.consistent_sign:
+            print(f"      consistent at {row.stability:.0%} of the periods tested")
+        for caveat in row.caveats:
+            print(f"      {caveat}")
+
+    if view.skipped_notes:
+        print()
+        print("  not tested:")
+        for note in view.skipped_notes:
+            print(f"    {note}")
+
+    print()
+    print("  q is a Benjamini-Hochberg false-discovery rate over every combination tested.")
+    print("  These are leads to test, not findings.")
+
+
+def _print_correlations_json(view: CorrelationsView) -> None:
+    import dataclasses
+    import json
+
+    def row_to_dict(row: CorrelationRow) -> dict[str, object]:
+        data = dataclasses.asdict(row)
+        data["first_period"] = row.first_period.isoformat()
+        data["last_period"] = row.last_period.isoformat()
+        return data
+
+    payload = {
+        "rows": [row_to_dict(row) for row in view.rows],
+        "skipped_notes": view.skipped_notes,
+        "tests_performed": view.tests_performed,
+        "series_count": view.series_count,
+        "truncated_series": view.truncated_series,
+        "first_day": view.first_day.isoformat() if view.first_day else None,
+        "last_day": view.last_day.isoformat() if view.last_day else None,
+    }
+    print(json.dumps(payload, indent=2))
 
 
 # ----------------------------------------------------------------------
@@ -274,6 +542,35 @@ def build_parser() -> argparse.ArgumentParser:
         "--force", action="store_true", help="re-read a file whose content was already imported"
     )
     importer.set_defaults(handler=cmd_import)
+
+    stream = subparsers.add_parser("stream", help="declare a new datastream")
+    stream_commands = stream.add_subparsers(dest="stream_command", required=True)
+    stream_add = stream_commands.add_parser(
+        "add", help="declare a point-in-time stream and its column mapping"
+    )
+    stream_add.add_argument("--key", required=True, help="stable slug, e.g. 'heart_rate'")
+    stream_add.add_argument("--name", required=True, help="human-facing label")
+    stream_add.add_argument(
+        "--kind", choices=("event",), default="event", help="stream kind (only 'event' today)"
+    )
+    stream_add.add_argument(
+        "--from",
+        dest="from_csv",
+        required=True,
+        type=lambda value: Path(value).expanduser(),
+        help="a sample CSV to read the header and guess a column mapping from",
+    )
+    stream_add.add_argument(
+        "--role",
+        action="append",
+        default=[],
+        metavar="COLUMN=ROLE",
+        help="override a guessed column role (at, category, source_id, number, text); repeatable",
+    )
+    stream_add.set_defaults(handler=cmd_stream_add)
+
+    streams = subparsers.add_parser("streams", help="list every declared stream")
+    streams.set_defaults(handler=cmd_streams)
 
     status = subparsers.add_parser("status", help="show streams, coverage, and recent imports")
     status.add_argument("--imports", type=int, default=3, help="recent imports to list")
@@ -312,6 +609,65 @@ def build_parser() -> argparse.ArgumentParser:
         "rebuild-rollups", help="recompute aggregates from observations"
     )
     rollups.set_defaults(handler=cmd_rebuild_rollups)
+
+    correlate = subparsers.add_parser(
+        "correlate", help="sweep for correlations between streams across many period lengths"
+    )
+    correlate.add_argument(
+        "--stream", action="append", default=None, help="restrict to this stream (repeatable)"
+    )
+    correlate.add_argument("--since", type=_parse_date, help="first local day (YYYY-MM-DD)")
+    correlate.add_argument("--until", type=_parse_date, help="last local day (YYYY-MM-DD)")
+    correlate.add_argument(
+        "--interval",
+        dest="interval",
+        type=_parse_sweep,
+        default=None,
+        metavar="UNIT[:COUNT][,UNIT[:COUNT]...]",
+        help="period length(s) to test, e.g. 'day:3,week:1' "
+        "(default: a built-in ladder from a day to a month)",
+    )
+    correlate.add_argument(
+        "--min-periods",
+        type=int,
+        default=8,
+        help="aligned periods required before a pair is even tested (default: 8)",
+    )
+    correlate.add_argument(
+        "--min-r",
+        type=float,
+        default=0.5,
+        help="only show pairs with |r| at least this (default: 0.5)",
+    )
+    correlate.add_argument(
+        "--max-q", type=float, default=None, help="also require q at or below this"
+    )
+    correlate.add_argument(
+        "--top", type=int, default=20, help="pairs to show (default: 20); 0 for no limit"
+    )
+    correlate.add_argument(
+        "--per-category",
+        action="store_true",
+        help="also test each stream's top-level categories, not just its grand total",
+    )
+    correlate.add_argument(
+        "--no-fields", action="store_true", help="skip numeric event-field measures"
+    )
+    correlate.add_argument(
+        "--field-sum",
+        action="store_true",
+        help="also test a numeric field's sum, alongside its mean",
+    )
+    correlate.add_argument(
+        "--all-intervals",
+        action="store_true",
+        help="show every period length tested per pair, not just its best",
+    )
+    correlate.add_argument(
+        "--max-series", type=int, default=40, help="cap on candidate series (default: 40)"
+    )
+    correlate.add_argument("--json", action="store_true", help="machine-readable output")
+    correlate.set_defaults(handler=cmd_correlate)
 
     return parser
 

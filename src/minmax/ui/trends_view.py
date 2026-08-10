@@ -1,15 +1,22 @@
-"""The trends screen: a side-scrolling stacked area over days.
+"""The trends screen: a side-scrolling stacked area over calendar columns.
 
 Where the day timeline answers "what happened on Tuesday", this answers "what
-has the shape of my time been". One column per local day, stacked by category
-group, scrolling horizontally through as much history as exists.
+has the shape of my time been". One column per period -- a day, a week, or a
+month -- stacked by category group, scrolling horizontally through as much
+history as exists.
 
-Two structural choices worth knowing:
+Three structural choices worth knowing:
 
 **The widget owns its scroll offset and paints only the visible window**, rather
 than being a huge widget inside a ``QScrollArea``. Ten years at maximum zoom
 would be a 290,000px-wide widget; painting a window keeps cost proportional to
 what is on screen and lets the axis labels stay pinned to the plot edges.
+
+**Columns are plotted as a daily average, never as a total.** A weekly column
+holds roughly seven times the seconds of a daily one, so plotting totals would
+rescale the y axis by seven the moment the granularity changed and make the same
+data look like a different life. Dividing by the days a column covers keeps the
+axis in hours-per-day at every granularity.
 
 **The chart is drawn to the rules in the dataviz reference**: at most eight
 categorical hues with the tail folded into a neutral "Other", solid hairline
@@ -36,16 +43,18 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import QSizePolicy, QToolTip, QWidget
 
-from minmax.api import TrendsView
-from minmax.api.format import format_duration
+from minmax.api import StreamKind, TrendsView
+from minmax.api.format import format_duration, format_measure
 from minmax.core.trends import (
-    DEFAULT_PIXELS_PER_DAY,
+    DEFAULT_PIXELS_PER_COLUMN,
     TrendsGeometry,
-    clamp_day_zoom,
+    clamp_column_zoom,
+    fit_column_zoom,
+    nice_count_ceiling,
     nice_seconds_ceiling,
     stack_bands,
-    tick_interval_days,
-    visible_day_range,
+    tick_interval_columns,
+    visible_column_range,
     window_totals,
 )
 from minmax.ui import theme
@@ -69,10 +78,16 @@ class TrendsChart(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._view: TrendsView | None = None
-        self._pixels_per_day = DEFAULT_PIXELS_PER_DAY
+        self._pixels_per_column = DEFAULT_PIXELS_PER_COLUMN
         self._scroll_offset = 0.0
         self._normalised = False
-        self._hover_day: int | None = None
+        self._hover_column: int | None = None
+        #: Stacked bands for the current view/normalisation, recomputed only
+        #: when either changes rather than on every paint -- a paint can be
+        #: triggered by a hover-driven crosshair move or a scroll, which would
+        #: otherwise re-stack every column of a multi-year view dozens of
+        #: times a second for no change in the result.
+        self._bands: list[list[tuple[float, float]]] = []
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
@@ -81,8 +96,8 @@ class TrendsChart(QWidget):
     # -- state -----------------------------------------------------------
 
     @property
-    def pixels_per_day(self) -> float:
-        return self._pixels_per_day
+    def pixels_per_column(self) -> float:
+        return self._pixels_per_column
 
     @property
     def normalised(self) -> bool:
@@ -94,6 +109,7 @@ class TrendsChart(QWidget):
 
     def set_view(self, view: TrendsView) -> None:
         self._view = view
+        self._bands = stack_bands(self._plot_values(), normalise=self._normalised)
         self._scroll_offset = 0.0
         self.scroll_to_end()
         self.update()
@@ -101,6 +117,7 @@ class TrendsChart(QWidget):
     def set_normalised(self, normalised: bool) -> None:
         if normalised != self._normalised:
             self._normalised = normalised
+            self._bands = stack_bands(self._plot_values(), normalise=self._normalised)
             self.update()
 
     def toggle_normalised(self) -> None:
@@ -117,30 +134,48 @@ class TrendsChart(QWidget):
         return max(1.0, self.height() - AXIS_STRIP - PLOT_PADDING_TOP)
 
     def geometry_model(self) -> TrendsGeometry | None:
-        if self._view is None or not self._view.days:
+        if self._view is None or not self._view.columns:
             return None
-        ceiling = (
-            1.0 if self._normalised else float(nice_seconds_ceiling(self._view.peak_day_seconds))
-        )
+        if self._normalised:
+            ceiling = 1.0
+        elif self._view.stream_kind is StreamKind.EVENT:
+            ceiling = float(nice_count_ceiling(self._view.peak_daily_seconds))
+        else:
+            ceiling = float(nice_seconds_ceiling(self._view.peak_daily_seconds))
         return TrendsGeometry(
-            day_count=len(self._view.days),
-            pixels_per_day=self._pixels_per_day,
+            column_count=len(self._view.columns),
+            pixels_per_column=self._pixels_per_column,
             plot_height=self.plot_height,
             max_value=ceiling,
         )
 
+    def _plot_values(self) -> list[list[float]]:
+        """Per-column daily averages, which is what the bands are drawn from."""
+        if self._view is None:
+            return []
+        spans = [max(1, column.day_count) for column in self._view.columns]
+        return [
+            [value / span for value, span in zip(series.values, spans, strict=True)]
+            for series in self._view.series
+        ]
+
     def visible_dates(self) -> tuple[date, date] | None:
+        """First and last *day* on screen -- the span, not the column starts.
+
+        A weekly column that is partly on screen still shows the whole week, so
+        the honest answer for the header is the outer edge of the end columns.
+        """
         geometry = self.geometry_model()
         if geometry is None or self._view is None:
             return None
-        first, last = visible_day_range(geometry, self._scroll_offset, self.plot_width)
-        return self._view.days[first], self._view.days[last]
+        first, last = visible_column_range(geometry, self._scroll_offset, self.plot_width)
+        return self._view.columns[first].start, self._view.columns[last].end
 
     def visible_indices(self) -> tuple[int, int]:
         geometry = self.geometry_model()
         if geometry is None:
             return (0, 0)
-        return visible_day_range(geometry, self._scroll_offset, self.plot_width)
+        return visible_column_range(geometry, self._scroll_offset, self.plot_width)
 
     # -- scrolling and zoom ----------------------------------------------
 
@@ -157,8 +192,8 @@ class TrendsChart(QWidget):
             self._announce_range()
             self.update()
 
-    def scroll_by_days(self, days: float) -> None:
-        self.set_scroll_offset(self._scroll_offset + days * self._pixels_per_day)
+    def scroll_by_columns(self, columns: float) -> None:
+        self.set_scroll_offset(self._scroll_offset + columns * self._pixels_per_column)
 
     def scroll_to_start(self) -> None:
         self.set_scroll_offset(0.0)
@@ -169,14 +204,14 @@ class TrendsChart(QWidget):
         self._announce_range()
 
     def zoom_by(self, factor: float, anchor_x: float | None = None) -> None:
-        """Change days-per-screen, keeping the day under ``anchor_x`` in place."""
-        old = self._pixels_per_day
-        new = clamp_day_zoom(old * factor)
+        """Change columns-per-screen, keeping the column under ``anchor_x`` in place."""
+        old = self._pixels_per_column
+        new = clamp_column_zoom(old * factor)
         if new == old:
             return
 
         anchor = anchor_x if anchor_x is not None else self.plot_width / 2
-        self._pixels_per_day = new
+        self._pixels_per_column = new
         self._scroll_offset = max(
             0.0, min(self._max_offset(), (self._scroll_offset + anchor) * (new / old) - anchor)
         )
@@ -184,10 +219,10 @@ class TrendsChart(QWidget):
         self.update()
 
     def fit_all(self) -> None:
-        """Zoom so the entire recorded span is on screen at once."""
-        if self._view is None or not self._view.days:
+        """Zoom so the entire range is on screen at once."""
+        if self._view is None or not self._view.columns:
             return
-        self._pixels_per_day = clamp_day_zoom(self.plot_width / len(self._view.days))
+        self._pixels_per_column = fit_column_zoom(self.plot_width, len(self._view.columns))
         self._scroll_offset = 0.0
         self._announce_range()
         self.update()
@@ -217,27 +252,27 @@ class TrendsChart(QWidget):
             return
 
         dark = theme.is_dark(appearance)
-        first, last = visible_day_range(geometry, self._scroll_offset, self.plot_width)
+        first, last = visible_column_range(geometry, self._scroll_offset, self.plot_width)
         # One extra column each side so bands run to the plot edges rather than
         # stopping half a column short.
         low = max(0, first - 1)
-        high = min(geometry.day_count - 1, last + 1)
+        high = min(geometry.column_count - 1, last + 1)
 
         self._paint_value_grid(painter, geometry)
         self._paint_bands(painter, geometry, low, high, dark=dark)
         self._paint_date_axis(painter, geometry, first, last)
         self._paint_crosshair(painter, geometry)
 
-    def _plot_point(self, geometry: TrendsGeometry, day: int, value: float) -> QPointF:
+    def _plot_point(self, geometry: TrendsGeometry, column: int, value: float) -> QPointF:
         return QPointF(
-            AXIS_GUTTER + geometry.centre_for_day(day) - self._scroll_offset,
+            AXIS_GUTTER + geometry.centre_for_column(column) - self._scroll_offset,
             PLOT_PADDING_TOP + geometry.y_for_value(value),
         )
 
-    def _edge(self, geometry: TrendsGeometry, day_edge: float, value: float) -> QPointF:
-        """A point at a day-column boundary rather than its centre."""
+    def _edge(self, geometry: TrendsGeometry, column_edge: float, value: float) -> QPointF:
+        """A point at a column boundary rather than its centre."""
         return QPointF(
-            AXIS_GUTTER + geometry.x_for_day(day_edge) - self._scroll_offset,
+            AXIS_GUTTER + geometry.x_for_column(column_edge) - self._scroll_offset,
             PLOT_PADDING_TOP + geometry.y_for_value(value),
         )
 
@@ -252,9 +287,9 @@ class TrendsChart(QWidget):
     ) -> list[QPointF]:
         """The polyline along one side of a band, spanning full end columns.
 
-        Values are plotted at day centres, but the *first and last* days of the
-        whole series also get a point at the outer edge of their own column. A
-        day's value applies across that entire day, so stopping at its centre
+        Values are plotted at column centres, but the *first and last* columns of
+        the whole series also get a point at the outer edge of their own column.
+        A column's value applies across all of it, so stopping at its centre
         would leave a blank half-column that reads as the data ramping up from
         nothing -- which is a different claim from the one the data makes.
         """
@@ -264,10 +299,11 @@ class TrendsChart(QWidget):
         if low == 0:
             points.append(self._edge(geometry, 0.0, band[0][side]))
         points.extend(
-            self._plot_point(geometry, day, band[day][side]) for day in range(low, high + 1)
+            self._plot_point(geometry, column, band[column][side])
+            for column in range(low, high + 1)
         )
-        if high == geometry.day_count - 1:
-            points.append(self._edge(geometry, float(geometry.day_count), band[high][side]))
+        if high == geometry.column_count - 1:
+            points.append(self._edge(geometry, float(geometry.column_count), band[high][side]))
 
         return points
 
@@ -288,11 +324,8 @@ class TrendsChart(QWidget):
             painter.drawLine(AXIS_GUTTER, int(y), self.width(), int(y))
 
             painter.setPen(theme.gutter_text(appearance))
-            if self._normalised:
-                label = f"{value * 100:.0f}%"
-            else:
-                # "0s" reads oddly in a column of "6h", "12h", "18h".
-                label = "0" if value == 0 else format_duration(int(value))
+            is_event = self._view is not None and self._view.stream_kind is StreamKind.EVENT
+            label = _axis_label(value, normalised=self._normalised, is_event=is_event)
             painter.drawText(
                 QRectF(0, y - 9, AXIS_GUTTER - 8, 18),
                 int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter),
@@ -304,9 +337,7 @@ class TrendsChart(QWidget):
     ) -> None:
         if self._view is None:
             return
-        bands = stack_bands(
-            [series.values for series in self._view.series], normalise=self._normalised
-        )
+        bands = self._bands
         painter.setClipRect(
             QRectF(AXIS_GUTTER, 0, self.plot_width, self.plot_height + PLOT_PADDING_TOP)
         )
@@ -349,40 +380,40 @@ class TrendsChart(QWidget):
         painter.setFont(font)
         metrics = QFontMetrics(font)
 
-        interval = tick_interval_days(self._pixels_per_day)
+        interval = tick_interval_columns(self._pixels_per_column)
         painter.setPen(theme.subdued_text(appearance))
-        for day in range(first, last + 1):
-            if day % interval or day in (first, last):
+        for column in range(first, last + 1):
+            if column % interval or column in (first, last):
                 continue
-            self._draw_date_label(painter, geometry, day, metrics, emphasised=False)
+            self._draw_date_label(painter, geometry, column, metrics, emphasised=False)
 
-        # The first and last visible days are always labelled, whatever the tick
-        # interval works out to -- the reader must be able to see the span they
-        # are looking at without counting columns.
+        # The first and last visible columns are always labelled, whatever the
+        # tick interval works out to -- the reader must be able to see the span
+        # they are looking at without counting columns.
         emphasis = QFont(font)
         emphasis.setBold(True)
         painter.setFont(emphasis)
         painter.setPen(appearance.color(appearance.currentColorGroup(), appearance.ColorRole.Text))
-        for day in {first, last}:
-            self._draw_date_label(painter, geometry, day, QFontMetrics(emphasis), emphasised=True)
+        for column in {first, last}:
+            self._draw_date_label(
+                painter, geometry, column, QFontMetrics(emphasis), emphasised=True
+            )
 
     def _draw_date_label(
         self,
         painter: QPainter,
         geometry: TrendsGeometry,
-        day: int,
+        column: int,
         metrics: QFontMetrics,
         *,
         emphasised: bool,
     ) -> None:
         if self._view is None:
             return
-        moment = self._view.days[day]
-        # Built piecewise because the no-pad day directive is not portable.
-        text = f"{moment.day} {moment:%b}"
+        text = self._view.columns[column].axis_label
         width = metrics.horizontalAdvance(text) + 10
 
-        centre = AXIS_GUTTER + geometry.centre_for_day(day) - self._scroll_offset
+        centre = AXIS_GUTTER + geometry.centre_for_column(column) - self._scroll_offset
         # Keep an end label fully inside the plot instead of half off the edge.
         left = min(max(centre - width / 2, AXIS_GUTTER), self.width() - width)
         baseline = PLOT_PADDING_TOP + self.plot_height
@@ -396,9 +427,9 @@ class TrendsChart(QWidget):
         )
 
     def _paint_crosshair(self, painter: QPainter, geometry: TrendsGeometry) -> None:
-        if self._hover_day is None:
+        if self._hover_column is None:
             return
-        x = AXIS_GUTTER + geometry.centre_for_day(self._hover_day) - self._scroll_offset
+        x = AXIS_GUTTER + geometry.centre_for_column(self._hover_column) - self._scroll_offset
         if not (AXIS_GUTTER <= x <= self.width()):
             return
         pen = painter.pen()
@@ -409,38 +440,52 @@ class TrendsChart(QWidget):
 
     # -- interaction -----------------------------------------------------
 
-    def day_at(self, x: float) -> int | None:
+    def column_at(self, x: float) -> int | None:
         geometry = self.geometry_model()
         if geometry is None or x < AXIS_GUTTER:
             return None
-        return geometry.day_at_x(x - AXIS_GUTTER + self._scroll_offset)
+        return geometry.column_at_x(x - AXIS_GUTTER + self._scroll_offset)
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
-        day = self.day_at(event.position().x())
-        if day != self._hover_day:
-            self._hover_day = day
+        column = self.column_at(event.position().x())
+        if column != self._hover_column:
+            self._hover_column = column
             self.update()
-        if day is not None and self._view is not None:
-            QToolTip.showText(event.globalPosition().toPoint(), self._tooltip_for(day), self)
+        if column is not None and self._view is not None:
+            QToolTip.showText(event.globalPosition().toPoint(), self._tooltip_for(column), self)
         else:
             QToolTip.hideText()
         super().mouseMoveEvent(event)
 
     def leaveEvent(self, event: object) -> None:
-        self._hover_day = None
+        self._hover_column = None
         self.update()
         super().leaveEvent(event)  # type: ignore[arg-type]
 
-    def _tooltip_for(self, day: int) -> str:
+    def _tooltip_for(self, column: int) -> str:
         assert self._view is not None
-        moment = self._view.days[day]
-        total = sum(series.values[day] for series in self._view.series)
-        lines = [f"{moment:%A} {moment.day} {moment:%b %Y}", f"{format_duration(total)} tracked"]
-        for series in sorted(self._view.series, key=lambda s: -s.values[day]):
-            if series.values[day]:
-                share = series.values[day] / total if total else 0.0
+        kind = self._view.stream_kind
+        span = self._view.columns[column]
+        total = sum(series.values[column] for series in self._view.series)
+
+        lines = [span.detail_label]
+        if span.day_count > 1:
+            # A multi-day column needs both numbers: the total is what happened,
+            # the average is what the plotted height means.
+            lines.append(
+                f"{format_measure(total, kind)} over {span.day_count} days"
+                f"  ·  {format_measure(round(total / span.day_count), kind)}/day"
+            )
+        else:
+            # "N events tracked" reads oddly; "N events" already says enough.
+            suffix = "" if kind is StreamKind.EVENT else " tracked"
+            lines.append(f"{format_measure(total, kind)}{suffix}")
+
+        for series in sorted(self._view.series, key=lambda s: -s.values[column]):
+            if series.values[column]:
+                share = series.values[column] / total if total else 0.0
                 lines.append(
-                    f"  {series.label}  {format_duration(series.values[day])}  {share:.0%}"
+                    f"  {series.label}  {format_measure(series.values[column], kind)}  {share:.0%}"
                 )
         return "\n".join(lines)
 
@@ -448,12 +493,10 @@ class TrendsChart(QWidget):
         """Double-clicking a band focuses that group, splitting it into children."""
         if self._view is None:
             return
-        day = self.day_at(event.position().x())
-        if day is None:
+        column = self.column_at(event.position().x())
+        if column is None:
             return
-        bands = stack_bands(
-            [series.values for series in self._view.series], normalise=self._normalised
-        )
+        bands = self._bands
         geometry = self.geometry_model()
         if geometry is None:
             return
@@ -461,7 +504,7 @@ class TrendsChart(QWidget):
             1.0 - (event.position().y() - PLOT_PADDING_TOP) / self.plot_height
         )
         for series, band in zip(self._view.series, bands, strict=True):
-            lower, upper = band[day]
+            lower, upper = band[column]
             if lower <= value <= upper and series.can_drill and not series.is_other:
                 self.seriesActivated.emit(series.label)
                 return
@@ -477,7 +520,7 @@ class TrendsChart(QWidget):
         event.accept()
 
     def window_shares(self) -> list[float]:
-        """Each series' share of the days currently on screen."""
+        """Each series' share of the columns currently on screen."""
         if self._view is None:
             return []
         first, last = self.visible_indices()
@@ -490,3 +533,24 @@ class TrendsChart(QWidget):
             return []
         first, last = self.visible_indices()
         return window_totals([s.values for s in self._view.series], first, last)
+
+
+def _axis_label(value: float, *, normalised: bool, is_event: bool) -> str:
+    """One y-axis gridline's text.
+
+    Pulled out of the paint method because it is easy to get subtly wrong in
+    a way pixels don't reveal in review: ``round()`` on a count axis collapses
+    a half-integer gridline (a small, realistic ceiling for an event stream
+    puts them at 0, 0.5, 1, 1.5, 2) to the same displayed value as its
+    neighbour via round-half-to-even, so a chart with a low daily count
+    showed "2" on two different gridlines before this was a named function
+    with its own test.
+    """
+    if normalised:
+        return f"{value * 100:.0f}%"
+    if value == 0:
+        return "0"
+    if is_event:
+        return f"{value:g}"
+    # "0s" reads oddly in a column of "6h", "12h", "18h" -- handled above.
+    return format_duration(int(value))

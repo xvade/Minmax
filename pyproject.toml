@@ -18,9 +18,23 @@ minmax = "minmax.cli:main"
 ui = [
     "pyside6>=6.7",
 ]
+# scipy is the one analysis dependency landing so far (Pearson's r and its
+# p-value, for the correlation engine). Optional, like `ui`, and for the same
+# reason: `minmax import`/`totals`/`day`/etc. must keep working on an install
+# that never asked for correlation. `cli.py`'s `cmd_correlate` imports it
+# lazily and degrades to an install hint on ImportError, exactly as `cmd_ui`
+# already does for PySide6.
+analysis = [
+    "scipy>=1.11",
+]
 
 [dependency-groups]
-dev = ["pytest>=8.0", "ruff>=0.6", "mypy>=1.11"]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+    "mypy>=1.11",
+    "scipy-stubs>=1.17.1.5",
+]
 
 [build-system]
 requires = ["hatchling"]
