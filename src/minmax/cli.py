@@ -21,8 +21,8 @@ from typing import TYPE_CHECKING
 
 from minmax.api.format import format_duration
 from minmax.core.columns import Granularity, Interval
-from minmax.core.models import FieldRole, StreamKind
-from minmax.core.timeref import Period
+from minmax.core.models import FieldRole, Stream, StreamKind, View
+from minmax.core.timeref import Instant, Period
 from minmax.ingest import importer_for, run_import, sniff_fields, validate_declaration
 from minmax.storage.database import default_home, open_database
 from minmax.storage.repository import OverlapError, Repository
@@ -74,6 +74,20 @@ def _parse_interval(text: str) -> Interval:
 def _parse_sweep(text: str) -> list[Interval]:
     """``'day:3,week:1'`` -> the intervals to test, for ``--interval``."""
     return [_parse_interval(part) for part in text.split(",") if part.strip()]
+
+
+def _resolve_view(repository: Repository, view_key: str | None) -> tuple[View | None, int]:
+    """``(view, 0)`` if ``view_key`` is ``None`` or names a real view;
+    ``(None, 2)`` with an error already printed to stderr otherwise --
+    the same ``(value, exit code)`` shape every command's own validation
+    already returns inline, pulled out once since five commands share it."""
+    if view_key is None:
+        return None, 0
+    view = repository.get_view(view_key)
+    if view is None:
+        print(f"no view {view_key!r}", file=sys.stderr)
+        return None, 2
+    return view, 0
 
 
 def _local_bounds(first_day: date, last_day: date) -> tuple[int, int]:
@@ -211,6 +225,46 @@ def cmd_stream_delete(args: argparse.Namespace, repository: Repository) -> int:
     return 0
 
 
+def cmd_view_add(args: argparse.Namespace, repository: Repository) -> int:
+    """Save a new view, restricted to an interval stream's category.
+
+    ``--category`` is optional: omitted, the view means any activity at all
+    in ``--stream``, matching :class:`~minmax.core.models.View`'s own
+    convention.
+    """
+    try:
+        view = repository.create_view(args.key, args.name, args.stream, category_path=args.category)
+    except (ValueError, LookupError) as error:
+        print(str(error), file=sys.stderr)
+        return 2
+    where = view.category_path or "any activity"
+    print(f"created view {view.key!r}: {view.source_stream_key}/{where}")
+    return 0
+
+
+def cmd_view_delete(args: argparse.Namespace, repository: Repository) -> int:
+    """Permanently delete a view. No interactive confirmation -- the
+    explicit ``--key`` is the confirmation, matching ``stream delete``."""
+    try:
+        view = repository.delete_view(args.key)
+    except LookupError as error:
+        print(str(error), file=sys.stderr)
+        return 2
+    print(f"deleted view {view.key!r}")
+    return 0
+
+
+def cmd_view_list(args: argparse.Namespace, repository: Repository) -> int:
+    views = repository.list_views()
+    if not views:
+        print("no views yet; run `minmax view add`")
+        return 0
+    for view in views:
+        where = view.category_path or "any activity"
+        print(f"{view.key}  ({view.source_stream_key}/{where})  {view.name!r}")
+    return 0
+
+
 def cmd_streams(args: argparse.Namespace, repository: Repository) -> int:
     streams = repository.list_streams()
     if not streams:
@@ -289,6 +343,9 @@ def cmd_totals(args: argparse.Namespace, repository: Repository) -> int:
             file=sys.stderr,
         )
         return 2
+    view, code = _resolve_view(repository, args.view)
+    if code:
+        return code
 
     bounds = repository.observed_range(stream.id)
     if bounds is None:
@@ -299,18 +356,54 @@ def cmd_totals(args: argparse.Namespace, repository: Repository) -> int:
     last = args.until or datetime.fromtimestamp(bounds[1]).date()
     start, end = _local_bounds(first, last)
 
-    totals = repository.totals_by_category(stream.id, start, end, path_prefix=args.prefix)
-    grand = sum(item.seconds for item in totals)
-    print(f"{stream.key}  {first} -> {last}" + (f"  under {args.prefix}" if args.prefix else ""))
+    totals: list[tuple[str, int, int]]
+    if view is not None:
+        # The rollup-backed masked reader answers per (day, category); a
+        # day-aligned range (first/last are always whole local days here) is
+        # summed across its days per category to get the same shape
+        # totals_by_category returns for the unmasked path below.
+        mask = repository.mask_for_view(view, start, end)
+        rows = repository.masked_daily_totals_by_category(
+            stream.id,
+            mask,
+            start_bucket=first.isoformat(),
+            end_bucket=last.isoformat(),
+            path_prefix=args.prefix,
+        )
+        seconds_by_path: dict[str, int] = {}
+        count_by_path: dict[str, int] = {}
+        for row in rows:
+            seconds_by_path[row.category_path] = (
+                seconds_by_path.get(row.category_path, 0) + row.seconds
+            )
+            count_by_path[row.category_path] = (
+                count_by_path.get(row.category_path, 0) + row.record_count
+            )
+        totals = sorted(
+            ((path, seconds, count_by_path[path]) for path, seconds in seconds_by_path.items()),
+            key=lambda t: -t[1],
+        )
+    else:
+        totals = [
+            (item.category_path, item.seconds, item.record_count)
+            for item in repository.totals_by_category(
+                stream.id, start, end, path_prefix=args.prefix
+            )
+        ]
+
+    grand = sum(seconds for _, seconds, _ in totals)
+    label = f"{stream.key}  {first} -> {last}"
+    if args.prefix:
+        label += f"  under {args.prefix}"
+    if view is not None:
+        label += f"  view {view.key}"
+    print(label)
     if grand == 0:
         print("  nothing tracked in this range")
         return 0
-    for item in totals[: args.limit]:
-        share = 100.0 * item.seconds / grand
-        print(
-            f"  {format_duration(item.seconds):>9}  {share:5.1f}%  "
-            f"{item.category_path}  ({item.record_count})"
-        )
+    for path, seconds, count in totals[: args.limit]:
+        share = 100.0 * seconds / grand
+        print(f"  {format_duration(seconds):>9}  {share:5.1f}%  {path}  ({count})")
     print(f"  {format_duration(grand):>9}  total")
     return 0
 
@@ -327,26 +420,55 @@ def cmd_day(args: argparse.Namespace, repository: Repository) -> int:
             file=sys.stderr,
         )
         return 2
+    view, code = _resolve_view(repository, args.view)
+    if code:
+        return code
 
     start, end = _local_bounds(args.date, args.date)
     intervals = repository.intervals_in_range(stream.id, start, end)
-    if not intervals:
+
+    # (start, end, recorded_path) triples -- a masked record can split into
+    # several rows sharing one recorded_path, the CLI analogue of the desktop
+    # client's several TimelineRecords sharing one id (api/client.py's
+    # _clip_intervals_to_mask).
+    pieces: list[tuple[Instant, Instant, str]]
+    if view is not None:
+        mask = repository.mask_for_view(view, start, end)
+        pieces = [
+            (
+                Instant(piece_start, item.start.utc_offset_seconds),
+                Instant(piece_end, item.end.utc_offset_seconds),
+                item.recorded_path,
+            )
+            for item in intervals
+            for piece_start, piece_end in mask.clip(
+                item.start.epoch_seconds, item.end.epoch_seconds
+            )
+        ]
+    else:
+        pieces = [(item.start, item.end, item.recorded_path) for item in intervals]
+
+    if not pieces:
         print(f"nothing tracked on {args.date}")
         return 0
 
-    print(f"{stream.key}  {args.date}")
-    for item in intervals:
+    label = f"{stream.key}  {args.date}"
+    if view is not None:
+        label += f"  view {view.key}"
+    print(label)
+    for piece_start, piece_end, recorded_path in pieces:
         # A run may extend beyond the day it is shown under; mark the overhang
         # rather than silently clipping, matching how Timecard draws a
         # midnight-crossing run as one block.
-        starts_before = item.start.epoch_seconds < start
-        ends_after = item.end.epoch_seconds > end
+        starts_before = piece_start.epoch_seconds < start
+        ends_after = piece_end.epoch_seconds > end
         marker = "<" if starts_before else " "
         trailer = ">" if ends_after else ""
+        duration = piece_end.epoch_seconds - piece_start.epoch_seconds
         print(
-            f"  {marker}{item.start.local_datetime:%H:%M}-"
-            f"{item.end.local_datetime:%H:%M}{trailer or ' '} "
-            f"{format_duration(item.duration_seconds):>8}  {item.recorded_path}"
+            f"  {marker}{piece_start.local_datetime:%H:%M}-"
+            f"{piece_end.local_datetime:%H:%M}{trailer or ' '} "
+            f"{format_duration(duration):>8}  {recorded_path}"
         )
     return 0
 
@@ -356,6 +478,18 @@ def cmd_periods(args: argparse.Namespace, repository: Repository) -> int:
     if stream is None or stream.id is None:
         print(f"no stream {args.stream!r}; import something first", file=sys.stderr)
         return 2
+    view, code = _resolve_view(repository, args.view)
+    if code:
+        return code
+    if view is not None and args.period == "hour":
+        # masked.py's day-attribution readers are the only masked substitutes
+        # for the rollup table today -- an hourly masked reader would need
+        # its own version of the same clip-then-split logic, not yet built.
+        print("--view only supports --period day today", file=sys.stderr)
+        return 2
+
+    if view is not None:
+        return _cmd_periods_masked(args, repository, stream, view)
 
     period = Period.DAY if args.period == "day" else Period.HOUR
     totals = repository.totals_by_period(
@@ -387,6 +521,64 @@ def cmd_periods(args: argparse.Namespace, repository: Repository) -> int:
     return 0
 
 
+def _cmd_periods_masked(
+    args: argparse.Namespace, repository: Repository, stream: Stream, view: View
+) -> int:
+    """``cmd_periods``'s ``--view --period day`` path: the masked substitutes
+    (``storage/masked.py``) answer per (day, category), so every category's
+    row for a bucket is summed to get one total per bucket, the same shape
+    ``totals_by_period`` returns for the unmasked path."""
+    assert stream.id is not None
+
+    if args.since is not None and args.until is not None:
+        start, end = _local_bounds(args.since, args.until)
+    else:
+        observed = repository.observed_range(stream.id)
+        if observed is None:
+            print("no rollup data in this range")
+            return 0
+        start, end = observed[0], observed[1] + 1
+
+    mask = repository.mask_for_view(view, start, end)
+    start_bucket = args.since.isoformat() if args.since else None
+    end_bucket = args.until.isoformat() if args.until else None
+
+    if stream.kind is StreamKind.EVENT:
+        event_rows = repository.masked_daily_event_counts_by_category(
+            stream.id,
+            mask,
+            start_bucket=start_bucket,
+            end_bucket=end_bucket,
+            path_prefix=args.prefix,
+        )
+        counts: dict[str, int] = {}
+        for row in event_rows:
+            counts[row.bucket] = counts.get(row.bucket, 0) + row.record_count
+        if not counts:
+            print("no rollup data in this range")
+            return 0
+        widest = max(counts.values())
+        for bucket in sorted(counts):
+            bar = "#" * max(1, round(40 * counts[bucket] / widest))
+            print(f"  {bucket:<14} {counts[bucket]:>9}  {bar}")
+        return 0
+
+    interval_rows = repository.masked_daily_totals_by_category(
+        stream.id, mask, start_bucket=start_bucket, end_bucket=end_bucket, path_prefix=args.prefix
+    )
+    seconds: dict[str, int] = {}
+    for row in interval_rows:
+        seconds[row.bucket] = seconds.get(row.bucket, 0) + row.seconds
+    if not seconds:
+        print("no rollup data in this range")
+        return 0
+    widest = max(seconds.values())
+    for bucket in sorted(seconds):
+        bar = "#" * max(1, round(40 * seconds[bucket] / widest))
+        print(f"  {bucket:<14} {format_duration(seconds[bucket]):>9}  {bar}")
+    return 0
+
+
 def cmd_ui(args: argparse.Namespace, repository: Repository) -> int:
     """Launch the desktop app.
 
@@ -406,6 +598,9 @@ def cmd_ui(args: argparse.Namespace, repository: Repository) -> int:
     if repository.get_stream(args.stream) is None:
         print(f"no stream {args.stream!r}; import something first", file=sys.stderr)
         return 2
+    _view, code = _resolve_view(repository, args.view)
+    if code:
+        return code
 
     from minmax.api import InProcessClient
 
@@ -415,6 +610,7 @@ def cmd_ui(args: argparse.Namespace, repository: Repository) -> int:
         InProcessClient(repository, home=args.home),
         stream_key=args.stream,
         config_path=args.home / "shortcuts.json",
+        view_key=args.view,
     )
 
 
@@ -452,6 +648,9 @@ def cmd_correlate(args: argparse.Namespace, repository: Repository) -> int:
         if repository.get_stream(key) is None:
             print(f"no stream {key!r}; import something first", file=sys.stderr)
             return 2
+    _saved_view, code = _resolve_view(repository, args.view)
+    if code:
+        return code
 
     from minmax.api import InProcessClient
 
@@ -470,6 +669,7 @@ def cmd_correlate(args: argparse.Namespace, repository: Repository) -> int:
         field_sum=not args.no_field_sum,
         max_series=args.max_series,
         all_intervals=args.all_intervals,
+        view=args.view,
     )
 
     if args.json:
@@ -604,6 +804,32 @@ def build_parser() -> argparse.ArgumentParser:
     streams = subparsers.add_parser("streams", help="list every declared stream")
     streams.set_defaults(handler=cmd_streams)
 
+    view = subparsers.add_parser(
+        "view", help="a saved restriction to the times a category was active"
+    )
+    view_commands = view.add_subparsers(dest="view_command", required=True)
+    view_add = view_commands.add_parser(
+        "add", help="save a new view, restricted to an interval stream's category"
+    )
+    view_add.add_argument("--key", required=True, help="stable slug, e.g. 'work'")
+    view_add.add_argument("--name", required=True, help="human-facing label")
+    view_add.add_argument(
+        "--stream", required=True, help="the interval stream to build the view from"
+    )
+    view_add.add_argument(
+        "--category",
+        default=None,
+        help="restrict to this category and its descendants (default: any activity at all)",
+    )
+    view_add.set_defaults(handler=cmd_view_add)
+
+    view_delete = view_commands.add_parser("delete", help="permanently delete a view")
+    view_delete.add_argument("--key", required=True, help="the view to delete")
+    view_delete.set_defaults(handler=cmd_view_delete)
+
+    view_list = view_commands.add_parser("list", help="list every saved view")
+    view_list.set_defaults(handler=cmd_view_list)
+
     status = subparsers.add_parser("status", help="show streams, coverage, and recent imports")
     status.add_argument("--imports", type=int, default=3, help="recent imports to list")
     status.set_defaults(handler=cmd_status)
@@ -614,11 +840,13 @@ def build_parser() -> argparse.ArgumentParser:
     totals.add_argument("--until", type=_parse_date, help="last local day (YYYY-MM-DD)")
     totals.add_argument("--prefix", help="restrict to a category and its descendants")
     totals.add_argument("--limit", type=int, default=25)
+    totals.add_argument("--view", help="restrict to the times a saved view was active")
     totals.set_defaults(handler=cmd_totals)
 
     day = subparsers.add_parser("day", help="list a day's records")
     day.add_argument("date", type=_parse_date)
     day.add_argument("--stream", default="timecard")
+    day.add_argument("--view", help="restrict to the times a saved view was active")
     day.set_defaults(handler=cmd_day)
 
     periods = subparsers.add_parser("periods", help="totals per local hour or day, from rollups")
@@ -627,10 +855,14 @@ def build_parser() -> argparse.ArgumentParser:
     periods.add_argument("--since", type=_parse_date)
     periods.add_argument("--until", type=_parse_date)
     periods.add_argument("--prefix")
+    periods.add_argument(
+        "--view", help="restrict to the times a saved view was active (--period day only)"
+    )
     periods.set_defaults(handler=cmd_periods)
 
     ui = subparsers.add_parser("ui", help="open the desktop app")
     ui.add_argument("--stream", default="timecard")
+    ui.add_argument("--view", help="open with this saved view already active")
     ui.set_defaults(handler=cmd_ui)
 
     revert = subparsers.add_parser("revert", help="undo an import by id")
@@ -699,6 +931,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-series", type=int, default=40, help="cap on candidate series (default: 40)"
     )
     correlate.add_argument("--json", action="store_true", help="machine-readable output")
+    correlate.add_argument(
+        "--view", help="restrict every series to the times a saved view was active"
+    )
     correlate.set_defaults(handler=cmd_correlate)
 
     return parser

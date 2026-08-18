@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import sqlite3
 from collections.abc import Iterator
+from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 
 import pytest
 
-from minmax.core.models import EventRecord, FieldRole, FieldSpec, Stream, StreamKind
+from minmax.core.models import EventRecord, FieldRole, FieldSpec, IntervalRecord, Stream, StreamKind
 from minmax.core.timeref import Instant
 from minmax.storage.database import open_database
 from minmax.storage.repository import Repository
@@ -137,6 +139,148 @@ def readings_stream(repository: Repository) -> Stream:
     ]
     repository.insert_events(stream, run, records)
     return stream
+
+
+@dataclass(frozen=True, slots=True)
+class ViewFixture:
+    """Handles for :func:`viewed_streams`'s data -- a test reads better
+    asking for "the view" or "the app usage stream" than indexing into a
+    tuple."""
+
+    timecard: Stream
+    heart_rate: Stream
+    app_usage: Stream
+    view_key: str
+    day: date
+
+
+@pytest.fixture
+def viewed_streams(repository: Repository) -> ViewFixture:
+    """A view's source stream, plus two more streams shaped to catch a
+    clipping bug when read through it -- every existing fixture is
+    degenerate for this, since none has a category active in more than one
+    window on a single day.
+
+    ``timecard`` (exclusive) has its ``work`` category active in two
+    separate windows, 08:00-10:00 and 13:00-15:00, with ``rest`` filling the
+    gap between them. A single-window mask cannot distinguish "clip to a
+    range" from "clip to a set of windows with a gap in the middle" -- this
+    can.
+
+    ``heart_rate`` has a reading inside each work window, one exactly on a
+    window's closing edge (half-open, so it must be excluded, the same
+    convention :meth:`~minmax.storage.repository.Repository.events_in_range`
+    already uses), and one in the gap.
+
+    ``app_usage`` (a second, unrelated interval stream) has one run spanning
+    both work windows and the gap between them -- 09:00-14:00 -- to exercise
+    a masked record splitting into two pieces (one per window it touches)
+    that share one id.
+    """
+    day = date(2026, 7, 1)
+
+    timecard = repository.create_stream("timecard", "Timecard", StreamKind.INTERVAL, exclusive=True)
+    assert timecard.id is not None
+    run = repository.begin_import(
+        timecard.id,
+        importer="test",
+        source_name="t.csv",
+        source_sha256="1" * 64,
+        archived_path=None,
+    )
+    repository.insert_intervals(
+        timecard,
+        run,
+        [
+            IntervalRecord(
+                None,
+                "work",
+                Instant.from_iso("2026-07-01T08:00:00-07:00"),
+                Instant.from_iso("2026-07-01T10:00:00-07:00"),
+            ),
+            IntervalRecord(
+                None,
+                "rest",
+                Instant.from_iso("2026-07-01T10:00:00-07:00"),
+                Instant.from_iso("2026-07-01T13:00:00-07:00"),
+            ),
+            IntervalRecord(
+                None,
+                "work",
+                Instant.from_iso("2026-07-01T13:00:00-07:00"),
+                Instant.from_iso("2026-07-01T15:00:00-07:00"),
+            ),
+        ],
+    )
+
+    heart_rate = repository.create_stream(
+        "heart_rate",
+        "Heart Rate",
+        StreamKind.EVENT,
+        fields=[
+            FieldSpec(
+                key="bpm", label="BPM", role=FieldRole.NUMBER, source_column="bpm", unit="bpm"
+            )
+        ],
+    )
+    assert heart_rate.id is not None
+    hr_run = repository.begin_import(
+        heart_rate.id,
+        importer="test",
+        source_name="hr.csv",
+        source_sha256="2" * 64,
+        archived_path=None,
+    )
+    repository.insert_events(
+        heart_rate,
+        hr_run,
+        [
+            # Inside the first work window.
+            EventRecord(
+                None, "heart_rate", Instant.from_iso("2026-07-01T09:00:00-07:00"), {"bpm": 70.0}
+            ),
+            # Exactly on the first window's closing edge -- excluded (half-open).
+            EventRecord(
+                None, "heart_rate", Instant.from_iso("2026-07-01T10:00:00-07:00"), {"bpm": 999.0}
+            ),
+            # In the gap between the two work windows -- excluded.
+            EventRecord(
+                None, "heart_rate", Instant.from_iso("2026-07-01T11:00:00-07:00"), {"bpm": 60.0}
+            ),
+            # Inside the second work window.
+            EventRecord(
+                None, "heart_rate", Instant.from_iso("2026-07-01T14:00:00-07:00"), {"bpm": 90.0}
+            ),
+        ],
+    )
+
+    app_usage = repository.create_stream("app_usage", "App Usage", StreamKind.INTERVAL)
+    assert app_usage.id is not None
+    au_run = repository.begin_import(
+        app_usage.id,
+        importer="test",
+        source_name="a.csv",
+        source_sha256="3" * 64,
+        archived_path=None,
+    )
+    repository.insert_intervals(
+        app_usage,
+        au_run,
+        [
+            IntervalRecord(
+                None,
+                "coding",
+                Instant.from_iso("2026-07-01T09:00:00-07:00"),
+                Instant.from_iso("2026-07-01T14:00:00-07:00"),
+            ),
+        ],
+    )
+
+    view = repository.create_view("work-view", "Work", "timecard", category_path="work")
+
+    return ViewFixture(
+        timecard=timecard, heart_rate=heart_rate, app_usage=app_usage, view_key=view.key, day=day
+    )
 
 
 def data_snapshot(conn: sqlite3.Connection) -> dict[str, list[tuple[object, ...]]]:

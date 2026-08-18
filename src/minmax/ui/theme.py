@@ -17,6 +17,7 @@ __all__ = [
     "chip_background",
     "day_rule",
     "day_rule_text",
+    "excluded_time",
     "grid_line",
     "gutter_text",
     "is_dark",
@@ -81,6 +82,20 @@ def chip_background(palette: QPalette) -> QColor:
 def selection_ring(palette: QPalette) -> QColor:
     """Outline on the selected block. Uses the system accent, as a selection should."""
     return palette.color(QPalette.ColorRole.Highlight)
+
+
+def excluded_time(palette: QPalette) -> QColor:
+    """Wash over a stretch a saved view was not active in.
+
+    Deliberately lighter than :func:`grid_line`: the stretch genuinely
+    occurred and is genuinely empty (see ``DayView.active_spans``'s
+    docstring), so this is a legibility affordance for telling "outside the
+    view" apart from "a quiet day", not a claim that the time was cut out --
+    it must not read as louder than the blocks drawn on top of it.
+    """
+    colour = QColor(palette.color(QPalette.ColorRole.Text))
+    colour.setAlpha(16 if is_dark(palette) else 12)
+    return colour
 
 
 def block_border(palette: QPalette) -> QColor:

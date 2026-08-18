@@ -39,9 +39,11 @@ from minmax.core.models import (
     Stream,
     StreamField,
     StreamKind,
+    View,
 )
 from minmax.core.timeref import Instant, Period
-from minmax.storage import rollups
+from minmax.core.windows import TimeMask
+from minmax.storage import _sql, masked, rollups
 from minmax.storage.database import transaction
 
 __all__ = ["InsertOutcome", "OverlapError", "Repository"]
@@ -212,6 +214,190 @@ class Repository:
             )
             for row in rows
         ]
+
+    # ------------------------------------------------------------------
+    # Views
+    # ------------------------------------------------------------------
+
+    def create_view(
+        self,
+        key: str,
+        name: str,
+        source_stream_key: str,
+        *,
+        category_path: str | None = None,
+    ) -> View:
+        """Save a new view, restricted to an interval stream's category.
+
+        Only an interval stream records when a category was active, so that
+        is the only source kind a view can be built on today -- a later view
+        kind (an event stream's own timestamps, say) would need its own
+        ``source_kind`` discriminator, deliberately not added ahead of time.
+        """
+        if self.get_view(key) is not None:
+            raise ValueError(f"a view named {key!r} already exists")
+        stream = self.get_stream(source_stream_key)
+        if stream is None:
+            raise LookupError(f"no stream {source_stream_key!r}")
+        if stream.kind is not StreamKind.INTERVAL:
+            raise ValueError(
+                f"view {key!r} needs an interval stream, but"
+                f" {source_stream_key!r} is a {stream.kind} stream"
+            )
+        normalized = paths.normalize(category_path) if category_path is not None else None
+        with transaction(self._conn) as conn:
+            cursor = conn.execute(
+                "INSERT INTO view (key, name, source_stream_id, category_path, created_at)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (key, name, stream.id, normalized, int(time.time())),
+            )
+        return View(
+            key=key,
+            name=name,
+            source_stream_key=source_stream_key,
+            category_path=normalized,
+            id=int(cursor.lastrowid or 0),
+        )
+
+    def get_view(self, key: str) -> View | None:
+        row = self._conn.execute(
+            "SELECT v.id, v.key, v.name, v.category_path, s.key AS source_stream_key"
+            " FROM view v JOIN stream s ON s.id = v.source_stream_id"
+            " WHERE v.key = ?",
+            (key,),
+        ).fetchone()
+        return _view_from_row(row) if row is not None else None
+
+    def list_views(self) -> list[View]:
+        rows = self._conn.execute(
+            "SELECT v.id, v.key, v.name, v.category_path, s.key AS source_stream_key"
+            " FROM view v JOIN stream s ON s.id = v.source_stream_id"
+            " ORDER BY v.key"
+        ).fetchall()
+        return [_view_from_row(row) for row in rows]
+
+    def delete_view(self, key: str) -> View:
+        with transaction(self._conn) as conn:
+            row = conn.execute(
+                "SELECT v.id, v.key, v.name, v.category_path, s.key AS source_stream_key"
+                " FROM view v JOIN stream s ON s.id = v.source_stream_id"
+                " WHERE v.key = ?",
+                (key,),
+            ).fetchone()
+            if row is None:
+                raise LookupError(f"no view {key!r}")
+            view = _view_from_row(row)
+            conn.execute("DELETE FROM view WHERE id = ?", (view.id,))
+        return view
+
+    def active_windows(
+        self,
+        stream_id: int,
+        start_epoch: int,
+        end_epoch: int,
+        *,
+        path_prefix: str | None = None,
+    ) -> TimeMask:
+        """When a category (or, with no prefix, anything) in this stream was
+        active within ``[start_epoch, end_epoch)``.
+
+        Clipped exactly to the bounds in SQL -- the same clipping arithmetic
+        :meth:`totals_by_category` uses -- then merged into a
+        :class:`~minmax.core.windows.TimeMask`, the primitive a view's masked
+        reads are built from.
+        """
+        clause, params = _sql.prefix_clause(path_prefix)
+        rows = self._conn.execute(
+            "SELECT max(i.started_at, ?) AS clipped_start, min(i.ended_at, ?) AS clipped_end"
+            " FROM interval_record i JOIN category c ON c.id = i.category_id"
+            " WHERE i.stream_id = ? AND i.started_at < ? AND i.ended_at > ?" + clause,
+            (start_epoch, end_epoch, stream_id, end_epoch, start_epoch, *params),
+        ).fetchall()
+        return TimeMask.from_spans(
+            (int(row["clipped_start"]), int(row["clipped_end"])) for row in rows
+        )
+
+    def mask_for_view(self, view: View, start_epoch: int, end_epoch: int) -> TimeMask:
+        """The time mask a saved view implies over ``[start_epoch, end_epoch)``."""
+        stream = self.get_stream(view.source_stream_key)
+        if stream is None or stream.id is None:
+            raise LookupError(
+                f"view {view.key!r} references missing stream {view.source_stream_key!r}"
+            )
+        return self.active_windows(
+            stream.id, start_epoch, end_epoch, path_prefix=view.category_path
+        )
+
+    def masked_daily_totals_by_category(
+        self,
+        stream_id: int,
+        mask: TimeMask,
+        *,
+        start_bucket: str | None = None,
+        end_bucket: str | None = None,
+        path_prefix: str | None = None,
+    ) -> list[DailyCategoryTotal]:
+        """Seconds per (local day, category), restricted to ``mask``.
+
+        The masked analogue of :meth:`daily_totals_by_category`: reads raw
+        observations rather than the rollup table, since the rollup was
+        never bucketed with an arbitrary mask in mind. See
+        ``storage/masked.py``.
+        """
+        return masked.daily_totals_by_category(
+            self._conn,
+            stream_id,
+            mask,
+            start_bucket=start_bucket,
+            end_bucket=end_bucket,
+            path_prefix=path_prefix,
+        )
+
+    def masked_daily_event_counts_by_category(
+        self,
+        stream_id: int,
+        mask: TimeMask,
+        *,
+        start_bucket: str | None = None,
+        end_bucket: str | None = None,
+        path_prefix: str | None = None,
+    ) -> list[DailyCategoryTotal]:
+        """An event stream's masked count per (local day, category).
+
+        The masked analogue of :meth:`daily_totals_by_category`'s
+        record-count branch -- an interval stream's masked *seconds* come
+        from :meth:`masked_daily_totals_by_category` instead, since an
+        interval needs clipping rather than a membership test.
+        """
+        return masked.daily_event_counts_by_category(
+            self._conn,
+            stream_id,
+            mask,
+            start_bucket=start_bucket,
+            end_bucket=end_bucket,
+            path_prefix=path_prefix,
+        )
+
+    def masked_daily_field_totals_by_category(
+        self,
+        stream_id: int,
+        mask: TimeMask,
+        *,
+        field_id: int | None = None,
+        start_bucket: str | None = None,
+        end_bucket: str | None = None,
+        path_prefix: str | None = None,
+    ) -> list[DailyFieldTotal]:
+        """The masked analogue of :meth:`daily_field_totals_by_category`."""
+        return masked.daily_field_totals_by_category(
+            self._conn,
+            stream_id,
+            mask,
+            field_id=field_id,
+            start_bucket=start_bucket,
+            end_bucket=end_bucket,
+            path_prefix=path_prefix,
+        )
 
     # ------------------------------------------------------------------
     # Categories
@@ -733,7 +919,7 @@ class Repository:
         must appear when today is displayed, which is exactly how Timecard draws
         a midnight-crossing run as one block.
         """
-        clause, params = _prefix_clause(path_prefix)
+        clause, params = _sql.prefix_clause(path_prefix)
         rows = self._conn.execute(
             "SELECT i.id, i.stream_id, i.category_id, i.import_run_id, i.recorded_path,"
             "       i.started_at, i.ended_at, i.start_offset_seconds, i.end_offset_seconds,"
@@ -760,7 +946,7 @@ class Repository:
         range -- not just whole hours or days -- is exact. Rollups serve the
         bucket-aligned queries in :meth:`totals_by_period`.
         """
-        clause, params = _prefix_clause(path_prefix)
+        clause, params = _sql.prefix_clause(path_prefix)
         rows = self._conn.execute(
             "SELECT c.id AS category_id, c.path AS category_path,"
             "       SUM(MIN(i.ended_at, ?) - MAX(i.started_at, ?)) AS seconds,"
@@ -795,7 +981,7 @@ class Repository:
         Bucket keys are inclusive on both ends and compare as strings, which
         works because the key format sorts chronologically.
         """
-        clause, params = _prefix_clause(path_prefix)
+        clause, params = _sql.prefix_clause(path_prefix)
         bounds = ""
         bound_params: list[str] = []
         if start_bucket is not None:
@@ -840,7 +1026,7 @@ class Repository:
         Buckets are inclusive at both ends and compare as strings, which works
         because the key format sorts chronologically.
         """
-        clause, params = _prefix_clause(path_prefix)
+        clause, params = _sql.prefix_clause(path_prefix)
         bounds = ""
         bound_params: list[str] = []
         if start_bucket is not None:
@@ -892,7 +1078,7 @@ class Repository:
         one per row and averaging *those* would silently be the wrong number
         the moment two days have different counts.
         """
-        clause, params = _prefix_clause(path_prefix)
+        clause, params = _sql.prefix_clause(path_prefix)
         bounds = ""
         bound_params: list[str | int] = []
         if field_id is not None:
@@ -968,7 +1154,7 @@ class Repository:
         Contained, not overlapping, unlike :meth:`intervals_in_range`: a
         point-in-time observation has no span to spill across the boundary.
         """
-        clause, params = _prefix_clause(path_prefix)
+        clause, params = _sql.prefix_clause(path_prefix)
         rows = self._conn.execute(
             "SELECT e.id, e.stream_id, e.category_id, e.import_run_id, e.recorded_path,"
             "       e.occurred_at, e.offset_seconds, c.path AS category_path"
@@ -999,7 +1185,7 @@ class Repository:
         falls in ``[start, end)`` or it does not, so there is no clipped
         arithmetic to do.
         """
-        clause, params = _prefix_clause(path_prefix)
+        clause, params = _sql.prefix_clause(path_prefix)
         rows = self._conn.execute(
             "SELECT c.id AS category_id, c.path AS category_path, COUNT(*) AS record_count"
             " FROM event_record e JOIN category c ON c.id = e.category_id"
@@ -1055,26 +1241,6 @@ def _record_instant(record: Record) -> Instant:
     return record.start if isinstance(record, IntervalRecord) else record.at
 
 
-def _prefix_clause(path_prefix: str | None) -> tuple[str, tuple[str, ...]]:
-    """Restrict to a category and its descendants.
-
-    Matching is ``= prefix OR LIKE prefix || '/%'`` rather than a bare
-    ``LIKE prefix || '%'``, so ``media`` does not also match ``mediation``.
-    """
-    if path_prefix is None:
-        return "", ()
-    normalized = paths.normalize(path_prefix)
-    return " AND (c.path = ? OR c.path LIKE ? ESCAPE '\\')", (
-        normalized,
-        _escape_like(normalized) + "/%",
-    )
-
-
-def _escape_like(value: str) -> str:
-    """Neutralize LIKE wildcards in a category path used as a literal prefix."""
-    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-
-
 def _stream_from_row(row: sqlite3.Row) -> Stream:
     return Stream(
         id=int(row["id"]),
@@ -1084,6 +1250,16 @@ def _stream_from_row(row: sqlite3.Row) -> Stream:
         exclusive=bool(row["exclusive"]),
         watch_path=row["watch_path"],
         watch_enabled=bool(row["watch_enabled"]),
+    )
+
+
+def _view_from_row(row: sqlite3.Row) -> View:
+    return View(
+        id=int(row["id"]),
+        key=row["key"],
+        name=row["name"],
+        source_stream_key=row["source_stream_key"],
+        category_path=row["category_path"],
     )
 
 

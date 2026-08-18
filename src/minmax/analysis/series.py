@@ -19,6 +19,7 @@ from datetime import date
 from minmax.core import paths
 from minmax.core.measures import DailyValue, Measure, MeasureKind
 from minmax.core.models import DailyCategoryTotal, DailyFieldTotal, StreamKind
+from minmax.core.windows import TimeMask
 from minmax.storage.repository import Repository
 
 __all__ = ["SeriesLoader"]
@@ -37,15 +38,26 @@ class SeriesLoader:
     """Reads ``rollup``/``field_rollup`` on behalf of :class:`Measure`\\ s.
 
     ``since``/``until`` bound every query the same way, so a caller comparing
-    two measures over the same window only has to state it once.
+    two measures over the same window only has to state it once. ``mask``,
+    when given, restricts every stream read to a view's active windows --
+    see ``docs/architecture.md``'s decision D9. It comes in already built
+    (from ``api/client.py``, the one layer with a timezone to build one
+    with), so this module stays as free of environment access as the rest of
+    ``analysis``.
     """
 
     def __init__(
-        self, repository: Repository, *, since: date | None = None, until: date | None = None
+        self,
+        repository: Repository,
+        *,
+        since: date | None = None,
+        until: date | None = None,
+        mask: TimeMask | None = None,
     ) -> None:
         self._repository = repository
         self._since = since
         self._until = until
+        self._mask = mask
         self._cache: dict[str, _StreamDaily | None] = {}
 
     def daily(self, measure: Measure) -> list[DailyValue]:
@@ -152,23 +164,57 @@ class SeriesLoader:
         stream = self._repository.get_stream(stream_key)
         if stream is None or stream.id is None:
             return None
+        stream_id = stream.id
 
         start = self._since.isoformat() if self._since is not None else None
         end = self._until.isoformat() if self._until is not None else None
 
         by_day: dict[date, list[DailyCategoryTotal]] = {}
-        for total in self._repository.daily_totals_by_category(
-            stream.id, start_bucket=start, end_bucket=end
-        ):
+        for total in self._own_shape_rows(stream_id, stream.kind, start, end):
             by_day.setdefault(date.fromisoformat(total.bucket), []).append(total)
 
         fields_by_day: dict[date, list[DailyFieldTotal]] = {}
         if stream.kind is StreamKind.EVENT:
-            for field_total in self._repository.daily_field_totals_by_category(
-                stream.id, start_bucket=start, end_bucket=end
-            ):
+            for field_total in self._field_rows(stream_id, start, end):
                 fields_by_day.setdefault(date.fromisoformat(field_total.bucket), []).append(
                     field_total
                 )
 
         return _StreamDaily(kind=stream.kind, by_day=by_day, fields_by_day=fields_by_day)
+
+    def _own_shape_rows(
+        self, stream_id: int, kind: StreamKind, start: str | None, end: str | None
+    ) -> list[DailyCategoryTotal]:
+        """A stream's own-shape rows -- seconds for an interval stream, a
+        count for an event stream -- from the rollup table, or, under
+        :attr:`_mask`, from the masked substitutes (``storage/masked.py``)
+        instead. See ``docs/architecture.md``'s decision D9.
+        """
+        if self._mask is None:
+            return self._repository.daily_totals_by_category(
+                stream_id, start_bucket=start, end_bucket=end
+            )
+        if self._mask.is_empty():
+            return []
+        if kind is StreamKind.EVENT:
+            return self._repository.masked_daily_event_counts_by_category(
+                stream_id, self._mask, start_bucket=start, end_bucket=end
+            )
+        return self._repository.masked_daily_totals_by_category(
+            stream_id, self._mask, start_bucket=start, end_bucket=end
+        )
+
+    def _field_rows(
+        self, stream_id: int, start: str | None, end: str | None
+    ) -> list[DailyFieldTotal]:
+        """A declared numeric field's rows, masked the same way as
+        :meth:`_own_shape_rows`."""
+        if self._mask is None:
+            return self._repository.daily_field_totals_by_category(
+                stream_id, start_bucket=start, end_bucket=end
+            )
+        if self._mask.is_empty():
+            return []
+        return self._repository.masked_daily_field_totals_by_category(
+            stream_id, self._mask, start_bucket=start, end_bucket=end
+        )

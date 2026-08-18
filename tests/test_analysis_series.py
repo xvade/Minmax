@@ -14,10 +14,12 @@ from pathlib import Path
 
 import pytest
 
+from conftest import ViewFixture
 from minmax.analysis.series import SeriesLoader
 from minmax.core.measures import Aggregate, Measure, MeasureKind
 from minmax.core.models import EventRecord, FieldRole, FieldSpec, IntervalRecord, Stream, StreamKind
 from minmax.core.timeref import Instant
+from minmax.core.windows import TimeMask
 from minmax.storage.repository import Repository
 
 
@@ -349,3 +351,105 @@ class TestQueryCount:
             assert len(queries) == after_first_measure  # the second and third cost nothing new
         finally:
             repository.connection.set_trace_callback(None)
+
+
+class TestMasking:
+    """A view's mask, threaded through :class:`SeriesLoader`.
+
+    The storage-layer guarantees (``test_storage.py``'s
+    ``TestMaskedDailyTotals``/``TestMaskedDailyFieldTotals``) apply here too,
+    since this is the same masked reader, just reached through a
+    :class:`Measure` instead of directly. ``viewed_streams`` (``conftest.py``)
+    is the same fixture ``test_api.py``'s ``TestViews`` uses: ``timecard``'s
+    ``work`` category runs 08:00-10:00 and 13:00-15:00 on 2026-07-01, and
+    ``heart_rate`` has readings at 09:00, 10:00 (excluded, on the edge),
+    11:00 (excluded, in the gap), and 14:00.
+    """
+
+    def _full_day(self) -> TimeMask:
+        return TimeMask.from_spans(
+            [
+                (
+                    at("2026-07-01T00:00:00-07:00").epoch_seconds,
+                    at("2026-07-02T00:00:00-07:00").epoch_seconds,
+                )
+            ]
+        )
+
+    def _work_mask(self, repository: Repository) -> TimeMask:
+        view = repository.get_view("work-view")
+        assert view is not None
+        return repository.mask_for_view(
+            view,
+            at("2026-07-01T00:00:00-07:00").epoch_seconds,
+            at("2026-07-02T00:00:00-07:00").epoch_seconds,
+        )
+
+    def test_a_full_coverage_mask_matches_the_unmasked_loader(
+        self, repository: Repository, viewed_streams: ViewFixture
+    ) -> None:
+        measure = Measure(stream_key="app_usage", kind=MeasureKind.DURATION)
+        unmasked = SeriesLoader(repository).daily(measure)
+        masked = SeriesLoader(repository, mask=self._full_day()).daily(measure)
+        assert unmasked == masked
+        assert unmasked, "expected some values to compare"
+
+    def test_a_partial_mask_changes_a_field_measures_value(
+        self, repository: Repository, viewed_streams: ViewFixture
+    ) -> None:
+        measure = Measure(
+            stream_key="heart_rate",
+            kind=MeasureKind.FIELD,
+            field_key="bpm",
+            aggregate=Aggregate.MEAN,
+        )
+        [unmasked] = SeriesLoader(repository).daily(measure)
+        assert unmasked.total == 70.0 + 999.0 + 60.0 + 90.0
+        assert unmasked.weight == 4.0
+
+        [masked] = SeriesLoader(repository, mask=self._work_mask(repository)).daily(measure)
+        assert masked.total == 70.0 + 90.0  # the 10:00 edge and 11:00 gap readings are excluded
+        assert masked.weight == 2.0
+
+    def test_a_mask_restricts_a_count_measure_too(
+        self, repository: Repository, viewed_streams: ViewFixture
+    ) -> None:
+        measure = Measure(stream_key="heart_rate", kind=MeasureKind.COUNT)
+        [value] = SeriesLoader(repository, mask=self._work_mask(repository)).daily(measure)
+        assert value.total == 2.0
+
+    def test_a_mask_restricts_a_duration_measure_too(
+        self, repository: Repository, viewed_streams: ViewFixture
+    ) -> None:
+        # app_usage's one 09:00-14:00 run is clipped by the work mask into
+        # two pieces (09:00-10:00 and 13:00-14:00), summing to two hours --
+        # not the five hours the raw run spans.
+        measure = Measure(stream_key="app_usage", kind=MeasureKind.DURATION)
+        [value] = SeriesLoader(repository, mask=self._work_mask(repository)).daily(measure)
+        assert value.total == 2 * 3600
+
+    def test_an_empty_mask_yields_no_values(
+        self, repository: Repository, viewed_streams: ViewFixture
+    ) -> None:
+        measure = Measure(stream_key="heart_rate", kind=MeasureKind.COUNT)
+        values = SeriesLoader(repository, mask=TimeMask.from_spans([])).daily(measure)
+        assert values == []
+
+    def test_the_sweep_above_is_unaware_of_masking(
+        self, repository: Repository, viewed_streams: ViewFixture
+    ) -> None:
+        # periodic_values/align (sweep.py) only ever see DailyValues; a mask
+        # changes what SeriesLoader hands them, never how they combine it.
+        from minmax.analysis.sweep import periodic_values
+        from minmax.core.columns import Granularity, Interval
+
+        measure = Measure(stream_key="heart_rate", kind=MeasureKind.COUNT)
+        loader = SeriesLoader(repository, mask=self._work_mask(repository))
+        daily = loader.daily(measure)
+        periods = periodic_values(
+            measure,
+            daily,
+            Interval(Granularity.DAY),
+            active_days=loader.active_days("heart_rate"),
+        )
+        assert periods == {date(2026, 7, 1): 2.0}

@@ -191,6 +191,7 @@ class Timeline(QWidget):
         if geometry is None or self._window is None:
             return
 
+        self._paint_view_mask(painter, geometry)
         self._paint_hour_grid(painter, geometry)
         lo, hi = self._visible_block_range(event.rect().top(), event.rect().bottom())
         for block in self._blocks[lo:hi]:
@@ -199,6 +200,23 @@ class Timeline(QWidget):
         # run that crosses it, which is the whole point of not clipping there.
         self._paint_day_rules(painter, geometry)
         self._paint_selection(painter, lo, hi)
+
+    def _paint_view_mask(self, painter: QPainter, geometry: TimelineGeometry) -> None:
+        """Wash over the stretches a saved view was not active in.
+
+        Drawn first, under the grid and every block, so it never competes
+        with what is actually on screen -- see ``theme.excluded_time``.
+        """
+        if self._window is None:
+            return
+        appearance = self.palette()
+        tint = theme.excluded_time(appearance)
+        for start, end in _excluded_spans(self._window):
+            top = geometry.y_for_epoch(max(start, geometry.start_epoch))
+            bottom = geometry.y_for_epoch(min(end, geometry.end_epoch))
+            painter.fillRect(
+                QRectF(GUTTER_WIDTH, top, self.width() - GUTTER_WIDTH, bottom - top), tint
+            )
 
     def _paint_hour_grid(self, painter: QPainter, geometry: TimelineGeometry) -> None:
         if self._window is None:
@@ -574,6 +592,27 @@ class TimelinePane(QScrollArea):
             event.accept()
             return
         super().wheelEvent(event)
+
+
+def _excluded_spans(window: TimelineWindow) -> list[tuple[int, int]]:
+    """The gaps between ``window.active_spans``, bounded to the window itself.
+
+    Empty when no view is active (``window.view is None``) -- there is
+    nothing to shade over ordinary data. ``active_spans`` is already sorted
+    and disjoint (:class:`~minmax.core.windows.TimeMask`'s invariant), so a
+    single pass across it is enough.
+    """
+    if window.view is None:
+        return []
+    gaps: list[tuple[int, int]] = []
+    cursor = window.start_epoch
+    for start, end in window.active_spans:
+        if start > cursor:
+            gaps.append((cursor, start))
+        cursor = max(cursor, end)
+    if cursor < window.end_epoch:
+        gaps.append((cursor, window.end_epoch))
+    return gaps
 
 
 def _tooltip_text(record: TimelineRecord) -> str:

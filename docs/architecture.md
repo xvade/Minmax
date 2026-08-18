@@ -46,6 +46,8 @@ structurally enforce rather than merely intend.
    hand-edit the database.
 6. **Analysis reads aggregates, not raw rows,** wherever it can. This is the
    single decision that keeps the correlation engine fast as streams grow.
+   The one deliberate exception is a saved view, whose arbitrary time mask
+   the rollup table cannot answer — see [§7.2](#72-views-a-time-mask-applied-by-substitution).
 
 ## 3. Layer map
 
@@ -133,13 +135,18 @@ src/minmax/
 │   ├── columns.py   #   Grouping a date range into anchored chart columns (§8.2)
 │   ├── measures.py  #   Duration/count/field-aggregate abstraction (§7.1) — no Qt
 │   ├── palette.py   #   Validated categorical palette and slot assignment
-│   └── paths.py     #   Category path parsing, prefix matching, tree derivation
+│   ├── paths.py     #   Category path parsing, prefix matching, tree derivation
+│   └── windows.py   #   TimeMask: a sorted, disjoint set of epoch spans (§7.2)
 │
 ├── storage/         # Persistence. The only layer that knows SQL exists.
 │   ├── migrations/  #   NNNN_name.sql, applied in order; the schema's history
 │   ├── database.py  #   Connection setup, PRAGMAs, migration runner
 │   ├── repository.py#   The read/write API. Callers use this, never raw SQL.
-│   └── rollups.py   #   Aggregate maintenance (§7)
+│   ├── rollups.py   #   Aggregate maintenance (§7)
+│   ├── masked.py    #   Masked substitutes for the rollup readers, under a
+│   │                #   view's TimeMask (§7.2)
+│   └── _sql.py      #   Prefix-matching SQL clause, shared by repository.py
+│                    #   and masked.py
 │
 ├── ingest/          # Getting foreign data in. One module per source.
 │   ├── base.py      #   Importer protocol, ParseResult, the import pipeline
@@ -461,6 +468,53 @@ stream switch would be wasted work most of the time. Neither surface touched
 `api/client.trends()` or the rest of `ui/` at the time (see **D7**) — that
 stopped being true once the trends chart itself gained a field-metric
 selector (**D8**).
+
+### 7.2 Views: a time mask, applied by substitution
+
+A view (`core/models.py`'s `View`; migration `0007_views.sql`) is a saved
+restriction of every screen to the times a category was active elsewhere —
+"only heart rate readings while Timecard's `work` category was running."
+Unlike the `/` category-prefix filter, which narrows *which* categories of
+*one* stream are shown, a view narrows *when*, across every stream. See
+**D9** for the choice this section documents.
+
+The primitive is `core/windows.py`'s `TimeMask`: a sorted, disjoint set of
+half-open epoch spans, with `clip`/`contains`/`covered_seconds`. Nothing
+like it existed before -- every other range in Minmax is one contiguous
+`(start, end)` pair. `Repository.active_windows` builds one from an interval
+stream's raw rows (clipped exactly to the query bounds, the same clipping
+`totals_by_category` already does); `Repository.mask_for_view` resolves a
+saved `View` into one over an arbitrary span.
+
+**The mask restricts time; it does not compress it.** A day the view was
+never active on is still a real, navigable, empty day -- the excluded
+stretches simply have no data, the same way an ordinary quiet day does.
+`api/client.py`'s `DayView.active_spans` carries where the mask *was*
+active, so the timeline can shade the rest (`ui/timeline_view.py`'s
+`_paint_view_mask`) without claiming those moments did not occur.
+
+**Applying a mask means going back to raw rows.** Design principle 6
+("analysis reads aggregates, not raw rows") is in real tension here:
+`rollup` and `field_rollup` were bucketed at write time with no mask in
+mind, so they cannot answer an arbitrary one. `storage/masked.py` is the
+substitute -- `daily_totals_by_category`/`daily_event_counts_by_category`/
+`daily_field_totals_by_category`, one per raw observation table, each
+producing the *exact same row shape* its rollup-backed counterpart does.
+Day attribution reuses `timeref.split_by_local_period`, the same function
+`rollups.apply_intervals` uses to write the rollup table in the first
+place -- sharing it is what guarantees a full-coverage mask reproduces the
+rollup path exactly (the oracle in `tests/test_storage.py`'s
+`TestMaskedDailyTotals`). Every read site that can be masked picks between
+the rollup reader and the masked one on whether a view is active
+(`InProcessClient.trends`, `analysis.series.SeriesLoader._own_shape_rows`)
+-- nothing downstream (ranking, the "Other" fold, `periodic_values`/`align`)
+learns that the rows came from somewhere else.
+
+*Revisit if:* a masked correlation sweep gets slow on a large database --
+the rollup table's finest grain is the local hour, so an hour-aligned mask
+could get its own fast path, or a per-view rollup could be materialized.
+Neither is built today; one caller doing the raw-row fallback is not yet a
+pattern that justifies either.
 
 ## 8. The UI boundary
 
@@ -901,3 +955,45 @@ ranked and capped" shape `InProcessClient.trends()` just grew a bespoke
 version of — at that point factoring it out into something
 `SeriesLoader`-adjacent is worth doing. One caller doing it inline is not yet
 a pattern.
+
+### D9 — Views: a filter over calendar time, not a compressed one; new raw-row readers, not a masked rollup
+
+The feature ("show every screen as though the only data ever gathered was
+gathered while a category was running") had one pivotal ambiguity, resolved
+with the user before anything was built: **a view masks time, it does not
+compress it.** Real dates and clock times stay exactly where they are; the
+excluded stretches are simply empty, the same way an ordinary quiet day is.
+The alternative — stitching active windows into a gapless elapsed-time
+timeline — would have needed a second, non-calendar coordinate system
+through the day timeline, the hour grid, and the trends columns; masking
+needed none of that, only a primitive for "restrict to a set of spans"
+that had never existed ([§7.2](#72-views-a-time-mask-applied-by-substitution)).
+
+Two more decisions followed from exploring the codebase before building:
+
+**A view is a saved, named entity (`view` table, migration `0007`), not a
+session filter.** The request's own wording — "to start with, this feature
+will support basic interval stream based views" — implies more kinds later,
+which needs a row to hang them off. This is also why `View.category_path`
+is nullable rather than required: `None` means "any activity in the source
+stream at all," so a view can restrict to a whole stream's schedule, not
+only one category within it.
+
+**The masked reader is new raw-row SQL (`storage/masked.py`), not a masked
+rollup table.** `rollup`/`field_rollup` are bucketed at write time against
+the calendar, with no mask in mind, and a view's mask is arbitrary — the
+same reason `totals_by_category` already reads observations instead of
+rollups for an unaligned range. The alternative, a per-view materialized
+rollup, was rejected for the same reason D6 rejected building `Measure`
+before a second caller needed it: one caller (views) does not yet justify
+the write-path complexity of keeping a second aggregate table in sync.
+
+*Rejected:* extending `rollup` itself with a mask-aware column or a
+per-view rollup table — premature until a masked sweep is measurably slow
+(see [§7.2](#72-views-a-time-mask-applied-by-substitution)'s own revisit
+condition, which is the more specific version of this one).
+
+*Revisit if:* a second view kind is requested (built from an event stream's
+own timestamps, say, rather than an interval stream's category) — `View`
+has no `source_kind` discriminator today because only one kind exists to
+discriminate from.

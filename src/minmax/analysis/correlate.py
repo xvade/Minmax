@@ -27,6 +27,7 @@ from minmax.analysis.stats import PearsonResult, benjamini_hochberg, pearson
 from minmax.analysis.sweep import DEFAULT_SWEEP, align, periodic_values
 from minmax.core.columns import Granularity, Interval
 from minmax.core.measures import DailyValue, Measure
+from minmax.core.windows import TimeMask
 from minmax.storage.repository import Repository
 
 __all__ = ["MIN_DISTINCT_VALUES", "MIN_PERIODS", "correlate"]
@@ -72,6 +73,7 @@ def correlate(
     include_fields: bool = True,
     field_sum: bool = True,
     max_series: int = DEFAULT_MAX_SERIES,
+    mask: TimeMask | None = None,
 ) -> CorrelationReport:
     """Run a full correlation sweep and return a ranked report.
 
@@ -82,6 +84,11 @@ def correlate(
     (:func:`~minmax.analysis.stats.benjamini_hochberg`) is computed over all
     of that before any filtering happens, so narrowing what is displayed
     later can never change a q-value.
+
+    ``mask``, when given, restricts every measure's daily values to a
+    view's active windows (``docs/architecture.md``'s decision D9) -- built
+    by the caller, which has the timezone to build one with; this function
+    only ever hands it straight to :class:`~minmax.analysis.series.SeriesLoader`.
     """
     measures = candidate_measures(
         repository,
@@ -101,7 +108,7 @@ def correlate(
     )
     pairs = candidate_pairs(repository, measures)
 
-    loader = SeriesLoader(repository, since=since, until=until)
+    loader = SeriesLoader(repository, since=since, until=until, mask=mask)
     daily_cache: dict[str, list[DailyValue]] = {}
     active_cache: dict[str, frozenset[date]] = {}
     periodic_cache: dict[tuple[str, Interval], dict[date, float]] = {}

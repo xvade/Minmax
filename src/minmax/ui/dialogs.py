@@ -44,6 +44,7 @@ from minmax.api import (
     Granularity,
     Interval,
     StreamKind,
+    StreamSummary,
     validate_declaration,
 )
 from minmax.ui.shortcuts import SCOPE_TITLES, SCOPES, Action, ShortcutMap
@@ -52,6 +53,7 @@ __all__ = [
     "ALL_CATEGORIES",
     "IntervalDialog",
     "NewStreamDialog",
+    "NewViewDialog",
     "RangeDialog",
     "ShortcutsDialog",
     "prompt_for_prefix",
@@ -60,6 +62,10 @@ __all__ = [
 #: The first entry of the filter list, meaning "no filter". A sentinel rather
 #: than an empty string so it is impossible to confuse with a real path.
 ALL_CATEGORIES = "— all categories —"
+
+#: The first entry of a view's category combo, meaning "any activity in the
+#: source stream at all" -- View.category_path=None. Mirrors ALL_CATEGORIES.
+ANY_ACTIVITY = "— any activity —"
 
 
 def prompt_for_prefix(
@@ -521,10 +527,141 @@ class NewStreamDialog(QDialog):
         )
 
 
-def _slugify(text: str) -> str:
+def _slugify(text: str, *, fallback: str = "stream") -> str:
     slug = "".join(ch if ch.isalnum() else "_" for ch in text.strip().lower())
     slug = "_".join(part for part in slug.split("_") if part)
-    return slug or "stream"
+    return slug or fallback
+
+
+@dataclass(frozen=True, slots=True)
+class NewViewChoice:
+    """What :class:`NewViewDialog` returns once "Create" is pressed."""
+
+    key: str
+    name: str
+    source_stream_key: str
+    category_path: str | None
+
+
+class NewViewDialog(QDialog):
+    """Declare a new view: name it, pick its source interval stream, and
+    (optionally) restrict it to one category and its children.
+
+    Only interval streams are offered as a source -- a view is currently
+    built from when a category was *active*, which only an interval stream
+    records; see ``core/models.py``'s ``View`` docstring. ``category_paths``
+    is injected rather than reaching for the client directly, the same
+    reason :class:`NewStreamDialog` injects ``inspect`` -- this stays
+    constructible in a test without a real database behind it.
+    """
+
+    def __init__(
+        self,
+        parent: QWidget,
+        *,
+        existing_keys: Sequence[str],
+        streams: Sequence[StreamSummary],
+        category_paths: Callable[[str], Sequence[str]],
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("New view")
+        self._existing_keys = set(existing_keys)
+        self._streams = [s for s in streams if s.kind == StreamKind.INTERVAL]
+        self._category_paths = category_paths
+        self._key_edited_by_hand = False
+
+        self._name = QLineEdit()
+        self._name.setPlaceholderText("Work")
+        self._name.textEdited.connect(self._on_name_edited)
+        self._key = QLineEdit()
+        self._key.setPlaceholderText("work")
+        self._key.textEdited.connect(self._on_key_edited)
+
+        self._stream = QComboBox()
+        for stream in self._streams:
+            self._stream.addItem(stream.name, stream.key)
+        self._stream.currentIndexChanged.connect(self._on_stream_changed)
+
+        self._category = QComboBox()
+        self._category.currentIndexChanged.connect(self._update_ok_state)
+
+        form = QFormLayout()
+        form.addRow("Name", self._name)
+        form.addRow("Key", self._key)
+        form.addRow("Source stream", self._stream)
+        form.addRow("Category", self._category)
+
+        self._problem = QLabel()
+        self._problem.setWordWrap(True)
+        self._problem.hide()
+        if not self._streams:
+            self._problem.setText(
+                "No interval streams exist yet -- a view needs one to build a schedule from."
+            )
+            self._problem.show()
+
+        self._buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        self._buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Create")
+        self._buttons.accepted.connect(self.accept)
+        self._buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout()
+        layout.addLayout(form)
+        layout.addWidget(self._problem)
+        layout.addWidget(self._buttons)
+        self.setLayout(layout)
+
+        self._on_stream_changed(self._stream.currentIndex())
+
+    def _current_stream_key(self) -> str | None:
+        index = self._stream.currentIndex()
+        return self._streams[index].key if 0 <= index < len(self._streams) else None
+
+    def _on_stream_changed(self, _index: int) -> None:
+        self._category.blockSignals(True)
+        self._category.clear()
+        self._category.addItem(ANY_ACTIVITY)
+        stream_key = self._current_stream_key()
+        if stream_key is not None:
+            self._category.addItems(self._category_paths(stream_key))
+        self._category.blockSignals(False)
+        self._update_ok_state()
+
+    def _sync_key_from_name(self) -> None:
+        if not self._key_edited_by_hand:
+            self._key.setText(_slugify(self._name.text(), fallback="view"))
+
+    def _on_name_edited(self, _text: str) -> None:
+        self._sync_key_from_name()
+        self._update_ok_state()
+
+    def _on_key_edited(self, _text: str) -> None:
+        self._key_edited_by_hand = True
+        self._update_ok_state()
+
+    def _update_ok_state(self, *_args: object) -> None:
+        self._buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled(self._is_valid())
+
+    def _is_valid(self) -> bool:
+        if self._current_stream_key() is None:
+            return False
+        key = self._key.text().strip()
+        if not key or key in self._existing_keys:
+            return False
+        return bool(self._name.text().strip())
+
+    def selection(self) -> NewViewChoice:
+        stream_key = self._current_stream_key()
+        assert stream_key is not None
+        category = self._category.currentText()
+        return NewViewChoice(
+            key=self._key.text().strip(),
+            name=self._name.text().strip(),
+            source_stream_key=stream_key,
+            category_path=None if category in (ANY_ACTIVITY, "") else category,
+        )
 
 
 class ShortcutsDialog(QDialog):

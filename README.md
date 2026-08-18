@@ -157,6 +157,35 @@ heart_rate  (event)  2026-08-01 -> 2026-08-05
     number     BPM (bpm)
 ```
 
+### `minmax view`
+
+A view is a saved restriction of every other command (and every desktop
+screen) to the times a category was active in an interval stream — "only my
+heart rate readings while Timecard's `work` category was running." Unlike
+`--prefix`, which narrows which categories of *one* stream are shown, a view
+narrows *when*, across every stream.
+
+```
+$ minmax view add --key work --name Work --stream timecard --category work
+created view 'work': timecard/work
+$ minmax view list
+work  (timecard/work)  'Work'
+$ minmax totals --stream heart_rate --view work
+heart_rate  2026-06-05 -> 2026-08-05  view work
+    12h 04m   100.0%  heart_rate  (1,340)
+    12h 04m  total
+```
+
+`--category` is optional — omitted, the view means any activity at all in
+`--stream`. `minmax view delete --key work` removes it permanently, no
+confirmation beyond typing the key, the same as `stream delete`.
+
+A view masks time, it does not compress it: real dates and clock times stay
+where they are, and the excluded stretches are simply empty — a day the view
+was never active on is still a real, navigable day. `--view KEY` is
+available on `totals`, `day`, `periods` (day granularity only), `correlate`,
+and `ui`.
+
 ### `minmax status`
 
 Streams, how much they cover, and recent imports.
@@ -187,6 +216,8 @@ timecard  2026-06-05 -> 2026-08-05  under media
 - `--prefix` — restrict to a category and its descendants. Matching is
   component-wise, so `media` does not also match `mediation`.
 - `--limit` — rows to show.
+- `--view KEY` — restrict to the times a saved view was active; see
+  `minmax view`.
 
 Totals are computed from the observations themselves and clipped exactly to the
 requested range, so an arbitrary window is exact rather than rounded to whole
@@ -209,7 +240,11 @@ timecard  2026-08-04
 
 A run that crosses midnight stays a single record and is marked `<` or `>`
 rather than being split or clipped — the same way Timecard draws it as one
-block with the day boundary through it.
+block with the day boundary through it. Under `--view`, a record straddling
+a gap in the view's mask is split into the pieces that survive it, each
+printed on its own line.
+
+- `--view KEY` — restrict to the times a saved view was active.
 
 ### `minmax periods`
 
@@ -218,6 +253,9 @@ for both stream kinds: an interval stream's bar is a duration, a point-in-time
 stream's is a plain count (its rollup rows carry no duration to show).
 
 - `--period day|hour`, `--since`, `--until`, `--prefix`.
+- `--view KEY` — restrict to the times a saved view was active. Only
+  `--period day` supports this today; `--period hour` with `--view` is
+  refused.
 
 ### `minmax correlate`
 
@@ -272,6 +310,7 @@ either) causes the other.
 - `--interval UNIT[:COUNT][,...]` — test specific period lengths (e.g. `week:2,month`) instead of the built-in ladder.
 - `--min-periods` (default `8`), `--min-r` (default `0.5`), `--max-q`, `--top` (default `20`, `0` for no limit).
 - `--per-category`, `--no-fields`, `--no-field-sum`, `--all-intervals`, `--max-series` (default `40`).
+- `--view KEY` — restrict every series to the times a saved view was active.
 - `--json` for machine-readable output.
 
 Needs the `analysis` extra (`uv sync --extra analysis`) — scipy is optional,
@@ -337,6 +376,30 @@ If the file goes missing, or the merge itself fails (say it now conflicts
 with something already stored), you are asked once for a replacement; cancel
 and that stream's auto-fetch pauses rather than asking again every minute.
 This is a desktop-app feature only — it has no CLI equivalent today.
+
+#### Views
+
+A second picker, "View", sits beside the stream picker and lists "All data"
+plus every saved view (`minmax view`). Choosing one restricts the day
+timeline, the trends chart, and the correlations sweep all at once to the
+times the view's category was active — heart rate readings only while
+Timecard's `work` was running, say. `V` opens the picker, `Ctrl`+`Shift`+`N`
+declares a new view (name it, pick its source interval stream, and
+optionally a category — omitted, the view means any activity in that
+stream), and `Ctrl`+`Shift`+`Backspace` permanently deletes whichever view
+is currently active.
+
+Unlike the stream picker, a view is **not** reset by switching streams — it
+restricts *when*, which means the same thing regardless of which stream is
+on screen. On the day timeline, the stretches outside the view's active
+windows are shaded, faintly: those moments really did happen, they just have
+no data, so the shading is a reading aid rather than a claim that time was
+removed. A record straddling the edge of a view's window is drawn as the
+piece that survives it, same as `minmax day --view` does from the terminal.
+
+Deleting a stream that a view was built from deletes the view along with it;
+if that view was the active one, the window falls back to "All data" rather
+than being left pointing at something that no longer exists.
 
 #### The timeline
 
@@ -477,8 +540,10 @@ them.
 
 `1`, `2`, and `3` switch screens, `?` shows the list, `Ctrl`+`I` imports a
 file, `Ctrl`+`K` switches streams, and `Ctrl`+`N` declares a new one — all
-anywhere. The same key means different things on each screen because actions
-are scoped to the screen that owns them: `R` re-runs the sweep on the
+anywhere. `V` switches views, `Ctrl`+`Shift`+`N` declares a new one, and
+`Ctrl`+`Shift`+`Backspace` deletes whichever is active; see
+[Views](#views). The same key means different things on each screen because
+actions are scoped to the screen that owns them: `R` re-runs the sweep on the
 correlations screen, the same key that pins the trends range.
 
 `Ctrl`/`Cmd` + scroll zooms around the pointer rather than the centre.
@@ -494,6 +559,7 @@ The app follows the system light/dark appearance, since everything but the
 category colours is drawn from semantic system colours.
 
 - `--stream KEY` — which stream to show (default `timecard`).
+- `--view KEY` — open with this saved view already active.
 
 ### `minmax revert <import-id>`
 

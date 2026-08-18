@@ -26,6 +26,7 @@ from minmax.core.models import (
     implicit_category_path,
 )
 from minmax.core.timeref import Instant, Period
+from minmax.core.windows import TimeMask
 from minmax.storage import rollups
 from minmax.storage.database import migrate, open_database
 from minmax.storage.repository import OverlapError, Repository
@@ -1278,3 +1279,413 @@ class TestDailyFieldTotals:
         rollups.rebuild(repository.connection, heart_rate_stream.id)
         after = repository.daily_field_totals_by_category(heart_rate_stream.id)
         assert before == after
+
+
+class TestViews:
+    def test_creating_a_view_returns_it_with_a_normalized_path(
+        self, repository: Repository, stream: Stream
+    ) -> None:
+        view = repository.create_view(
+            "work-view", "Work", stream.key, category_path=" work / focus "
+        )
+        assert view.key == "work-view"
+        assert view.source_stream_key == stream.key
+        assert view.category_path == "work/focus"
+        assert view.id is not None
+
+    def test_a_view_with_no_category_means_any_activity(
+        self, repository: Repository, stream: Stream
+    ) -> None:
+        view = repository.create_view("all-timecard", "Timecard", stream.key)
+        assert view.category_path is None
+
+    def test_creating_a_view_on_a_duplicate_key_raises(
+        self, repository: Repository, stream: Stream
+    ) -> None:
+        repository.create_view("work-view", "Work", stream.key, category_path="work")
+        with pytest.raises(ValueError, match="already exists"):
+            repository.create_view("work-view", "Work again", stream.key, category_path="rest")
+
+    def test_creating_a_view_on_an_unknown_stream_raises(self, repository: Repository) -> None:
+        with pytest.raises(LookupError, match="no stream"):
+            repository.create_view("work-view", "Work", "nonexistent", category_path="work")
+
+    def test_creating_a_view_on_an_event_stream_raises(
+        self, repository: Repository, heart_rate_stream: Stream
+    ) -> None:
+        with pytest.raises(ValueError, match="interval stream"):
+            repository.create_view("hr-view", "Heart Rate", heart_rate_stream.key)
+
+    def test_get_view_of_an_unknown_key_is_none(self, repository: Repository) -> None:
+        assert repository.get_view("nonexistent") is None
+
+    def test_list_views_is_sorted_by_key(self, repository: Repository, stream: Stream) -> None:
+        repository.create_view("z-view", "Z", stream.key)
+        repository.create_view("a-view", "A", stream.key)
+        assert [v.key for v in repository.list_views()] == ["a-view", "z-view"]
+
+    def test_deleting_an_unknown_view_raises(self, repository: Repository) -> None:
+        with pytest.raises(LookupError, match="no view"):
+            repository.delete_view("nonexistent")
+
+    def test_deleting_a_view_returns_it_and_removes_it(
+        self, repository: Repository, stream: Stream
+    ) -> None:
+        repository.create_view("work-view", "Work", stream.key, category_path="work")
+        deleted = repository.delete_view("work-view")
+        assert deleted.key == "work-view"
+        assert repository.get_view("work-view") is None
+
+    def test_deleting_the_source_stream_cascades_the_view_away(
+        self, repository: Repository, connection: sqlite3.Connection, stream: Stream
+    ) -> None:
+        repository.create_view("work-view", "Work", stream.key, category_path="work")
+        repository.delete_stream(stream.key)
+        assert repository.list_views() == []
+        assert connection.execute("SELECT count(*) FROM view").fetchone()[0] == 0
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+class TestActiveWindows:
+    def test_back_to_back_runs_of_the_same_category_merge_into_one_window(
+        self, repository: Repository, stream: Stream, run_id: int
+    ) -> None:
+        assert stream.id is not None
+        repository.insert_intervals(
+            stream,
+            run_id,
+            [
+                record("work", "2026-08-01T08:00:00-07:00", "2026-08-01T10:00:00-07:00"),
+                record("work", "2026-08-01T10:00:00-07:00", "2026-08-01T12:00:00-07:00"),
+            ],
+        )
+        start = at("2026-08-01T00:00:00-07:00").epoch_seconds
+        end = at("2026-08-02T00:00:00-07:00").epoch_seconds
+        mask = repository.active_windows(stream.id, start, end, path_prefix="work")
+        assert mask.spans == (
+            (
+                at("2026-08-01T08:00:00-07:00").epoch_seconds,
+                at("2026-08-01T12:00:00-07:00").epoch_seconds,
+            ),
+        )
+
+    def test_a_run_outside_the_prefix_is_excluded(
+        self, repository: Repository, stream: Stream, run_id: int
+    ) -> None:
+        assert stream.id is not None
+        repository.insert_intervals(
+            stream,
+            run_id,
+            [
+                record("work", "2026-08-01T08:00:00-07:00", "2026-08-01T10:00:00-07:00"),
+                record("rest", "2026-08-01T10:00:00-07:00", "2026-08-01T12:00:00-07:00"),
+            ],
+        )
+        start = at("2026-08-01T00:00:00-07:00").epoch_seconds
+        end = at("2026-08-02T00:00:00-07:00").epoch_seconds
+        mask = repository.active_windows(stream.id, start, end, path_prefix="work")
+        assert mask.covered_seconds(start, end) == 2 * HOUR
+
+    def test_a_run_is_clipped_to_the_queried_bounds(
+        self, repository: Repository, stream: Stream, run_id: int
+    ) -> None:
+        assert stream.id is not None
+        # Straddles midnight; only the second day is queried.
+        repository.insert_intervals(
+            stream,
+            run_id,
+            [record("sleep/night", "2026-08-01T23:00:00-07:00", "2026-08-02T07:00:00-07:00")],
+        )
+        start = at("2026-08-02T00:00:00-07:00").epoch_seconds
+        end = at("2026-08-03T00:00:00-07:00").epoch_seconds
+        mask = repository.active_windows(stream.id, start, end, path_prefix="sleep")
+        assert mask.spans == ((start, at("2026-08-02T07:00:00-07:00").epoch_seconds),)
+
+
+class TestMaskedDailyTotals:
+    def test_a_full_coverage_mask_reproduces_the_rollup_reader_exactly(
+        self, repository: Repository, stream: Stream, run_id: int
+    ) -> None:
+        # The load-bearing guarantee: a mask spanning every local day boundary
+        # in the query exactly (no gaps) must produce the identical rows the
+        # rollup-backed reader does, since both attribute the same raw
+        # observations to local days via the same split_by_local_period call.
+        assert stream.id is not None
+        for day, hour in [(1, 9), (1, 14), (2, 8), (2, 17), (3, 10)]:
+            repository.insert_intervals(
+                stream,
+                run_id,
+                [
+                    record(
+                        "admin" if hour % 4 else "media/youtube",
+                        f"2026-08-0{day}T{hour:02d}:17:00-07:00",
+                        f"2026-08-0{day}T{hour + 1:02d}:43:00-07:00",
+                    )
+                ],
+            )
+        repository.insert_intervals(
+            stream,
+            run_id,
+            [record("sleep/night", "2026-08-02T22:00:00-07:00", "2026-08-03T06:30:00-07:00")],
+        )
+
+        start = at("2026-08-01T00:00:00-07:00").epoch_seconds
+        end = at("2026-08-05T00:00:00-07:00").epoch_seconds
+        full_mask = repository.active_windows(stream.id, start, end)
+
+        unmasked = sorted(
+            repository.daily_totals_by_category(
+                stream.id, start_bucket="2026-08-01", end_bucket="2026-08-04"
+            ),
+            key=lambda t: (t.bucket, t.category_path),
+        )
+        via_mask = sorted(
+            repository.masked_daily_totals_by_category(
+                stream.id, full_mask, start_bucket="2026-08-01", end_bucket="2026-08-04"
+            ),
+            key=lambda t: (t.bucket, t.category_path),
+        )
+        assert unmasked == via_mask
+        assert unmasked, "expected some rollup rows to compare"
+
+    def test_a_partial_mask_excludes_time_outside_its_windows(
+        self, repository: Repository, stream: Stream, run_id: int
+    ) -> None:
+        assert stream.id is not None
+        repository.insert_intervals(
+            stream,
+            run_id,
+            [
+                record("work", "2026-08-01T08:00:00-07:00", "2026-08-01T10:00:00-07:00"),
+                record("work", "2026-08-01T13:00:00-07:00", "2026-08-01T15:00:00-07:00"),
+                record("rest", "2026-08-01T10:00:00-07:00", "2026-08-01T13:00:00-07:00"),
+            ],
+        )
+        start = at("2026-08-01T00:00:00-07:00").epoch_seconds
+        end = at("2026-08-02T00:00:00-07:00").epoch_seconds
+        work_mask = repository.active_windows(stream.id, start, end, path_prefix="work")
+
+        totals = repository.masked_daily_totals_by_category(stream.id, work_mask)
+        by_path = {t.category_path: t for t in totals}
+        assert by_path.keys() == {"work"}
+        assert by_path["work"].seconds == 4 * HOUR
+        assert by_path["work"].record_count == 2
+
+    def test_a_run_straddling_a_mask_gap_splits_into_two_pieces(
+        self, repository: Repository, stream: Stream, run_id: int
+    ) -> None:
+        assert stream.id is not None
+        # One long "admin" run spans a mask window and the gap right after it;
+        # only the portion inside the mask should be attributed. The mask is
+        # built directly (rather than via active_windows on this same
+        # exclusive stream) since a mask's source is generally a *different*
+        # stream's category activity -- masked_daily_totals_by_category takes
+        # any TimeMask, whatever produced it.
+        repository.insert_intervals(
+            stream,
+            run_id,
+            [record("admin", "2026-08-01T09:00:00-07:00", "2026-08-01T11:00:00-07:00")],
+        )
+        window_end = at("2026-08-01T10:00:00-07:00").epoch_seconds
+        mask = TimeMask.from_spans([(at("2026-08-01T00:00:00-07:00").epoch_seconds, window_end)])
+
+        totals = repository.masked_daily_totals_by_category(stream.id, mask)
+        by_path = {t.category_path: t for t in totals}
+        assert by_path["admin"].seconds == HOUR  # only 09:00-10:00 survives
+
+    def test_a_midnight_crossing_run_clipped_mid_window_attributes_to_both_days(
+        self, repository: Repository, stream: Stream, run_id: int
+    ) -> None:
+        assert stream.id is not None
+        repository.insert_intervals(
+            stream,
+            run_id,
+            [record("sleep/night", "2026-08-01T23:00:00-07:00", "2026-08-02T07:00:00-07:00")],
+        )
+        # A mask covering the whole run, unclipped -- the same shape the
+        # oracle test relies on -- should split at local midnight exactly as
+        # the rollup table already does.
+        start = at("2026-08-01T00:00:00-07:00").epoch_seconds
+        end = at("2026-08-03T00:00:00-07:00").epoch_seconds
+        full_mask = repository.active_windows(stream.id, start, end)
+
+        totals = repository.masked_daily_totals_by_category(stream.id, full_mask)
+        by_bucket = {t.bucket: t.seconds for t in totals}
+        assert by_bucket["2026-08-01"] == HOUR
+        assert by_bucket["2026-08-02"] == 7 * HOUR
+
+    def test_an_empty_mask_yields_no_totals(
+        self, repository: Repository, stream: Stream, run_id: int
+    ) -> None:
+        assert stream.id is not None
+        repository.insert_intervals(
+            stream,
+            run_id,
+            [record("work", "2026-08-01T08:00:00-07:00", "2026-08-01T10:00:00-07:00")],
+        )
+        assert repository.masked_daily_totals_by_category(stream.id, TimeMask.from_spans([])) == []
+
+
+class TestMaskedDailyFieldTotals:
+    def test_a_full_coverage_mask_reproduces_the_rollup_reader_exactly(
+        self,
+        repository: Repository,
+        heart_rate_stream: Stream,
+        event_run_id: int,
+        stream: Stream,
+    ) -> None:
+        assert heart_rate_stream.id is not None
+        assert stream.id is not None
+        repository.insert_events(
+            heart_rate_stream,
+            event_run_id,
+            [
+                event("heart_rate", "2026-08-01T09:00:00-07:00", values={"bpm": 70.0}),
+                event("heart_rate", "2026-08-01T11:00:00-07:00", values={"bpm": 60.0}),
+                event("heart_rate", "2026-08-01T14:00:00-07:00", values={"bpm": 90.0}),
+            ],
+        )
+        # An activity stream whose coverage spans the whole day, so the mask
+        # excludes nothing -- the field-total analogue of the interval oracle.
+        start = at("2026-08-01T00:00:00-07:00").epoch_seconds
+        end = at("2026-08-02T00:00:00-07:00").epoch_seconds
+        run = repository.begin_import(
+            stream.id, importer="test", source_name="x", source_sha256="f" * 64, archived_path=None
+        )
+        repository.insert_intervals(
+            stream, run, [record("awake", "2026-08-01T00:00:00-07:00", "2026-08-02T00:00:00-07:00")]
+        )
+        full_mask = repository.active_windows(stream.id, start, end)
+
+        unmasked = sorted(
+            repository.daily_field_totals_by_category(heart_rate_stream.id),
+            key=lambda t: (t.bucket, t.category_path, t.field_key),
+        )
+        via_mask = sorted(
+            repository.masked_daily_field_totals_by_category(heart_rate_stream.id, full_mask),
+            key=lambda t: (t.bucket, t.category_path, t.field_key),
+        )
+        assert unmasked == via_mask
+        assert unmasked, "expected some field rollup rows to compare"
+
+    def test_a_partial_mask_excludes_a_straddling_reading(
+        self,
+        repository: Repository,
+        heart_rate_stream: Stream,
+        event_run_id: int,
+        stream: Stream,
+        run_id: int,
+    ) -> None:
+        assert heart_rate_stream.id is not None
+        assert stream.id is not None
+        repository.insert_events(
+            heart_rate_stream,
+            event_run_id,
+            [
+                event("heart_rate", "2026-08-01T09:00:00-07:00", values={"bpm": 70.0}),
+                event("heart_rate", "2026-08-01T11:00:00-07:00", values={"bpm": 60.0}),
+                event("heart_rate", "2026-08-01T14:00:00-07:00", values={"bpm": 90.0}),
+            ],
+        )
+        repository.insert_intervals(
+            stream,
+            run_id,
+            [
+                record("work", "2026-08-01T08:00:00-07:00", "2026-08-01T10:00:00-07:00"),
+                record("work", "2026-08-01T13:00:00-07:00", "2026-08-01T15:00:00-07:00"),
+            ],
+        )
+        start = at("2026-08-01T00:00:00-07:00").epoch_seconds
+        end = at("2026-08-02T00:00:00-07:00").epoch_seconds
+        work_mask = repository.active_windows(stream.id, start, end, path_prefix="work")
+
+        totals = repository.masked_daily_field_totals_by_category(heart_rate_stream.id, work_mask)
+        assert len(totals) == 1
+        assert totals[0].value_sum == 160.0  # 70 + 90; the 11:00 reading is outside work
+        assert totals[0].value_count == 2
+        assert totals[0].value_min == 70.0
+        assert totals[0].value_max == 90.0
+
+
+class TestMaskedDailyEventCounts:
+    """The event-count analogue of :class:`TestMaskedDailyTotals` -- an event
+    stream's masked column is a count, not clipped seconds."""
+
+    def test_a_full_coverage_mask_reproduces_the_rollup_reader_exactly(
+        self, repository: Repository, pickups_stream: Stream, stream: Stream, run_id: int
+    ) -> None:
+        assert pickups_stream.id is not None
+        assert stream.id is not None
+        run = repository.begin_import(
+            pickups_stream.id,
+            importer="test",
+            source_name="x",
+            source_sha256="c" * 64,
+            archived_path=None,
+        )
+        repository.insert_events(
+            pickups_stream,
+            run,
+            [
+                event("pickups", "2026-08-01T09:00:00-07:00"),
+                event("pickups", "2026-08-01T11:00:00-07:00"),
+                event("pickups", "2026-08-02T08:00:00-07:00"),
+            ],
+        )
+        repository.insert_intervals(
+            stream,
+            run_id,
+            [record("awake", "2026-08-01T00:00:00-07:00", "2026-08-03T00:00:00-07:00")],
+        )
+        start = at("2026-08-01T00:00:00-07:00").epoch_seconds
+        end = at("2026-08-03T00:00:00-07:00").epoch_seconds
+        full_mask = repository.active_windows(stream.id, start, end)
+
+        unmasked = sorted(
+            repository.daily_totals_by_category(pickups_stream.id),
+            key=lambda t: (t.bucket, t.category_path),
+        )
+        via_mask = sorted(
+            repository.masked_daily_event_counts_by_category(pickups_stream.id, full_mask),
+            key=lambda t: (t.bucket, t.category_path),
+        )
+        assert unmasked == via_mask
+        assert unmasked, "expected some rollup rows to compare"
+
+    def test_a_partial_mask_excludes_a_pickup_outside_the_window(
+        self,
+        repository: Repository,
+        pickups_stream: Stream,
+        stream: Stream,
+        run_id: int,
+    ) -> None:
+        assert pickups_stream.id is not None
+        assert stream.id is not None
+        run = repository.begin_import(
+            pickups_stream.id,
+            importer="test",
+            source_name="x",
+            source_sha256="d" * 64,
+            archived_path=None,
+        )
+        repository.insert_events(
+            pickups_stream,
+            run,
+            [
+                event("pickups", "2026-08-01T09:00:00-07:00"),
+                event("pickups", "2026-08-01T11:00:00-07:00"),
+            ],
+        )
+        repository.insert_intervals(
+            stream,
+            run_id,
+            [record("work", "2026-08-01T08:00:00-07:00", "2026-08-01T10:00:00-07:00")],
+        )
+        start = at("2026-08-01T00:00:00-07:00").epoch_seconds
+        end = at("2026-08-02T00:00:00-07:00").epoch_seconds
+        work_mask = repository.active_windows(stream.id, start, end, path_prefix="work")
+
+        totals = repository.masked_daily_event_counts_by_category(pickups_stream.id, work_mask)
+        assert len(totals) == 1
+        assert totals[0].record_count == 1
+        assert totals[0].seconds == 0

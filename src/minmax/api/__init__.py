@@ -32,6 +32,7 @@ from minmax.api.client import (
     TrendMetric,
     TrendSeries,
     TrendsView,
+    ViewSummary,
     other_breakdown,
     system_timezone,
 )
@@ -70,6 +71,7 @@ __all__ = [
     "TrendMetric",
     "TrendSeries",
     "TrendsView",
+    "ViewSummary",
     "format_duration",
     "format_value",
     "other_breakdown",

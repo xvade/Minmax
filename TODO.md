@@ -628,6 +628,112 @@ next.
     fields; the metric combo, `M`, the line-mode gap, and the legend's
     share-column drop in the GUI; the new count/sum caveat and the default
     `field_sum=True` in the correlation sweep, CLI and library both.
+- [x] Design and implement views: a saved restriction of every screen to the
+      times a category was active in an interval stream, so "what was my
+      heart rate while Timecard's `work` category was running" becomes
+      answerable. Requested by user 2026-08-06; planned and reviewed with the
+      user before building. Four decisions confirmed up front: a view masks
+      time rather than compressing it (real dates/clock times stay put, the
+      excluded stretches are simply empty -- "from the perspective of the
+      view, the other points in time still occurred, they just contain no
+      data," in the user's words); a view is a saved, named entity (a new
+      table + CRUD + CLI), not a session filter, since "to start with...
+      interval stream based views" implies more kinds later; the
+      correlations screen honours the active view too, since "every screen"
+      means every screen; a trends column's `day_count` stays calendar days
+      (a week is seven days whether or not the view touched all of them),
+      keeping a masked column comparable to an unmasked one.
+  - [x] `core/windows.py` (new): `TimeMask`, a sorted disjoint set of
+    half-open epoch spans (`from_spans`/`clip`/`contains`/`covered_seconds`).
+    Nothing like it existed before -- every other range in Minmax is one
+    contiguous `(start, end)` pair, and a view genuinely needs a *set* of
+    them (a category active in several separate windows on one day).
+  - [x] `core/models.py`: `View` (key, name, source stream key, nullable
+    category path -- `None` means any activity in the stream at all).
+    `storage/migrations/0007_views.sql`: the `view` table, `source_stream_id
+    REFERENCES stream (id) ON DELETE CASCADE` so deleting a stream deletes
+    the views built on it, the same cascade choice already made for every
+    other table that references `stream`.
+  - [x] `storage/_sql.py` (new): the category-prefix-matching SQL clause,
+    pulled out of `repository.py` so `storage/masked.py` (below) can reuse
+    it without the two modules matching a prefix two different ways.
+  - [x] `storage/masked.py` (new) + `Repository`: view CRUD
+    (`create_view`/`get_view`/`list_views`/`delete_view`); `active_windows`
+    (an interval stream's category activity, clipped to a range, as a
+    `TimeMask`) and `mask_for_view`; three masked substitutes for the
+    rollup-backed daily readers -- `masked_daily_totals_by_category`,
+    `masked_daily_event_counts_by_category`, and
+    `masked_daily_field_totals_by_category` -- since `rollup`/`field_rollup`
+    were bucketed at write time with no mask in mind and cannot answer an
+    arbitrary one (a real, documented exception to design principle 6; see
+    `docs/architecture.md` §7.2/D9). Day attribution reuses
+    `timeref.split_by_local_period`, the same function the rollup writer
+    itself uses -- sharing it is what guarantees a full-coverage mask
+    reproduces the rollup path exactly, the oracle
+    `tests/test_storage.py`'s `TestMaskedDailyTotals`/
+    `TestMaskedDailyFieldTotals`/`TestMaskedDailyEventCounts` assert.
+  - [x] `api/client.py`: every read method (`streams`, `bounds`, `day`,
+    `window`, `range_totals`, `trends`, `correlations`) gains a `view: str |
+    None` kwarg; new `views()`/`create_view()`/`delete_view()`. `day`/
+    `window`/`range_totals` clip already-fetched raw records to the mask in
+    Python rather than querying twice -- a record straddling a gap in the
+    mask yields several `TimelineRecord`s sharing one `id`, mirrored by
+    `cli.py`'s `day` command splitting a record into the pieces that
+    survive the mask, each on its own line. `DayView`/`TimelineWindow` gain
+    `active_spans` (where the mask was active, for shading) and every view
+    dataclass echoes back `view: str | None`. New `ViewSummary` transfer
+    object for a picker.
+  - [x] `analysis/series.py` (`SeriesLoader`) gains a `mask: TimeMask |
+    None` constructor kwarg, picking the masked reader over the rollup one
+    per stream kind; `analysis/correlate.py`'s `correlate()` gains a `mask`
+    kwarg threaded straight to it. Nothing above `SeriesLoader` (the sweep,
+    alignment, ranking) learns that the values came from somewhere else.
+  - [x] GUI: a second picker, "View", beside the stream picker, listing "All
+    data" plus every saved view. Global shortcuts `V` (switch), `Ctrl+Shift+N`
+    (new view, via a `NewViewDialog` mirroring `NewStreamDialog`'s
+    inject-dependencies/validate-before-OK/return-a-frozen-choice pattern),
+    and `Ctrl+Shift+Backspace` (delete the active one). Unlike the stream
+    picker's selection, a view is **not** reset by `set_stream` -- it
+    restricts *when*, which means the same thing regardless of which stream
+    is on screen. `ui/timeline_view.py`'s `_paint_view_mask` shades the
+    stretches outside the view's active windows, deliberately faintly (per
+    the mask-not-compress decision, those moments occurred and are honestly
+    empty, so this is a legibility aid, not a claim otherwise).
+    - A real ordering bug caught by a test, not by review:
+      `prompt_to_delete_stream` originally deleted the stream, then switched
+      to a remaining one, *then* cleared a dangling view -- but switching
+      streams first reloads with the about-to-be-cleared (already invalid)
+      view key still set, raising `LookupError` from inside a screen reload.
+      Fixed by clearing the dangling view's key directly on every screen
+      (no reload of its own) before the one reload that must see both the
+      new stream and the corrected view key at once.
+  - [x] `cli.py`: `minmax view add/list/delete`, and `--view KEY` on
+    `totals`, `day`, `periods` (day granularity only -- the masked readers
+    have no hourly attribution path today), `correlate`, and `ui`.
+  - [x] `docs/architecture.md`: new §7.2 and decision D9 (the mask-vs-
+    compress choice, the raw-row-vs-masked-rollup tension with design
+    principle 6, and the revisit conditions for both).
+  - [x] Tests: `TimeMask`'s own edge cases (touching spans merge, half-open
+    containment, clipping across a gap); the storage-layer oracle above; a
+    new `viewed_streams` fixture (`tests/conftest.py`) with a category active
+    in two separate windows on one day plus readings inside, outside,
+    exactly on a window's closing edge, and straddling the gap between
+    windows -- every existing fixture was too degenerate (single window) to
+    catch a clipping bug; API-level tests for every masked read path
+    including the record-splits-into-pieces-sharing-one-id behaviour and an
+    unknown view key raising `LookupError`; GUI tests for the picker, the
+    view surviving a stream switch, the dialog, and the delete/cascade
+    fallback to "All data"; CLI round trips for every `--view` flag.
+  - [ ] Deliberately not built, logged rather than silently dropped: time
+    compression/reflow (rejected up front, see the decisions above); a
+    second view kind built from an event stream's own timestamps rather
+    than an interval stream's category (`View` has no `source_kind`
+    discriminator yet); `--period hour --view` on the CLI, or an hourly
+    masked reader at all; a per-view materialized rollup (one caller does
+    not yet justify the write-path complexity); `category_paths` is not
+    itself view-restricted (a filter dialog offering a category that turns
+    out to have no data under the view is harmless, just occasionally
+    unhelpful).
 
 ---
 

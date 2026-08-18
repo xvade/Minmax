@@ -45,6 +45,8 @@ from minmax.core.columns import (
 from minmax.core.measures import Aggregate
 from minmax.core.models import (
     CategoryTotal,
+    DailyCategoryTotal,
+    DailyFieldTotal,
     EventCategoryTotal,
     FieldRole,
     FieldSpec,
@@ -53,10 +55,12 @@ from minmax.core.models import (
     Stream,
     StreamField,
     StreamKind,
+    View,
 )
 from minmax.core.palette import OTHER, Swatch, swatch_for_slot
 from minmax.core.timeline import hour_boundaries
-from minmax.core.timeref import local_day_bounds
+from minmax.core.timeref import Instant, local_day_bounds
+from minmax.core.windows import TimeMask
 from minmax.ingest import guess_fields, importer_for, read_sample, run_import
 from minmax.storage.repository import OverlapError, Repository
 
@@ -87,6 +91,7 @@ __all__ = [
     "TrendMetric",
     "TrendSeries",
     "TrendsView",
+    "ViewSummary",
     "other_breakdown",
     "system_timezone",
 ]
@@ -170,6 +175,27 @@ class StreamSummary:
     """The path :meth:`MinmaxClient.set_auto_fetch` last remembered, if any."""
     watch_enabled: bool = False
     """Whether this stream is re-imported from ``watch_path`` once a minute."""
+
+
+@dataclass(frozen=True, slots=True)
+class ViewSummary:
+    """A saved view, with enough about what it currently covers to show in a
+    picker without a second call per entry."""
+
+    key: str
+    name: str
+    source_stream_key: str
+    source_stream_name: str
+    category_path: str | None
+    covered_seconds: int
+    """How much of the source stream's own history the view's mask covers --
+    not how much of *this* view's target stream has data, which varies by
+    what is being looked at through it."""
+    window_count: int
+    """How many separate active spans the mask has, over the source
+    stream's whole history -- a rough sense of how fragmented the view is."""
+    first_day: date | None
+    last_day: date | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -289,6 +315,18 @@ class DayView:
     stream has no duration, so ``tracked_seconds`` is 0 for one and the count
     is what a reader wants instead."""
 
+    view: str | None = None
+    """The saved view restricting this day, if any -- echoed back so a
+    screen can title itself without holding the key separately."""
+
+    active_spans: tuple[tuple[int, int], ...] = ()
+    """Where :attr:`view` was active within ``[day_start_epoch,
+    day_end_epoch)``, for shading the stretches that were not. Always empty
+    when :attr:`view` is ``None`` -- but a view genuinely quiet all day is
+    *also* an empty tuple, so a renderer must check :attr:`view` itself to
+    tell "no view" from "view, inactive today," never infer it from this
+    alone."""
+
     @property
     def is_empty(self) -> bool:
         return not self.records
@@ -319,6 +357,12 @@ class TimelineWindow:
     days: list[DaySummary] = field(default_factory=list)
     prefix: str | None = None
     stream_kind: StreamKind = StreamKind.INTERVAL
+    view: str | None = None
+    """The saved view restricting this window, if any. See :attr:`DayView.view`."""
+
+    active_spans: tuple[tuple[int, int], ...] = ()
+    """Where :attr:`view` was active within ``[start_epoch, end_epoch)``.
+    See :attr:`DayView.active_spans`."""
 
     @property
     def is_empty(self) -> bool:
@@ -451,6 +495,9 @@ class TrendsView:
     columns: list[TrendColumn]
     series: list[TrendSeries] = field(default_factory=list)
     prefix: str | None = None
+    view: str | None = None
+    """The saved view restricting this chart, if any. See :attr:`DayView.view`."""
+
     interval: Interval = DAILY_INTERVAL
     """Always resolved -- its unit is never :attr:`~minmax.core.columns.Granularity.AUTO`."""
 
@@ -497,6 +544,8 @@ class RangeTotals:
     slices: list[CategorySlice] = field(default_factory=list)
     total_seconds: int = 0
     stream_kind: StreamKind = StreamKind.INTERVAL
+    view: str | None = None
+    """The saved view restricting this range, if any. See :attr:`DayView.view`."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -555,12 +604,24 @@ class CorrelationsView:
 class MinmaxClient(Protocol):
     """The whole surface the UI is permitted to use."""
 
-    def streams(self) -> list[StreamSummary]: ...
+    def streams(self, *, view: str | None = None) -> list[StreamSummary]: ...
 
-    def bounds(self, stream_key: str) -> tuple[date, date] | None:
-        """First and last local day with data, or None when the stream is empty."""
+    def bounds(self, stream_key: str, *, view: str | None = None) -> tuple[date, date] | None:
+        """First and last local day with data, or None when the stream is empty.
 
-    def day(self, stream_key: str, day: date, *, prefix: str | None = None) -> DayView: ...
+        Under a view, this is the first/last local day with data *surviving
+        the mask* -- a day the view was never active on does not count, even
+        if the stream itself recorded something that day.
+        """
+
+    def day(
+        self,
+        stream_key: str,
+        day: date,
+        *,
+        prefix: str | None = None,
+        view: str | None = None,
+    ) -> DayView: ...
 
     def window(
         self,
@@ -569,6 +630,7 @@ class MinmaxClient(Protocol):
         last_day: date,
         *,
         prefix: str | None = None,
+        view: str | None = None,
     ) -> TimelineWindow:
         """A run of consecutive local days, for the continuously scrolling timeline."""
 
@@ -579,6 +641,7 @@ class MinmaxClient(Protocol):
         until: date,
         *,
         prefix: str | None = None,
+        view: str | None = None,
     ) -> RangeTotals: ...
 
     def trends(
@@ -592,6 +655,7 @@ class MinmaxClient(Protocol):
         max_series: int = 8,
         field_key: str | None = None,
         aggregate: Aggregate = Aggregate.SUM,
+        view: str | None = None,
     ) -> TrendsView:
         """``field_key``/``aggregate`` select a metric other than the stream's
         own shape -- a declared numeric field's total or average rather than
@@ -603,6 +667,30 @@ class MinmaxClient(Protocol):
 
     def category_paths(self, stream_key: str) -> list[str]:
         """Every category path in the stream, sorted -- for filter completion."""
+
+    def views(self) -> list[ViewSummary]:
+        """Every saved view, sorted by key -- for a view picker."""
+
+    def create_view(
+        self,
+        key: str,
+        name: str,
+        source_stream_key: str,
+        *,
+        category_path: str | None = None,
+    ) -> ViewSummary:
+        """Save a new view, restricted to an interval stream's category (or,
+        with ``category_path=None``, any activity in that stream at all).
+
+        Raises ``ValueError`` if the key is already taken or
+        ``source_stream_key`` is not an interval stream, ``LookupError`` if
+        it names no stream at all.
+        """
+
+    def delete_view(self, key: str) -> None:
+        """Permanently delete a saved view. Raises ``LookupError`` for an
+        unknown key. A screen currently showing this view should fall back
+        to unfiltered data -- the view simply stops existing."""
 
     def import_file(self, path: Path, *, stream_key: str, force: bool = False) -> ImportOutcome:
         """Archive, parse, and store one source file, exactly as the CLI's
@@ -661,6 +749,7 @@ class MinmaxClient(Protocol):
         field_sum: bool = True,
         max_series: int = 40,
         all_intervals: bool = False,
+        view: str | None = None,
     ) -> CorrelationsView:
         """Sweep every candidate pair of series across every declared stream
         (or just ``stream_keys``) for a correlation, and return a ranked,
@@ -669,8 +758,9 @@ class MinmaxClient(Protocol):
         A thin, flattening wrapper over ``analysis.correlate`` -- see there
         for what every parameter actually controls (the sample-size and
         multiple-comparisons reasoning lives there, not here). ``sweep=None``
-        uses the engine's own default ladder of period lengths.
-        """
+        uses the engine's own default ladder of period lengths. ``view``
+        restricts every series read to the times the named view was active,
+        the same restriction :meth:`trends` applies to one chart."""
 
 
 # ----------------------------------------------------------------------
@@ -703,23 +793,41 @@ class InProcessClient:
 
     # -- streams ---------------------------------------------------------
 
-    def streams(self) -> list[StreamSummary]:
+    def streams(self, *, view: str | None = None) -> list[StreamSummary]:
         summaries: list[StreamSummary] = []
         for stream in self._repository.list_streams():
             assert stream.id is not None
-            bounds = self._repository.observed_range(stream.id)
+            observed = self._repository.observed_range(stream.id)
             record_count = 0
             tracked_seconds = 0
-            if bounds is not None:
-                if stream.kind is StreamKind.EVENT:
-                    counts = self._repository.counts_by_category(
-                        stream.id, bounds[0], bounds[1] + 1
-                    )
-                    record_count = sum(total.record_count for total in counts)
+            first_day: date | None = None
+            last_day: date | None = None
+            if observed is not None:
+                if view is None:
+                    if stream.kind is StreamKind.EVENT:
+                        counts = self._repository.counts_by_category(
+                            stream.id, observed[0], observed[1] + 1
+                        )
+                        record_count = sum(total.record_count for total in counts)
+                    else:
+                        totals = self._repository.totals_by_category(
+                            stream.id, observed[0], observed[1]
+                        )
+                        record_count = sum(total.record_count for total in totals)
+                        tracked_seconds = sum(total.seconds for total in totals)
+                    first_day = self._local_date(observed[0])
+                    last_day = self._local_date(observed[1])
                 else:
-                    totals = self._repository.totals_by_category(stream.id, bounds[0], bounds[1])
-                    record_count = sum(total.record_count for total in totals)
-                    tracked_seconds = sum(total.seconds for total in totals)
+                    mask = self._mask(view, observed[0], observed[1] + 1)
+                    if not mask.is_empty():
+                        rows = self._kind_daily_rows(stream, mask)
+                        record_count = sum(row.record_count for row in rows)
+                        if stream.kind is not StreamKind.EVENT:
+                            tracked_seconds = sum(row.seconds for row in rows)
+                        if rows:
+                            buckets = sorted(row.bucket for row in rows)
+                            first_day = date.fromisoformat(buckets[0])
+                            last_day = date.fromisoformat(buckets[-1])
             summaries.append(
                 StreamSummary(
                     key=stream.key,
@@ -728,35 +836,57 @@ class InProcessClient:
                     exclusive=stream.exclusive,
                     record_count=record_count,
                     tracked_seconds=tracked_seconds,
-                    first_day=self._local_date(bounds[0]) if bounds else None,
-                    last_day=self._local_date(bounds[1]) if bounds else None,
+                    first_day=first_day,
+                    last_day=last_day,
                     watch_path=stream.watch_path,
                     watch_enabled=stream.watch_enabled,
                 )
             )
         return summaries
 
-    def bounds(self, stream_key: str) -> tuple[date, date] | None:
-        stream_id = self._stream_id(stream_key)
-        observed = self._repository.observed_range(stream_id)
+    def bounds(self, stream_key: str, *, view: str | None = None) -> tuple[date, date] | None:
+        stream = self._require_stream(stream_key)
+        assert stream.id is not None
+        observed = self._repository.observed_range(stream.id)
         if observed is None:
             return None
-        return self._local_date(observed[0]), self._local_date(observed[1])
+        if view is None:
+            return self._local_date(observed[0]), self._local_date(observed[1])
+        mask = self._mask(view, observed[0], observed[1] + 1)
+        if mask.is_empty():
+            return None
+        rows = self._kind_daily_rows(stream, mask)
+        if not rows:
+            return None
+        buckets = sorted(row.bucket for row in rows)
+        return date.fromisoformat(buckets[0]), date.fromisoformat(buckets[-1])
 
-    # -- views -----------------------------------------------------------
+    # -- views (streams) --------------------------------------------------
 
-    def day(self, stream_key: str, day: date, *, prefix: str | None = None) -> DayView:
+    def day(
+        self,
+        stream_key: str,
+        day: date,
+        *,
+        prefix: str | None = None,
+        view: str | None = None,
+    ) -> DayView:
         stream = self._require_stream(stream_key)
         assert stream.id is not None
         start_epoch, end_epoch = local_day_bounds(day, self._tz)
+        mask = self._mask(view, start_epoch, end_epoch) if view is not None else None
 
         if stream.kind is StreamKind.EVENT:
             events = self._repository.events_in_range(
                 stream.id, start_epoch, end_epoch, path_prefix=prefix
             )
-            counts = self._repository.counts_by_category(
-                stream.id, start_epoch, end_epoch, path_prefix=prefix
-            )
+            if mask is not None:
+                events = _filter_events_to_mask(events, mask)
+                counts = _counts_from_filtered(events, start_epoch, end_epoch)
+            else:
+                counts = self._repository.counts_by_category(
+                    stream.id, start_epoch, end_epoch, path_prefix=prefix
+                )
             swatches = self._swatches_for(stream.id, (item.category_path for item in counts))
             total_count = sum(item.record_count for item in counts)
             records = self._events(events, swatches)
@@ -766,9 +896,13 @@ class InProcessClient:
             intervals = self._repository.intervals_in_range(
                 stream.id, start_epoch, end_epoch, path_prefix=prefix
             )
-            interval_totals = self._repository.totals_by_category(
-                stream.id, start_epoch, end_epoch, path_prefix=prefix
-            )
+            if mask is not None:
+                intervals = _clip_intervals_to_mask(intervals, mask)
+                interval_totals = _totals_from_clipped(intervals, start_epoch, end_epoch)
+            else:
+                interval_totals = self._repository.totals_by_category(
+                    stream.id, start_epoch, end_epoch, path_prefix=prefix
+                )
             swatches = self._swatches_for(
                 stream.id, (item.category_path for item in interval_totals)
             )
@@ -789,6 +923,8 @@ class InProcessClient:
             tracked_seconds=tracked,
             prefix=prefix,
             stream_kind=stream.kind,
+            view=view,
+            active_spans=tuple(mask.clip(start_epoch, end_epoch)) if mask is not None else (),
         )
 
     def window(
@@ -798,12 +934,15 @@ class InProcessClient:
         last_day: date,
         *,
         prefix: str | None = None,
+        view: str | None = None,
     ) -> TimelineWindow:
         """Consecutive local days as one continuous timeline.
 
         Fetched as a single span rather than day by day so that a run crossing
         midnight is one record with no seam, and so extending the window while
-        scrolling costs one query rather than one per day.
+        scrolling costs one query rather than one per day. Under a view this
+        also means the per-day loop below reshapes the window's own already-
+        masked records instead of issuing a further query per day.
         """
         if last_day < first_day:
             raise ValueError(f"window ends before it starts: {first_day} -> {last_day}")
@@ -813,17 +952,22 @@ class InProcessClient:
         day_count = (last_day - first_day).days + 1
         start_epoch, end_epoch = local_day_bounds(first_day, self._tz, days=day_count)
         is_event = stream.kind is StreamKind.EVENT
+        mask = self._mask(view, start_epoch, end_epoch) if view is not None else None
 
         if is_event:
             events = self._repository.events_in_range(
                 stream.id, start_epoch, end_epoch, path_prefix=prefix
             )
+            if mask is not None:
+                events = _filter_events_to_mask(events, mask)
             swatches = self._swatches_for(stream.id, (item.category_path for item in events))
             records = self._events(events, swatches)
         else:
             intervals = self._repository.intervals_in_range(
                 stream.id, start_epoch, end_epoch, path_prefix=prefix
             )
+            if mask is not None:
+                intervals = _clip_intervals_to_mask(intervals, mask)
             # One swatch lookup for the whole window: the colours must not
             # shift as the reader scrolls into a day where a group happens
             # not to appear.
@@ -836,15 +980,21 @@ class InProcessClient:
             moment = first_day + timedelta(days=offset)
             bounds = local_day_bounds(moment, self._tz)
             if is_event:
-                counts = self._repository.counts_by_category(
-                    stream.id, bounds[0], bounds[1], path_prefix=prefix
-                )
+                if mask is not None:
+                    counts = _counts_from_filtered(events, bounds[0], bounds[1])
+                else:
+                    counts = self._repository.counts_by_category(
+                        stream.id, bounds[0], bounds[1], path_prefix=prefix
+                    )
                 tracked = sum(total.record_count for total in counts)
                 day_totals = _event_slices(counts, swatches, tracked)
             else:
-                day_interval_totals = self._repository.totals_by_category(
-                    stream.id, bounds[0], bounds[1], path_prefix=prefix
-                )
+                if mask is not None:
+                    day_interval_totals = _totals_from_clipped(intervals, bounds[0], bounds[1])
+                else:
+                    day_interval_totals = self._repository.totals_by_category(
+                        stream.id, bounds[0], bounds[1], path_prefix=prefix
+                    )
                 tracked = sum(total.seconds for total in day_interval_totals)
                 day_totals = _slices(day_interval_totals, swatches, tracked)
             days.append(
@@ -874,6 +1024,8 @@ class InProcessClient:
             days=days,
             prefix=prefix,
             stream_kind=stream.kind,
+            view=view,
+            active_spans=tuple(mask.clip(start_epoch, end_epoch)) if mask is not None else (),
         )
 
     def range_totals(
@@ -883,6 +1035,7 @@ class InProcessClient:
         until: date,
         *,
         prefix: str | None = None,
+        view: str | None = None,
     ) -> RangeTotals:
         if until < since:
             raise ValueError(f"range ends before it starts: {since} -> {until}")
@@ -890,14 +1043,31 @@ class InProcessClient:
         stream = self._require_stream(stream_key)
         assert stream.id is not None
         start_epoch, end_epoch = local_day_bounds(since, self._tz, days=(until - since).days + 1)
+        mask = self._mask(view, start_epoch, end_epoch) if view is not None else None
 
         if stream.kind is StreamKind.EVENT:
-            counts = self._repository.counts_by_category(
-                stream.id, start_epoch, end_epoch, path_prefix=prefix
-            )
+            if mask is not None:
+                events = self._repository.events_in_range(
+                    stream.id, start_epoch, end_epoch, path_prefix=prefix
+                )
+                events = _filter_events_to_mask(events, mask)
+                counts = _counts_from_filtered(events, start_epoch, end_epoch)
+            else:
+                counts = self._repository.counts_by_category(
+                    stream.id, start_epoch, end_epoch, path_prefix=prefix
+                )
             swatches = self._swatches_for(stream.id, (total.category_path for total in counts))
             grand = sum(total.record_count for total in counts)
             slices = _event_slices(counts, swatches, grand)
+        elif mask is not None:
+            intervals = self._repository.intervals_in_range(
+                stream.id, start_epoch, end_epoch, path_prefix=prefix
+            )
+            intervals = _clip_intervals_to_mask(intervals, mask)
+            totals = _totals_from_clipped(intervals, start_epoch, end_epoch)
+            swatches = self._swatches_for(stream.id, (total.category_path for total in totals))
+            grand = sum(total.seconds for total in totals)
+            slices = _slices(totals, swatches, grand)
         else:
             totals = self._repository.totals_by_category(
                 stream.id, start_epoch, end_epoch, path_prefix=prefix
@@ -913,6 +1083,7 @@ class InProcessClient:
             slices=slices,
             total_seconds=grand,
             stream_kind=stream.kind,
+            view=view,
         )
 
     def trends(
@@ -926,6 +1097,7 @@ class InProcessClient:
         max_series: int = 8,
         field_key: str | None = None,
         aggregate: Aggregate = Aggregate.SUM,
+        view: str | None = None,
     ) -> TrendsView:
         """Composition over a range, as stacked series (or, for a mean
         metric, unstacked lines), one column per period.
@@ -934,7 +1106,9 @@ class InProcessClient:
         is proportional to (days x categories) instead of to everything ever
         recorded -- a year of history is a few thousand aggregate rows. Weekly
         and monthly columns are summed from those same daily rows, which is why
-        no second rollup period is needed to support them.
+        no second rollup period is needed to support them. Under a view the
+        rollup table cannot answer an arbitrary mask, so the masked readers
+        (``storage/masked.py``) take over instead -- see decision D9.
 
         ``prefix`` focuses on one group and splits it into its children, which
         is how per-timer detail is reached without ever putting more than
@@ -961,11 +1135,12 @@ class InProcessClient:
         metric_options = _metric_options(stream.kind, numeric_fields)
         metric, target_field = _resolve_metric(stream, numeric_fields, field_key, aggregate)
 
-        bounds = self.bounds(stream_key)
+        bounds = self.bounds(stream_key, view=view)
         if bounds is None:
             return TrendsView(
                 columns=[],
                 prefix=prefix,
+                view=view,
                 requested_interval=requested,
                 stream_kind=stream.kind,
                 metric=metric,
@@ -977,11 +1152,19 @@ class InProcessClient:
         if last_day < first_day:
             raise ValueError(f"range ends before it starts: {first_day} -> {last_day}")
 
+        mask = None
+        if view is not None:
+            mask_start, mask_end = local_day_bounds(
+                first_day, self._tz, days=(last_day - first_day).days + 1
+            )
+            mask = self._mask(view, mask_start, mask_end)
+
         grouping = columns_for(first_day, last_day, requested)
         columns = [_trend_column(column) for column in grouping]
         empty = TrendsView(
             columns=columns,
             prefix=prefix,
+            view=view,
             interval=grouping[0].interval,
             requested_interval=requested,
             since=first_day,
@@ -1007,12 +1190,31 @@ class InProcessClient:
             # across an event stream's buckets; see rollups.apply_events) is
             # what a column plots.
             is_event = stream.kind is StreamKind.EVENT
-            rows = self._repository.daily_totals_by_category(
-                stream_id,
-                start_bucket=first_day.isoformat(),
-                end_bucket=last_day.isoformat(),
-                path_prefix=prefix,
-            )
+            if mask is not None and mask.is_empty():
+                rows: Sequence[DailyCategoryTotal] = []
+            elif mask is not None and is_event:
+                rows = self._repository.masked_daily_event_counts_by_category(
+                    stream_id,
+                    mask,
+                    start_bucket=first_day.isoformat(),
+                    end_bucket=last_day.isoformat(),
+                    path_prefix=prefix,
+                )
+            elif mask is not None:
+                rows = self._repository.masked_daily_totals_by_category(
+                    stream_id,
+                    mask,
+                    start_bucket=first_day.isoformat(),
+                    end_bucket=last_day.isoformat(),
+                    path_prefix=prefix,
+                )
+            else:
+                rows = self._repository.daily_totals_by_category(
+                    stream_id,
+                    start_bucket=first_day.isoformat(),
+                    end_bucket=last_day.isoformat(),
+                    path_prefix=prefix,
+                )
             for row in rows:
                 index = column_of.get(row.bucket)
                 if index is None:
@@ -1024,13 +1226,25 @@ class InProcessClient:
                     drillable.add(key)
         else:
             assert target_field.id is not None  # returned by stream_fields(), always persisted
-            field_rows = self._repository.daily_field_totals_by_category(
-                stream_id,
-                field_id=target_field.id,
-                start_bucket=first_day.isoformat(),
-                end_bucket=last_day.isoformat(),
-                path_prefix=prefix,
-            )
+            if mask is not None and mask.is_empty():
+                field_rows: Sequence[DailyFieldTotal] = []
+            elif mask is not None:
+                field_rows = self._repository.masked_daily_field_totals_by_category(
+                    stream_id,
+                    mask,
+                    field_id=target_field.id,
+                    start_bucket=first_day.isoformat(),
+                    end_bucket=last_day.isoformat(),
+                    path_prefix=prefix,
+                )
+            else:
+                field_rows = self._repository.daily_field_totals_by_category(
+                    stream_id,
+                    field_id=target_field.id,
+                    start_bucket=first_day.isoformat(),
+                    end_bucket=last_day.isoformat(),
+                    path_prefix=prefix,
+                )
             for field_row in field_rows:
                 index = column_of.get(field_row.bucket)
                 if index is None:
@@ -1065,6 +1279,7 @@ class InProcessClient:
             columns=columns,
             series=series,
             prefix=prefix,
+            view=view,
             interval=grouping[0].interval,
             requested_interval=requested,
             since=first_day,
@@ -1079,6 +1294,54 @@ class InProcessClient:
     def category_paths(self, stream_key: str) -> list[str]:
         stream_id = self._stream_id(stream_key)
         return sorted(category.path for category in self._repository.list_categories(stream_id))
+
+    # -- views (saved) ------------------------------------------------------
+
+    def views(self) -> list[ViewSummary]:
+        return [self._view_summary(saved) for saved in self._repository.list_views()]
+
+    def create_view(
+        self,
+        key: str,
+        name: str,
+        source_stream_key: str,
+        *,
+        category_path: str | None = None,
+    ) -> ViewSummary:
+        saved = self._repository.create_view(
+            key, name, source_stream_key, category_path=category_path
+        )
+        return self._view_summary(saved)
+
+    def delete_view(self, key: str) -> None:
+        self._repository.delete_view(key)
+
+    def _view_summary(self, saved: View) -> ViewSummary:
+        source = self._repository.get_stream(saved.source_stream_key)
+        assert source is not None and source.id is not None
+        observed = self._repository.observed_range(source.id)
+        covered_seconds = 0
+        window_count = 0
+        first_day: date | None = None
+        last_day: date | None = None
+        if observed is not None:
+            mask = self._repository.mask_for_view(saved, observed[0], observed[1] + 1)
+            covered_seconds = mask.covered_seconds(observed[0], observed[1] + 1)
+            window_count = len(mask.spans)
+            if mask.spans:
+                first_day = self._local_date(mask.spans[0][0])
+                last_day = self._local_date(mask.spans[-1][1] - 1)
+        return ViewSummary(
+            key=saved.key,
+            name=saved.name,
+            source_stream_key=saved.source_stream_key,
+            source_stream_name=source.name,
+            category_path=saved.category_path,
+            covered_seconds=covered_seconds,
+            window_count=window_count,
+            first_day=first_day,
+            last_day=last_day,
+        )
 
     # -- declaring streams -------------------------------------------------
 
@@ -1182,7 +1445,26 @@ class InProcessClient:
         field_sum: bool = True,
         max_series: int = 40,
         all_intervals: bool = False,
+        view: str | None = None,
     ) -> CorrelationsView:
+        mask = None
+        if view is not None:
+            saved = self._repository.get_view(view)
+            if saved is None:
+                raise LookupError(f"no view {view!r}")
+            if since is not None and until is not None:
+                start_epoch, end_epoch = local_day_bounds(
+                    since, self._tz, days=(until - since).days + 1
+                )
+            else:
+                source = self._repository.get_stream(saved.source_stream_key)
+                assert source is not None and source.id is not None
+                observed = self._repository.observed_range(source.id)
+                start_epoch, end_epoch = (
+                    (0, 0) if observed is None else (observed[0], observed[1] + 1)
+                )
+            mask = self._repository.mask_for_view(saved, start_epoch, end_epoch)
+
         report = run_correlate(
             self._repository,
             stream_keys=stream_keys,
@@ -1197,6 +1479,7 @@ class InProcessClient:
             include_fields=include_fields,
             field_sum=field_sum,
             max_series=max_series,
+            mask=mask,
         )
 
         rows: list[CorrelationRow] = []
@@ -1252,6 +1535,29 @@ class InProcessClient:
 
     def _clock_label(self, epoch_seconds: int) -> str:
         return datetime.fromtimestamp(epoch_seconds, tz=self._tz).strftime("%H:%M")
+
+    def _mask(self, view: str, start_epoch: int, end_epoch: int) -> TimeMask:
+        """The time mask a saved view implies over ``[start_epoch, end_epoch)``.
+
+        Raises ``LookupError`` for an unknown view key -- the same failure
+        mode as an unknown stream key, since both name something a caller
+        should have gotten from :meth:`views`/:meth:`streams` in the first
+        place.
+        """
+        saved = self._repository.get_view(view)
+        if saved is None:
+            raise LookupError(f"no view {view!r}")
+        return self._repository.mask_for_view(saved, start_epoch, end_epoch)
+
+    def _kind_daily_rows(self, stream: Stream, mask: TimeMask) -> list[DailyCategoryTotal]:
+        """Masked per-(day, category) rows in the stream's own shape --
+        seconds for an interval stream, a count for an event stream -- the
+        masked analogue of what the ``rollup`` table carries for either kind.
+        """
+        assert stream.id is not None
+        if stream.kind is StreamKind.EVENT:
+            return self._repository.masked_daily_event_counts_by_category(stream.id, mask)
+        return self._repository.masked_daily_totals_by_category(stream.id, mask)
 
     def _records(
         self, intervals: Sequence[StoredInterval], swatches: dict[str, Swatch]
@@ -1627,6 +1933,98 @@ def _series_key(category_path: str, prefix: str | None) -> str:
     components = paths.components(category_path)
     depth = len(paths.components(prefix)) + 1 if prefix else 1
     return paths.SEPARATOR.join(components[:depth])
+
+
+def _clip_intervals_to_mask(
+    intervals: Sequence[StoredInterval], mask: TimeMask
+) -> list[StoredInterval]:
+    """Restrict every interval to the times a view's mask was active.
+
+    An interval straddling a gap in the mask yields several rows sharing one
+    ``id`` -- honest, since the recorded observation really is one thing, and
+    what lets a click on any of its surviving pieces highlight all of them.
+    Each piece keeps its parent's own start/end offset (matching how
+    ``storage/masked.py`` attributes a clipped piece to a local day), since a
+    piece born from clipping was never itself recorded with an offset of its
+    own.
+    """
+    clipped: list[StoredInterval] = []
+    for item in intervals:
+        for piece_start, piece_end in mask.clip(item.start.epoch_seconds, item.end.epoch_seconds):
+            clipped.append(
+                replace(
+                    item,
+                    start=Instant(piece_start, item.start.utc_offset_seconds),
+                    end=Instant(piece_end, item.end.utc_offset_seconds),
+                )
+            )
+    return clipped
+
+
+def _filter_events_to_mask(events: Sequence[StoredEvent], mask: TimeMask) -> list[StoredEvent]:
+    """An event either happened while a view's mask was active or it did not
+    -- there is no span to clip, only a membership test."""
+    return [item for item in events if mask.contains(item.at.epoch_seconds)]
+
+
+def _totals_from_clipped(
+    intervals: Sequence[StoredInterval], lo: int, hi: int
+) -> list[CategoryTotal]:
+    """Per-category seconds from an already mask-clipped interval list,
+    further clipped to ``[lo, hi)`` -- the masked substitute for
+    ``Repository.totals_by_category``, reused for both a whole window's
+    totals and one day's, so the per-day loop in :meth:`InProcessClient.window`
+    needs no further query once the window's records are in hand.
+
+    ``record_count`` counts distinct source rows touching ``[lo, hi)``, not
+    clipped pieces -- splitting a run at a mask gap must not inflate how many
+    observations a reader is told touched the category.
+    """
+    seconds: dict[int, int] = {}
+    category_paths: dict[int, str] = {}
+    ids: dict[int, set[int]] = {}
+    for item in intervals:
+        clipped_start = max(item.start.epoch_seconds, lo)
+        clipped_end = min(item.end.epoch_seconds, hi)
+        if clipped_end <= clipped_start:
+            continue
+        seconds[item.category_id] = seconds.get(item.category_id, 0) + (clipped_end - clipped_start)
+        category_paths[item.category_id] = item.category_path
+        ids.setdefault(item.category_id, set()).add(item.id)
+    entries = [
+        CategoryTotal(
+            category_id=category_id,
+            category_path=category_paths[category_id],
+            seconds=total_seconds,
+            record_count=len(ids[category_id]),
+        )
+        for category_id, total_seconds in seconds.items()
+    ]
+    entries.sort(key=lambda total: (-total.seconds, total.category_path))
+    return entries
+
+
+def _counts_from_filtered(
+    events: Sequence[StoredEvent], lo: int, hi: int
+) -> list[EventCategoryTotal]:
+    """The event analogue of :func:`_totals_from_clipped`: per-category
+    counts from an already mask-filtered event list, further restricted to
+    ``[lo, hi)``."""
+    counts: dict[int, int] = {}
+    category_paths: dict[int, str] = {}
+    for item in events:
+        if not (lo <= item.at.epoch_seconds < hi):
+            continue
+        counts[item.category_id] = counts.get(item.category_id, 0) + 1
+        category_paths[item.category_id] = item.category_path
+    entries = [
+        EventCategoryTotal(
+            category_id=category_id, category_path=category_paths[category_id], record_count=count
+        )
+        for category_id, count in counts.items()
+    ]
+    entries.sort(key=lambda total: (-total.record_count, total.category_path))
+    return entries
 
 
 def _slices(

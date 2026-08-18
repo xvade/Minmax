@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
+from conftest import ViewFixture
 from minmax.api import (
     Aggregate,
     CsvPreview,
@@ -988,3 +989,213 @@ class TestTrendMetrics:
         client = InProcessClient(repository, timezone=PACIFIC, home=home)
         with pytest.raises(ValueError, match="requires field_key"):
             client.trends("readings", aggregate=Aggregate.MEAN)
+
+
+class TestViews:
+    """A saved view restricts every read to the times its source category was
+    active -- see ``conftest.viewed_streams`` for the fixture's exact shape:
+    ``timecard``'s ``work`` category runs 08:00-10:00 and 13:00-15:00 on
+    2026-07-01, with a ``rest`` gap between them.
+    """
+
+    def test_creating_a_view_returns_a_summary(
+        self, repository: Repository, viewed_streams: ViewFixture, home: Path
+    ) -> None:
+        client = InProcessClient(repository, timezone=PACIFIC, home=home)
+        summary = client.create_view("all-timecard", "All Timecard", "timecard")
+        assert summary.key == "all-timecard"
+        assert summary.source_stream_key == "timecard"
+        assert summary.source_stream_name == "Timecard"
+        assert summary.category_path is None
+        assert summary.covered_seconds == 7 * HOUR  # 2h + 3h + 2h: both work windows plus rest
+
+    def test_creating_a_duplicate_view_key_raises(
+        self, repository: Repository, viewed_streams: ViewFixture, home: Path
+    ) -> None:
+        client = InProcessClient(repository, timezone=PACIFIC, home=home)
+        with pytest.raises(ValueError, match="already exists"):
+            client.create_view("work-view", "Again", "timecard", category_path="work")
+
+    def test_views_lists_what_was_created(
+        self, repository: Repository, viewed_streams: ViewFixture, home: Path
+    ) -> None:
+        client = InProcessClient(repository, timezone=PACIFIC, home=home)
+        [summary] = client.views()
+        assert summary.key == "work-view"
+        assert summary.category_path == "work"
+        assert summary.covered_seconds == 4 * HOUR  # 08:00-10:00 + 13:00-15:00, not the rest gap
+        assert summary.window_count == 2
+        assert summary.first_day == viewed_streams.day
+        assert summary.last_day == viewed_streams.day
+
+    def test_deleting_a_view_removes_it(
+        self, repository: Repository, viewed_streams: ViewFixture, home: Path
+    ) -> None:
+        client = InProcessClient(repository, timezone=PACIFIC, home=home)
+        client.delete_view("work-view")
+        assert client.views() == []
+
+    def test_day_excludes_readings_outside_the_masked_windows(
+        self, repository: Repository, viewed_streams: ViewFixture, home: Path
+    ) -> None:
+        client = InProcessClient(repository, timezone=PACIFIC, home=home)
+        view = client.day("heart_rate", viewed_streams.day, view="work-view")
+        assert view.view == "work-view"
+        assert [record.start_label for record in view.records] == ["09:00", "14:00"]
+        assert view.tracked_seconds == 2
+
+    def test_an_event_exactly_on_a_windows_closing_edge_is_excluded(
+        self, repository: Repository, viewed_streams: ViewFixture, home: Path
+    ) -> None:
+        # The reading at 10:00 sits exactly on the first work window's
+        # closing edge -- half-open, so it must not appear, the same
+        # convention Repository.events_in_range already uses.
+        client = InProcessClient(repository, timezone=PACIFIC, home=home)
+        view = client.day("heart_rate", viewed_streams.day, view="work-view")
+        assert "10:00" not in [record.start_label for record in view.records]
+
+    def test_a_record_straddling_the_gap_splits_into_two_pieces_sharing_one_id(
+        self, repository: Repository, viewed_streams: ViewFixture, home: Path
+    ) -> None:
+        client = InProcessClient(repository, timezone=PACIFIC, home=home)
+        view = client.day("app_usage", viewed_streams.day, view="work-view")
+        assert len(view.records) == 2
+        first, second = view.records
+        assert first.id == second.id
+        assert (first.start_label, first.end_label) == ("09:00", "10:00")
+        assert (second.start_label, second.end_label) == ("13:00", "14:00")
+        assert view.tracked_seconds == 2 * HOUR
+
+    def test_masking_a_streams_own_source_shows_exactly_its_active_windows(
+        self, repository: Repository, viewed_streams: ViewFixture, home: Path
+    ) -> None:
+        # A view built on timecard/work, applied back to timecard itself:
+        # only the work windows survive, and rest disappears entirely.
+        client = InProcessClient(repository, timezone=PACIFIC, home=home)
+        view = client.day("timecard", viewed_streams.day, view="work-view")
+        assert {record.category_path for record in view.records} == {"work"}
+        assert view.tracked_seconds == 4 * HOUR
+
+    def test_active_spans_are_empty_when_no_view_is_given(
+        self, repository: Repository, viewed_streams: ViewFixture, home: Path
+    ) -> None:
+        client = InProcessClient(repository, timezone=PACIFIC, home=home)
+        view = client.day("heart_rate", viewed_streams.day)
+        assert view.view is None
+        assert view.active_spans == ()
+
+    def test_active_spans_shade_the_two_windows(
+        self, repository: Repository, viewed_streams: ViewFixture, home: Path
+    ) -> None:
+        client = InProcessClient(repository, timezone=PACIFIC, home=home)
+        view = client.day("heart_rate", viewed_streams.day, view="work-view")
+        assert len(view.active_spans) == 2
+        assert sum(end - start for start, end in view.active_spans) == 4 * HOUR
+
+    def test_window_view_agrees_with_day_view_per_day(
+        self, repository: Repository, viewed_streams: ViewFixture, home: Path
+    ) -> None:
+        client = InProcessClient(repository, timezone=PACIFIC, home=home)
+        window = client.window(
+            "heart_rate", viewed_streams.day, viewed_streams.day, view="work-view"
+        )
+        assert len(window.records) == 2
+        [summary] = window.days
+        assert summary.tracked_seconds == 2
+
+    def test_range_totals_reflect_the_mask(
+        self, repository: Repository, viewed_streams: ViewFixture, home: Path
+    ) -> None:
+        client = InProcessClient(repository, timezone=PACIFIC, home=home)
+        totals = client.range_totals(
+            "heart_rate", viewed_streams.day, viewed_streams.day, view="work-view"
+        )
+        assert totals.view == "work-view"
+        [slice_] = totals.slices
+        assert slice_.record_count == 2
+
+    def test_trends_field_mean_is_value_weighted_over_the_masked_readings(
+        self, repository: Repository, viewed_streams: ViewFixture, home: Path
+    ) -> None:
+        client = InProcessClient(repository, timezone=PACIFIC, home=home)
+        view = client.trends(
+            "heart_rate",
+            field_key="bpm",
+            aggregate=Aggregate.MEAN,
+            since=viewed_streams.day,
+            until=viewed_streams.day,
+            view="work-view",
+        )
+        [series] = view.series
+        assert series.values == [160.0]  # 70 + 90; 999 and 60 excluded
+        assert series.weights == [2.0]
+
+    def test_trends_day_count_stays_calendar_days_under_a_view(
+        self, repository: Repository, viewed_streams: ViewFixture, home: Path
+    ) -> None:
+        # A trends column's day_count is unaffected by the mask -- a week is
+        # seven days whether or not the view was active every day of it.
+        client = InProcessClient(repository, timezone=PACIFIC, home=home)
+        view = client.trends(
+            "heart_rate",
+            since=viewed_streams.day,
+            until=viewed_streams.day,
+            view="work-view",
+        )
+        assert [column.day_count for column in view.columns] == [1]
+
+    def test_bounds_only_counts_days_surviving_the_mask(
+        self, repository: Repository, viewed_streams: ViewFixture, home: Path
+    ) -> None:
+        client = InProcessClient(repository, timezone=PACIFIC, home=home)
+        assert client.bounds("heart_rate", view="work-view") == (
+            viewed_streams.day,
+            viewed_streams.day,
+        )
+
+    def test_streams_reports_masked_counts(
+        self, repository: Repository, viewed_streams: ViewFixture, home: Path
+    ) -> None:
+        client = InProcessClient(repository, timezone=PACIFIC, home=home)
+        summaries = {s.key: s for s in client.streams(view="work-view")}
+        assert summaries["heart_rate"].record_count == 2
+        assert summaries["timecard"].tracked_seconds == 4 * HOUR
+
+    def test_an_unknown_view_key_raises(
+        self, repository: Repository, viewed_streams: ViewFixture, home: Path
+    ) -> None:
+        client = InProcessClient(repository, timezone=PACIFIC, home=home)
+        with pytest.raises(LookupError, match="no view"):
+            client.day("heart_rate", viewed_streams.day, view="nonexistent")
+
+    def test_a_view_whose_mask_is_empty_gives_empty_views_not_a_crash(
+        self, repository: Repository, viewed_streams: ViewFixture, home: Path
+    ) -> None:
+        client = InProcessClient(repository, timezone=PACIFIC, home=home)
+        client.create_view("never", "Never", "timecard", category_path="nonexistent")
+        view = client.day("heart_rate", viewed_streams.day, view="never")
+        assert view.records == []
+        assert view.active_spans == ()
+        assert client.bounds("heart_rate", view="never") is None
+
+    def test_correlations_accepts_a_view_without_crashing(
+        self, repository: Repository, viewed_streams: ViewFixture, home: Path
+    ) -> None:
+        # Statistics are re-tested nowhere here (test_analysis_series.py's
+        # TestMasking already pins down that SeriesLoader reads the masked
+        # values correctly); this just confirms the CorrelationsScreen path
+        # -- client.correlations(view=...) -- threads a mask all the way
+        # through the sweep instead of raising.
+        client = InProcessClient(repository, timezone=PACIFIC, home=home)
+        view = client.correlations(
+            stream_keys=["heart_rate", "app_usage"], view="work-view", min_periods=1
+        )
+        assert view.is_empty  # one masked day is not enough for any real test
+        assert view.skipped_notes
+
+    def test_correlations_with_an_unknown_view_raises(
+        self, repository: Repository, viewed_streams: ViewFixture, home: Path
+    ) -> None:
+        client = InProcessClient(repository, timezone=PACIFIC, home=home)
+        with pytest.raises(LookupError, match="no view"):
+            client.correlations(view="nonexistent")

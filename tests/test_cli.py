@@ -726,3 +726,240 @@ class TestCorrelateCommand:
             == 0
         )
         assert json.loads(capsys.readouterr().out)["series_count"] == 2
+
+
+class TestViewCommands:
+    """``imported`` (via ``sample_csv``) is one interval stream, ``timecard``,
+    with ``sleep/night`` running 2026-06-05 23:00-07:00 -> 2026-06-06 07:00-07:00
+    and three more runs after it on 2026-06-06 -- see ``timecard_sample.csv``."""
+
+    def test_view_add_creates_a_view(
+        self, imported: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        assert (
+            run(
+                imported,
+                "view",
+                "add",
+                "--key",
+                "sleep-view",
+                "--name",
+                "Sleep",
+                "--stream",
+                "timecard",
+                "--category",
+                "sleep",
+            )
+            == 0
+        )
+        out = capsys.readouterr().out
+        assert "sleep-view" in out
+        assert "timecard/sleep" in out
+
+    def test_view_add_with_no_category_means_any_activity(
+        self, imported: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        assert (
+            run(imported, "view", "add", "--key", "all", "--name", "All", "--stream", "timecard")
+            == 0
+        )
+        assert "any activity" in capsys.readouterr().out
+
+    def test_view_add_on_an_unknown_stream_fails_clearly(
+        self, imported: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        assert run(imported, "view", "add", "--key", "x", "--name", "X", "--stream", "fitbit") == 2
+        assert "no stream" in capsys.readouterr().err
+
+    def test_view_add_a_duplicate_key_fails_clearly(
+        self, imported: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        run(
+            imported,
+            "view",
+            "add",
+            "--key",
+            "sleep-view",
+            "--name",
+            "Sleep",
+            "--stream",
+            "timecard",
+        )
+        capsys.readouterr()
+        assert (
+            run(
+                imported,
+                "view",
+                "add",
+                "--key",
+                "sleep-view",
+                "--name",
+                "Again",
+                "--stream",
+                "timecard",
+            )
+            == 2
+        )
+        assert "already exists" in capsys.readouterr().err
+
+    def test_view_list_shows_every_saved_view(
+        self, imported: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        run(
+            imported,
+            "view",
+            "add",
+            "--key",
+            "sleep-view",
+            "--name",
+            "Sleep",
+            "--stream",
+            "timecard",
+        )
+        capsys.readouterr()
+        assert run(imported, "view", "list") == 0
+        assert "sleep-view" in capsys.readouterr().out
+
+    def test_view_list_on_an_empty_database_says_so(
+        self, imported: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        assert run(imported, "view", "list") == 0
+        assert "no views yet" in capsys.readouterr().out
+
+    def test_view_delete_removes_it(
+        self, imported: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        run(
+            imported,
+            "view",
+            "add",
+            "--key",
+            "sleep-view",
+            "--name",
+            "Sleep",
+            "--stream",
+            "timecard",
+        )
+        capsys.readouterr()
+        assert run(imported, "view", "delete", "--key", "sleep-view") == 0
+        assert "deleted view 'sleep-view'" in capsys.readouterr().out
+        run(imported, "view", "list")
+        assert "no views yet" in capsys.readouterr().out
+
+    def test_view_delete_an_unknown_key_fails_clearly(
+        self, imported: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        assert run(imported, "view", "delete", "--key", "nonexistent") == 2
+        assert "no view" in capsys.readouterr().err
+
+    def test_totals_narrows_under_a_view(
+        self, imported: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        run(
+            imported,
+            "view",
+            "add",
+            "--key",
+            "media-view",
+            "--name",
+            "Media",
+            "--stream",
+            "timecard",
+            "--category",
+            "media",
+        )
+        capsys.readouterr()
+
+        assert run(imported, "totals", "--stream", "timecard") == 0
+        unmasked = capsys.readouterr().out
+
+        assert run(imported, "totals", "--stream", "timecard", "--view", "media-view") == 0
+        masked = capsys.readouterr().out
+
+        assert "view media-view" in masked
+        assert "sleep/night" not in masked
+        assert "media/gaming/chess" in masked
+        assert "sleep/night" in unmasked
+
+    def test_totals_with_an_unknown_view_fails_clearly(
+        self, imported: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        assert run(imported, "totals", "--stream", "timecard", "--view", "nonexistent") == 2
+        assert "no view" in capsys.readouterr().err
+
+    def test_day_splits_a_record_straddling_the_masks_edge(
+        self, imported: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # sleep/night runs 23:00 (6/5) -> 07:00 (6/6); a view over just the
+        # first half of that hour range clips it rather than dropping it.
+        run(
+            imported,
+            "view",
+            "add",
+            "--key",
+            "morning",
+            "--name",
+            "Morning",
+            "--stream",
+            "timecard",
+            "--category",
+            "sleep",
+        )
+        capsys.readouterr()
+        assert run(imported, "day", "2026-06-06", "--stream", "timecard", "--view", "morning") == 0
+        out = capsys.readouterr().out
+        assert "sleep/night" in out
+        assert "view morning" in out
+
+    def test_periods_narrows_under_a_view(
+        self, imported: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        run(
+            imported,
+            "view",
+            "add",
+            "--key",
+            "media-view",
+            "--name",
+            "Media",
+            "--stream",
+            "timecard",
+            "--category",
+            "media",
+        )
+        capsys.readouterr()
+        assert run(imported, "periods", "--stream", "timecard", "--view", "media-view") == 0
+        out = capsys.readouterr().out
+        assert "2026-06-06" in out
+
+    def test_periods_hour_with_a_view_is_refused(
+        self, imported: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        run(
+            imported,
+            "view",
+            "add",
+            "--key",
+            "media-view",
+            "--name",
+            "Media",
+            "--stream",
+            "timecard",
+            "--category",
+            "media",
+        )
+        capsys.readouterr()
+        assert (
+            run(
+                imported,
+                "periods",
+                "--stream",
+                "timecard",
+                "--period",
+                "hour",
+                "--view",
+                "media-view",
+            )
+            == 2
+        )
+        assert "only supports --period day" in capsys.readouterr().err

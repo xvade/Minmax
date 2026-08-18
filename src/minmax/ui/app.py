@@ -22,6 +22,7 @@ def run(
     *,
     stream_key: str = "timecard",
     config_path: Path | None = None,
+    view_key: str | None = None,
 ) -> int:
     """Show the window and run the event loop until it closes.
 
@@ -30,11 +31,14 @@ def run(
 
     ``config_path`` is where remapped shortcuts live. It is passed in rather
     than computed here because working out the data directory is the storage
-    layer's job, and the UI is not permitted to ask it.
+    layer's job, and the UI is not permitted to ask it. ``view_key``, when
+    given, must already be a real view -- the caller (``cli.py``'s
+    ``cmd_ui``) checks that before this ever constructs a window, since a bad
+    key here would raise while building it rather than failing cleanly.
     """
     app = QApplication.instance() or QApplication([])
 
-    window = MainWindow(client, stream_key=stream_key, config_path=config_path)
+    window = MainWindow(client, stream_key=stream_key, config_path=config_path, view_key=view_key)
     window.show()
     window.raise_()
     window.activateWindow()

@@ -37,6 +37,7 @@ __all__ = [
     "Stream",
     "StreamField",
     "StreamKind",
+    "View",
     "implicit_category_path",
 ]
 
@@ -83,6 +84,30 @@ class Stream:
     ``watch_enabled``. Remembered per stream so auto-fetch survives a
     restart; see ``docs/architecture.md`` §6.2."""
     watch_enabled: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class View:
+    """A saved restriction of every screen to the times one category was active.
+
+    ``source_stream_key`` must name an interval stream -- the first (and, for
+    now, only) kind of view is built from when a category was running, which
+    only an interval stream records. ``category_path`` of ``None`` means any
+    activity in the source stream at all, matching the same convention
+    :class:`~minmax.core.measures.Measure`'s ``category_path`` already uses;
+    a path restricts to that category and everything under it, the same
+    prefix rule ``storage.repository``'s ``path_prefix`` queries use.
+
+    The view masks time, it does not compress it: from its perspective every
+    other moment still occurred, it simply gathered no data -- see
+    ``docs/architecture.md``'s decision D9.
+    """
+
+    key: str
+    name: str
+    source_stream_key: str
+    category_path: str | None = None
+    id: int | None = None
 
 
 @dataclass(frozen=True, slots=True)

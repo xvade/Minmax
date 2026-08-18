@@ -2020,3 +2020,268 @@ class TestOtherBreakdown:
         screen.cycle_interval()  # any action that ends in reload()
         assert screen._other_stack == []
         assert any(s.is_other for s in screen._view.series)
+
+
+class TestViewPicker:
+    """``window`` (via ``sample_csv``) has one interval stream, ``timecard``,
+    with ``sleep/night`` running 2026-06-05 23:00-07:00 and ``media/gaming/chess``
+    running 2026-06-06 07:11:19-08:00 -- see ``timecard_sample.csv``."""
+
+    def test_the_picker_starts_with_only_all_data(self, window: MainWindow) -> None:
+        assert window._view_picker.count() == 1
+        assert window._view_picker.currentText() == "All data"
+        assert window._view_picker.currentData() == ""
+
+    def test_a_view_appears_after_creation(self, window: MainWindow) -> None:
+        window._client.create_view("media-view", "Media", "timecard", category_path="media")
+        window._refresh_view_picker()
+        assert window._view_picker.count() == 2
+        assert {window._view_picker.itemData(i) for i in range(window._view_picker.count())} == {
+            "",
+            "media-view",
+        }
+        # Refreshing must not silently switch the reader away from "All data".
+        assert window._view_picker.currentData() == ""
+
+    def test_switching_views_restricts_every_screen(self, window: MainWindow) -> None:
+        window._client.create_view("media-view", "Media", "timecard", category_path="media")
+        window._refresh_view_picker()
+
+        window.set_view("media-view")
+
+        assert window._view_key == "media-view"
+        assert window.day_screen.view_key == "media-view"
+        assert window.trends_screen.view_key == "media-view"
+        assert window.correlations_screen.view_key == "media-view"
+        assert window._view_picker.currentData() == "media-view"
+
+        loaded = window.day_screen.pane.timeline.window_view
+        assert loaded is not None
+        assert [r.category_path for r in loaded.records] == ["media/gaming/chess"]
+
+    def test_picking_the_same_view_again_is_a_no_op(self, window: MainWindow) -> None:
+        window.set_view(None)
+        assert window._view_key is None
+
+    def test_prompt_for_view_opens_the_pickers_popup(
+        self, monkeypatch: pytest.MonkeyPatch, window: MainWindow
+    ) -> None:
+        opened = []
+        monkeypatch.setattr(window._view_picker, "showPopup", lambda: opened.append(True))
+        window.prompt_for_view()
+        assert opened == [True]
+
+    def test_the_view_survives_a_stream_switch(self, window: MainWindow) -> None:
+        # Unlike the category filter, a view restricts time -- it describes
+        # nothing about which stream is on screen, so switching streams must
+        # not silently drop it the way set_stream drops the filter/drill-down.
+        window._client.create_stream("pickups", "Pickups", StreamKind.EVENT)
+        window._client.create_view("media-view", "Media", "timecard", category_path="media")
+        window.set_view("media-view")
+
+        window.set_stream("pickups")
+
+        assert window._view_key == "media-view"
+        assert window.day_screen.view_key == "media-view"
+        assert window.trends_screen.view_key == "media-view"
+
+
+class TestNewViewDialog:
+    """The dialog itself, exercised directly."""
+
+    def _dialog(self, window: MainWindow, existing: list[str] | None = None) -> object:
+        from minmax.ui.dialogs import NewViewDialog
+
+        return NewViewDialog(
+            window,
+            existing_keys=existing or [],
+            streams=window._client.streams(),
+            category_paths=window._client.category_paths,
+        )
+
+    def test_only_interval_streams_are_offered(self, window: MainWindow) -> None:
+        window._client.create_stream("pickups", "Pickups", StreamKind.EVENT)
+        dialog = self._dialog(window)
+        assert [dialog._stream.itemText(i) for i in range(dialog._stream.count())] == ["Timecard"]
+
+    def test_the_category_combo_starts_with_any_activity(self, window: MainWindow) -> None:
+        from minmax.ui.dialogs import ANY_ACTIVITY
+
+        dialog = self._dialog(window)
+        assert dialog._category.itemText(0) == ANY_ACTIVITY
+        assert "media/gaming/chess" in [
+            dialog._category.itemText(i) for i in range(dialog._category.count())
+        ]
+
+    def test_is_invalid_until_a_name_and_key_are_set(self, window: MainWindow) -> None:
+        dialog = self._dialog(window)
+        assert not dialog._is_valid()
+        dialog._name.setText("Media")
+        dialog._sync_key_from_name()
+        assert dialog._is_valid()
+
+    def test_a_key_already_taken_is_rejected(self, window: MainWindow) -> None:
+        dialog = self._dialog(window, existing=["media"])
+        dialog._name.setText("Media")
+        dialog._sync_key_from_name()
+        assert dialog._key.text() == "media"
+        assert not dialog._is_valid()
+
+    def test_selection_with_any_activity_has_no_category_path(self, window: MainWindow) -> None:
+        dialog = self._dialog(window)
+        dialog._name.setText("All Timecard")
+        dialog._sync_key_from_name()
+        choice = dialog.selection()
+        assert choice.source_stream_key == "timecard"
+        assert choice.category_path is None
+
+    def test_selection_with_a_chosen_category(self, window: MainWindow) -> None:
+        dialog = self._dialog(window)
+        dialog._name.setText("Media")
+        dialog._sync_key_from_name()
+        index = dialog._category.findText("media/gaming/chess")
+        dialog._category.setCurrentIndex(index)
+        choice = dialog.selection()
+        assert choice.category_path == "media/gaming/chess"
+
+    def test_no_interval_streams_shows_a_problem_and_stays_invalid(
+        self, window: MainWindow
+    ) -> None:
+        from minmax.core.models import StreamKind as CoreStreamKind
+
+        window._client.delete_stream("timecard")
+        window._client.create_stream("pickups", "Pickups", CoreStreamKind.EVENT)
+        dialog = self._dialog(window)
+        dialog._name.setText("Anything")
+        dialog._sync_key_from_name()
+        assert not dialog._problem.isHidden()
+        assert not dialog._is_valid()
+
+
+class TestPromptForNewView:
+    """``MainWindow.prompt_for_new_view`` end to end, with the dialog itself
+    swapped out."""
+
+    def test_creating_a_view_switches_to_it(
+        self, monkeypatch: pytest.MonkeyPatch, window: MainWindow
+    ) -> None:
+        from minmax.ui.dialogs import NewViewChoice, NewViewDialog
+
+        choice = NewViewChoice(
+            key="media-view", name="Media", source_stream_key="timecard", category_path="media"
+        )
+        monkeypatch.setattr(NewViewDialog, "exec", lambda self: 1)
+        monkeypatch.setattr(NewViewDialog, "selection", lambda self: choice)
+
+        window.prompt_for_new_view()
+
+        assert window._view_key == "media-view"
+        assert {v.key for v in window._client.views()} == {"media-view"}
+
+    def test_a_duplicate_key_warns_without_switching(
+        self, monkeypatch: pytest.MonkeyPatch, window: MainWindow
+    ) -> None:
+        from minmax.ui.dialogs import NewViewChoice, NewViewDialog
+
+        window._client.create_view("media-view", "Media", "timecard", category_path="media")
+        choice = NewViewChoice(
+            key="media-view", name="Again", source_stream_key="timecard", category_path=None
+        )
+        monkeypatch.setattr(NewViewDialog, "exec", lambda self: 1)
+        monkeypatch.setattr(NewViewDialog, "selection", lambda self: choice)
+        warnings: list[tuple[object, ...]] = []
+        monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: warnings.append(a))
+
+        window.prompt_for_new_view()
+
+        assert len(warnings) == 1
+        assert "already exists" in warnings[0][-1]
+        assert window._view_key is None
+
+
+class TestPromptToDeleteView:
+    def test_warns_when_no_view_is_active(
+        self, monkeypatch: pytest.MonkeyPatch, window: MainWindow
+    ) -> None:
+        informed: list[tuple[object, ...]] = []
+        monkeypatch.setattr(QMessageBox, "information", lambda *a, **k: informed.append(a))
+
+        window.prompt_to_delete_view()
+
+        assert len(informed) == 1
+
+    def test_cancelling_the_confirmation_deletes_nothing(
+        self, monkeypatch: pytest.MonkeyPatch, window: MainWindow
+    ) -> None:
+        window._client.create_view("media-view", "Media", "timecard", category_path="media")
+        window.set_view("media-view")
+        monkeypatch.setattr(
+            QMessageBox, "warning", lambda *a, **k: QMessageBox.StandardButton.Cancel
+        )
+
+        window.prompt_to_delete_view()
+
+        assert {v.key for v in window._client.views()} == {"media-view"}
+        assert window._view_key == "media-view"
+
+    def test_confirming_deletes_and_falls_back_to_all_data(
+        self, monkeypatch: pytest.MonkeyPatch, window: MainWindow
+    ) -> None:
+        window._client.create_view("media-view", "Media", "timecard", category_path="media")
+        window.set_view("media-view")
+        monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: QMessageBox.StandardButton.Yes)
+
+        window.prompt_to_delete_view()
+
+        assert window._client.views() == []
+        assert window._view_key is None
+        assert window.day_screen.view_key is None
+        assert window._view_picker.currentData() == ""
+
+    def test_deleting_the_source_stream_falls_back_to_all_data(
+        self, monkeypatch: pytest.MonkeyPatch, window: MainWindow
+    ) -> None:
+        # A view cascades away when its source stream is deleted (the `view`
+        # table's ON DELETE CASCADE) -- the active view must not be left
+        # pointing at a key that no longer exists.
+        window._client.create_stream("pickups", "Pickups", StreamKind.EVENT)
+        window._client.create_view("media-view", "Media", "timecard", category_path="media")
+        window.set_view("media-view")
+        # "timecard" stays the current stream -- prompt_to_delete_stream acts
+        # on whatever the picker shows, and it is "timecard" (the view's
+        # source) that must be deleted here, with "pickups" left to fall back to.
+        monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: QMessageBox.StandardButton.Yes)
+
+        window.prompt_to_delete_stream()  # deletes "timecard", the view's source
+
+        assert window._view_key is None
+        assert window._client.views() == []
+
+
+class TestViewShading:
+    """The day timeline's excluded-time overlay -- ``timeline_view._excluded_spans``."""
+
+    def test_no_shading_at_all_without_an_active_view(self, window: MainWindow) -> None:
+        from minmax.ui.timeline_view import _excluded_spans
+
+        loaded = window.day_screen.pane.timeline.window_view
+        assert loaded is not None
+        assert loaded.view is None
+        assert _excluded_spans(loaded) == []
+
+    def test_shading_fills_the_gaps_around_the_active_spans(self, window: MainWindow) -> None:
+        from minmax.ui.timeline_view import _excluded_spans
+
+        window._client.create_view("media-view", "Media", "timecard", category_path="media")
+        window.set_view("media-view")
+
+        loaded = window.day_screen.pane.timeline.window_view
+        assert loaded is not None
+        assert loaded.view == "media-view"
+        gaps = _excluded_spans(loaded)
+        assert gaps, "the media window is a small fraction of the loaded days"
+        # Every gap plus every active span should reconstruct the whole
+        # loaded window with nothing left over and nothing double-counted.
+        covered = sorted([*gaps, *loaded.active_spans])
+        total = sum(end - start for start, end in covered)
+        assert total == loaded.end_epoch - loaded.start_epoch

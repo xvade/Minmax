@@ -59,6 +59,7 @@ from minmax.api import (
     TimelineRecord,
     TrendMetric,
     TrendsView,
+    ViewSummary,
     other_breakdown,
 )
 from minmax.api.format import format_duration, format_measure
@@ -67,6 +68,7 @@ from minmax.ui.correlations_view import CorrelationsTable
 from minmax.ui.dialogs import (
     IntervalDialog,
     NewStreamDialog,
+    NewViewDialog,
     RangeDialog,
     ShortcutsDialog,
     prompt_for_prefix,
@@ -192,6 +194,11 @@ class DayScreen(_ShortcutHost):
         self._stream_key = stream_key
         self._bounds = client.bounds(stream_key)
         self._prefix: str | None = None
+        #: The active saved view's key, or None. Unlike ``_prefix`` this is
+        #: *not* reset by :meth:`set_stream` -- a view restricts time, not
+        #: one stream's categories, so it is global state owned by
+        #: :class:`MainWindow` and carries across a stream switch.
+        self._view_key: str | None = None
         self._focus_day = self._bounds[1] if self._bounds else date.today()
         self._top_day = self._focus_day
         self._loading = False
@@ -211,6 +218,9 @@ class DayScreen(_ShortcutHost):
         self._filter_label = QLabel()
         self._filter_label.setEnabled(False)
 
+        self._view_label = QLabel()
+        self._view_label.setEnabled(False)
+
         self._total_label = QLabel()
         self._total_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 
@@ -219,6 +229,8 @@ class DayScreen(_ShortcutHost):
         header.addWidget(self._date_label)
         header.addSpacing(10)
         header.addWidget(self._filter_label)
+        header.addSpacing(10)
+        header.addWidget(self._view_label)
         header.addStretch(1)
         header.addWidget(self._total_label)
 
@@ -264,6 +276,10 @@ class DayScreen(_ShortcutHost):
     def prefix(self) -> str | None:
         return self._prefix
 
+    @property
+    def view_key(self) -> str | None:
+        return self._view_key
+
     def _limits(self) -> tuple[date, date]:
         """How far *scrolling* may extend the window.
 
@@ -290,7 +306,9 @@ class DayScreen(_ShortcutHost):
             return
         self._loading = True
         try:
-            window = self._client.window(self._stream_key, first, last, prefix=self._prefix)
+            window = self._client.window(
+                self._stream_key, first, last, prefix=self._prefix, view=self._view_key
+            )
             self.pane.set_window(window, anchor_epoch=anchor_epoch)
         finally:
             self._loading = False
@@ -431,6 +449,19 @@ class DayScreen(_ShortcutHost):
         self.clear_selection()
         self._reload_around(self.day)
 
+    def set_view(self, view_key: str | None) -> None:
+        """Restrict (or stop restricting) the timeline to a saved view.
+
+        Called by :class:`MainWindow`, not reset by :meth:`set_stream` --
+        see ``_view_key``'s docstring. A record excluded by the new mask
+        needs no special handling here: :meth:`~minmax.ui.timeline_view.Timeline.set_window`
+        already clears a selection that has left the loaded window.
+        """
+        if view_key == self._view_key:
+            return
+        self._view_key = view_key
+        self._reload_around(self.day)
+
     def clear_selection(self) -> None:
         self.pane.timeline.select(None)
 
@@ -485,6 +516,7 @@ class DayScreen(_ShortcutHost):
         # Built piecewise because the no-pad day directive is not portable.
         self._date_label.setText(f"{day:%A} {day.day} {day:%B %Y}")
         self._filter_label.setText(f"filtered to {self._prefix}" if self._prefix else "")
+        self._view_label.setText(f"view: {self._view_key}" if self._view_key else "")
 
         window = self.pane.timeline.window_view
         summary = window.summary_for(day) if window is not None else None
@@ -537,6 +569,8 @@ class TrendsScreen(_ShortcutHost):
         self._field_key: str | None = None
         self._aggregate = Aggregate.SUM
         self._metric_options: tuple[TrendMetric, ...] = ()
+        #: Not reset by set_stream -- see DayScreen._view_key's docstring.
+        self._view_key: str | None = None
 
         self._build_ui()
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -605,6 +639,10 @@ class TrendsScreen(_ShortcutHost):
     def range_selection(self) -> tuple[date | None, date | None]:
         return (self._since, self._until)
 
+    @property
+    def view_key(self) -> str | None:
+        return self._view_key
+
     def reload(self) -> None:
         # A real query invalidates any cached "Other" breakdown -- it was
         # fetched for the view before this one, which may no longer exist.
@@ -617,6 +655,7 @@ class TrendsScreen(_ShortcutHost):
             interval=self._interval,
             field_key=self._field_key,
             aggregate=self._aggregate,
+            view=self._view_key,
         )
         self._refresh_metric_combo()
         self.chart.set_view(self._view)
@@ -634,11 +673,15 @@ class TrendsScreen(_ShortcutHost):
         # changing the prefix, so the title needs its own word for it or the
         # header would keep describing the view from before the click.
         other = " · Other" if self._other_stack else ""
+        # A saved view restricting time is a fact about the whole window, not
+        # about the trends screen's own state, so it is named the same way a
+        # field metric is: appended, never silently absorbed into "where".
+        saved_view = f" · view: {self._view_key}" if self._view_key else ""
         # Naming the resolved interval matters most under AUTO, where the reader
         # has not chosen it and would otherwise have to infer it.
         if self._interval.is_auto:
-            return f"{where} · auto ({shown}){metric}{other}"
-        return f"{where} · {shown}{metric}{other}"
+            return f"{where} · auto ({shown}){metric}{other}{saved_view}"
+        return f"{where} · {shown}{metric}{other}{saved_view}"
 
     def _refresh_metric_combo(self) -> None:
         """Repopulate the metric dropdown from the view just loaded.
@@ -758,6 +801,17 @@ class TrendsScreen(_ShortcutHost):
         self._aggregate = Aggregate.SUM
         self.reload()
 
+    def set_view(self, view_key: str | None) -> None:
+        """Restrict (or stop restricting) the chart to a saved view.
+
+        Called by :class:`MainWindow`, not reset by :meth:`set_stream` --
+        see ``_view_key``'s docstring.
+        """
+        if view_key == self._view_key:
+            return
+        self._view_key = view_key
+        self.reload()
+
     # -- range and granularity -------------------------------------------
 
     def prompt_for_range(self) -> None:
@@ -873,6 +927,10 @@ class CorrelationsScreen(_ShortcutHost):
         super().__init__(parent)
         self._client = client
         self._view: CorrelationsView | None = None
+        #: Not reset by set_stream -- this screen isn't even scoped to one
+        #: stream (see the class docstring). Set only via set_view, called
+        #: from MainWindow the same way every other screen's is.
+        self._view_key: str | None = None
         #: A sweep across every stream is heavier than either existing
         #: screen's queries, so it is not run on app launch, on every stream
         #: switch (irrelevant to this screen anyway), or on every import --
@@ -940,12 +998,25 @@ class CorrelationsScreen(_ShortcutHost):
 
     # -- data --------------------------------------------------------------
 
+    @property
+    def view_key(self) -> str | None:
+        return self._view_key
+
+    def set_view(self, view_key: str | None) -> None:
+        """Restrict (or stop restricting) the sweep to a saved view."""
+        if view_key == self._view_key:
+            return
+        self._view_key = view_key
+        self.mark_dirty()
+
     def reload(self) -> None:
         """Re-run the sweep and redisplay it, unconditionally."""
         self._dirty = False
         try:
             view = self._client.correlations(
-                per_category=self._per_category.isChecked(), min_r=self._min_r.value()
+                per_category=self._per_category.isChecked(),
+                min_r=self._min_r.value(),
+                view=self._view_key,
             )
         except ImportError:
             self._show_missing_scipy()
@@ -985,7 +1056,8 @@ class CorrelationsScreen(_ShortcutHost):
         span = ""
         if view.first_day and view.last_day:
             span = f"{view.first_day} - {view.last_day}  ·  "
-        return f"{span}{view.series_count} series · {view.tests_performed} tested"
+        saved_view = f" · view: {self._view_key}" if self._view_key else ""
+        return f"{span}{view.series_count} series · {view.tests_performed} tested{saved_view}"
 
     def _footer(self, view: CorrelationsView) -> str:
         lines: list[str] = []
@@ -1012,10 +1084,12 @@ class MainWindow(QMainWindow):
         stream_key: str = "timecard",
         *,
         config_path: Path | None = None,
+        view_key: str | None = None,
     ) -> None:
         super().__init__()
         self._client = client
         self._stream_key = stream_key
+        self._view_key: str | None = None
         self._shortcuts = load_shortcuts(config_path)
         self._global_actions: list[QAction] = []
 
@@ -1035,6 +1109,10 @@ class MainWindow(QMainWindow):
         self._stream_picker = QComboBox()
         self._stream_picker.currentIndexChanged.connect(self._on_stream_picker_changed)
 
+        self._view_picker = QComboBox()
+        self._view_picker.setToolTip("Restrict every screen to the times a saved view was active.")
+        self._view_picker.currentIndexChanged.connect(self._on_view_picker_changed)
+
         self._auto_fetch_checkbox = QCheckBox("Auto-fetch every minute")
         self._auto_fetch_checkbox.setToolTip(
             "Re-import this stream's remembered CSV once a minute."
@@ -1042,11 +1120,14 @@ class MainWindow(QMainWindow):
         self._auto_fetch_checkbox.toggled.connect(self._on_auto_fetch_toggled)
 
         self._refresh_stream_picker()  # also syncs the checkbox to the current stream
+        self._refresh_view_picker()
 
         top_bar = QHBoxLayout()
         top_bar.setContentsMargins(12, 6, 12, 6)
         top_bar.addWidget(QLabel("Stream"))
         top_bar.addWidget(self._stream_picker)
+        top_bar.addWidget(QLabel("View"))
+        top_bar.addWidget(self._view_picker)
         top_bar.addWidget(self._auto_fetch_checkbox)
         top_bar.addStretch(1)
 
@@ -1070,6 +1151,9 @@ class MainWindow(QMainWindow):
         self._auto_fetch_timer.setInterval(AUTO_FETCH_INTERVAL_MS)
         self._auto_fetch_timer.timeout.connect(self._run_auto_fetch)
         self._auto_fetch_timer.start()
+
+        if view_key is not None:
+            self.set_view(view_key)
 
         self.show_day_screen()
         if self._shortcuts.problems:
@@ -1204,6 +1288,24 @@ class MainWindow(QMainWindow):
             return
 
         self._client.delete_stream(current.key)
+
+        # A stream cascades away every view built on it (see the `view` table's
+        # ON DELETE CASCADE). If the active view was one of them, both the
+        # stream *and* the view every screen is currently holding are about to
+        # be invalid at once -- set_stream below is the one reload that must
+        # happen, and it must see a view key that is already either valid or
+        # cleared, or the reload would ask the client for a view that no
+        # longer exists. Cleared directly here, without going through
+        # set_view, so clearing it costs no reload of its own with the old
+        # (about to be deleted) stream still current.
+        surviving = {view.key for view in self._client.views()}
+        if self._view_key is not None and self._view_key not in surviving:
+            self._view_key = None
+            self._day_screen._view_key = None
+            self._trends_screen._view_key = None
+            self._correlations_screen._view_key = None
+        self._refresh_view_picker()
+
         remaining = next(s for s in summaries if s.key != current.key)
         self.set_stream(remaining.key)
         self._correlations_screen.mark_dirty()
@@ -1229,6 +1331,105 @@ class MainWindow(QMainWindow):
         key = self._stream_picker.itemData(index)
         if key and key != self._stream_key:
             self.set_stream(key)
+
+    # -- views ---------------------------------------------------------------
+    # A view restricts every screen to the times a category was active
+    # elsewhere in time, not to one stream's own categories -- it is global
+    # state, unlike the stream picker's selection, so switching it never
+    # resets anything the way set_stream resets each screen's filter.
+
+    def set_view(self, key: str | None) -> None:
+        """Restrict (or stop restricting) the whole window to a saved view."""
+        if key == self._view_key:
+            return
+        self._view_key = key
+        self._day_screen.set_view(key)
+        self._trends_screen.set_view(key)
+        self._correlations_screen.set_view(key)
+        self._refresh_view_picker()
+
+    def prompt_for_view(self) -> None:
+        """The keyboard path to the picker: focus it and drop the list down,
+        mirroring :meth:`prompt_for_stream`."""
+        self._view_picker.setFocus()
+        self._view_picker.showPopup()
+
+    def prompt_for_new_view(self) -> None:
+        existing = [summary.key for summary in self._client.views()]
+        streams = self._client.streams()
+        dialog = NewViewDialog(
+            self,
+            existing_keys=existing,
+            streams=streams,
+            category_paths=self._client.category_paths,
+        )
+        if not dialog.exec():
+            return
+        choice = dialog.selection()
+        try:
+            self._client.create_view(
+                choice.key,
+                choice.name,
+                choice.source_stream_key,
+                category_path=choice.category_path,
+            )
+        except (ValueError, LookupError) as error:
+            QMessageBox.warning(self, "New view", str(error))
+            return
+
+        # Switching straight into the view just created, the same way
+        # prompt_for_new_stream switches into a freshly declared stream.
+        self.set_view(choice.key)
+
+    def prompt_to_delete_view(self) -> None:
+        """Delete the currently active view, after confirming.
+
+        Acts on whichever view is active rather than opening a second
+        view-selection UI -- select the one to remove first, the same way
+        :meth:`prompt_to_delete_stream` is scoped by the stream picker.
+        """
+        if self._view_key is None:
+            QMessageBox.information(self, "Delete view", "No view is currently active.")
+            return
+        summary = self._current_view_summary()
+        name = summary.name if summary is not None else self._view_key
+
+        confirmed = QMessageBox.warning(
+            self,
+            "Delete view",
+            f"Permanently delete the view '{name}'?\n\nThis cannot be undone.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if confirmed != QMessageBox.StandardButton.Yes:
+            return
+
+        self._client.delete_view(self._view_key)
+        self.set_view(None)
+
+    def _refresh_view_picker(self) -> None:
+        self._view_picker.blockSignals(True)
+        self._view_picker.clear()
+        # "" rather than None as the sentinel's item data: PySide6's QVariant
+        # round-trip for None is not reliable to search for with findData,
+        # the same trap NewStreamDialog's role combos avoid by index instead
+        # of currentData() -- here a plain falsy string sidesteps it instead,
+        # since a view's real key is never empty.
+        self._view_picker.addItem("All data", "")
+        for summary in self._client.views():
+            self._view_picker.addItem(summary.name, summary.key)
+        index = self._view_picker.findData(self._view_key or "")
+        self._view_picker.setCurrentIndex(index if index >= 0 else 0)
+        self._view_picker.blockSignals(False)
+
+    def _on_view_picker_changed(self, index: int) -> None:
+        key = self._view_picker.itemData(index)
+        self.set_view(key or None)
+
+    def _current_view_summary(self) -> ViewSummary | None:
+        if self._view_key is None:
+            return None
+        return next((v for v in self._client.views() if v.key == self._view_key), None)
 
     # -- auto-fetch --------------------------------------------------------
     # Opt-in per stream: not every imported file is a live feed worth polling,
