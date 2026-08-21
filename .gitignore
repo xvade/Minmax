@@ -13,6 +13,8 @@ build/
 .mypy_cache/
 .ruff_cache/
 
+.zshrc
+
 # Minmax's own data never belongs in the repo: it lives in $MINMAX_HOME
 # (~/.minmax by default). These patterns are a safety net in case a database is
 # ever created inside the working tree.
