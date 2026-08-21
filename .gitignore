@@ -14,6 +14,7 @@ build/
 .ruff_cache/
 
 .zshrc
+.envrc
 
 # Minmax's own data never belongs in the repo: it lives in $MINMAX_HOME
 # (~/.minmax by default). These patterns are a safety net in case a database is
