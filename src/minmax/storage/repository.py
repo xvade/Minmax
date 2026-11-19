@@ -22,6 +22,7 @@ from itertools import pairwise
 
 from minmax.core import palette, paths
 from minmax.core.models import (
+    ArchivedImport,
     Category,
     CategoryTotal,
     DailyCategoryTotal,
@@ -666,6 +667,60 @@ class Repository:
                 "SELECT * FROM import_run WHERE stream_id = ? ORDER BY id", (stream_id,)
             ).fetchall()
         return [_import_run_from_row(row) for row in rows]
+
+    def last_archived_at(self, stream_id: int) -> int | None:
+        """When this stream's raw file was last actually copied into the archive.
+
+        Epoch seconds of the newest import run that still has an archived copy,
+        or ``None`` if there is none. Runs whose copy was skipped (throttled, or
+        pruned) have ``archived_path IS NULL`` and do not count, so the answer
+        does not slide forward just because imports keep happening.
+        """
+        row = self._conn.execute(
+            "SELECT started_at FROM import_run WHERE stream_id = ? AND archived_path IS NOT NULL"
+            " ORDER BY id DESC LIMIT 1",
+            (stream_id,),
+        ).fetchone()
+        return int(row[0]) if row is not None else None
+
+    def archived_imports(self) -> list[ArchivedImport]:
+        """Every import run that still points at an archived file, oldest first."""
+        rows = self._conn.execute(
+            "SELECT import_run.id, stream.key, import_run.source_name,"
+            " import_run.started_at, import_run.archived_path"
+            " FROM import_run JOIN stream ON stream.id = import_run.stream_id"
+            " WHERE import_run.archived_path IS NOT NULL ORDER BY import_run.id"
+        ).fetchall()
+        return [
+            ArchivedImport(
+                import_run_id=row[0],
+                stream_key=row[1],
+                source_name=row[2],
+                started_at=row[3],
+                path=row[4],
+            )
+            for row in rows
+        ]
+
+    def clear_archived_paths(self, paths: Iterable[str]) -> int:
+        """Forget archived files that no longer exist; returns the runs updated.
+
+        One statement over a temporary table rather than one ``UPDATE`` per
+        path: ``import_run`` has no index on ``archived_path``, so tens of
+        thousands of separate updates would each scan every run.
+        """
+        with transaction(self._conn) as conn:
+            conn.execute("CREATE TEMP TABLE IF NOT EXISTS pruned_path (path TEXT PRIMARY KEY)")
+            conn.execute("DELETE FROM pruned_path")
+            conn.executemany(
+                "INSERT OR IGNORE INTO pruned_path (path) VALUES (?)", ((p,) for p in paths)
+            )
+            cursor = conn.execute(
+                "UPDATE import_run SET archived_path = NULL"
+                " WHERE archived_path IN (SELECT path FROM pruned_path)"
+            )
+            conn.execute("DROP TABLE pruned_path")
+        return cursor.rowcount
 
     def import_source_names(self, import_run_ids: Iterable[int]) -> dict[int, str]:
         """File name of each given import run, without loading every run.

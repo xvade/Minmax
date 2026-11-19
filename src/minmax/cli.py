@@ -23,7 +23,14 @@ from minmax.api.format import format_duration
 from minmax.core.columns import Granularity, Interval
 from minmax.core.models import FieldRole, Stream, StreamKind, View
 from minmax.core.timeref import Instant, Period
-from minmax.ingest import importer_for, run_import, sniff_fields, validate_declaration
+from minmax.ingest import (
+    apply_prune,
+    importer_for,
+    plan_prune,
+    run_import,
+    sniff_fields,
+    validate_declaration,
+)
 from minmax.storage.database import default_home, open_database
 from minmax.storage.repository import OverlapError, Repository
 from minmax.storage.rollups import rebuild
@@ -620,6 +627,43 @@ def cmd_revert(args: argparse.Namespace, repository: Repository) -> int:
     return 0
 
 
+def _gigabytes(size: int) -> str:
+    return f"{size / 1e9:.2f} GB" if size >= 1e8 else f"{size / 1e6:.1f} MB"
+
+
+def cmd_archive_prune(args: argparse.Namespace, repository: Repository) -> int:
+    """Delete archived copies that a later copy fully contains.
+
+    See :mod:`minmax.ingest.prune` for exactly what counts as redundant. This is
+    the one place Minmax deletes archived files, so ``--dry-run`` shows the
+    plan without acting on it.
+    """
+
+    def progress(done: int, total: int) -> None:
+        print(f"  checked {done}/{total} copies...", file=sys.stderr)
+
+    plan = plan_prune(repository, args.home, progress=progress)
+    for key, count in sorted(plan.per_stream.items()):
+        print(f"  {key}: {count} redundant copies")
+    print(
+        f"{len(plan.delete)} redundant copies, {_gigabytes(plan.bytes_freed)} to free; "
+        f"{plan.retained_unverified} kept because a later copy does not contain them, "
+        f"{len(plan.missing)} already missing"
+    )
+    if args.dry_run:
+        print("dry run: nothing deleted")
+        return 0
+
+    result = apply_prune(repository, plan)
+    print(
+        f"deleted {result.deleted} files, freed {_gigabytes(result.bytes_freed)}, "
+        f"cleared {result.runs_updated} import runs' archive references"
+    )
+    for error in result.errors:
+        print(f"  could not delete {error}", file=sys.stderr)
+    return 1 if result.errors else 0
+
+
 def cmd_rebuild_rollups(args: argparse.Namespace, repository: Repository) -> int:
     rebuild(repository.connection)
     print("rollups rebuilt from observations")
@@ -864,6 +908,17 @@ def build_parser() -> argparse.ArgumentParser:
     ui.add_argument("--stream", default="timecard")
     ui.add_argument("--view", help="open with this saved view already active")
     ui.set_defaults(handler=cmd_ui)
+
+    archive = subparsers.add_parser("archive", help="maintain the raw-file archive")
+    archive_commands = archive.add_subparsers(dest="archive_command", required=True)
+    archive_prune = archive_commands.add_parser(
+        "prune",
+        help="delete archived copies that a later copy of the same file fully contains",
+    )
+    archive_prune.add_argument(
+        "--dry-run", action="store_true", help="show what would be deleted and delete nothing"
+    )
+    archive_prune.set_defaults(handler=cmd_archive_prune)
 
     revert = subparsers.add_parser("revert", help="undo an import by id")
     revert.add_argument("import_run_id", type=int)

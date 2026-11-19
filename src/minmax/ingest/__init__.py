@@ -6,7 +6,14 @@ in :mod:`minmax.ingest.base`, so a new datastream needs only a parser.
 """
 
 from minmax.core.models import StreamKind
-from minmax.ingest.base import Importer, ImportReport, ParseResult, Rejection, run_import
+from minmax.ingest.base import (
+    UNATTENDED_ARCHIVE_INTERVAL,
+    Importer,
+    ImportReport,
+    ParseResult,
+    Rejection,
+    run_import,
+)
 from minmax.ingest.csvstream import (
     CsvStreamImporter,
     IntervalCsvImporter,
@@ -15,19 +22,25 @@ from minmax.ingest.csvstream import (
     sniff_fields,
     validate_declaration,
 )
+from minmax.ingest.prune import PrunePlan, PruneResult, apply_prune, plan_prune
 from minmax.ingest.timecard import TimecardCsvImporter
 from minmax.storage.repository import Repository
 
 __all__ = [
+    "UNATTENDED_ARCHIVE_INTERVAL",
     "CsvStreamImporter",
     "ImportReport",
     "Importer",
     "IntervalCsvImporter",
     "ParseResult",
+    "PrunePlan",
+    "PruneResult",
     "Rejection",
     "TimecardCsvImporter",
+    "apply_prune",
     "guess_fields",
     "importer_for",
+    "plan_prune",
     "read_sample",
     "run_import",
     "sniff_fields",

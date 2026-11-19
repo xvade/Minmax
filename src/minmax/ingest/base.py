@@ -8,16 +8,40 @@ every source, so adding a stream later means writing a parser and nothing else.
 
 from __future__ import annotations
 
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from datetime import timedelta
 from pathlib import Path
 from typing import Protocol
 
 from minmax.core.models import EventRecord, IntervalRecord, StreamKind
-from minmax.ingest.archive import archive_file, sha256_of
+from minmax.ingest.archive import ArchivedFile, archive_file, sha256_of
 from minmax.storage.repository import Repository
 
-__all__ = ["ImportReport", "Importer", "ParseResult", "Rejection", "run_import"]
+__all__ = [
+    "UNATTENDED_ARCHIVE_INTERVAL",
+    "ImportReport",
+    "Importer",
+    "ParseResult",
+    "Rejection",
+    "run_import",
+]
+
+
+#: How often an *unattended* import (auto-fetch) may add a full copy of a stream's
+#: source to the archive. Manual imports and the CLI always archive. A feed that
+#: grows between imports hashes differently every time, so without this cap a
+#: once-a-minute auto-fetch writes a complete new copy every minute -- tens of
+#: gigabytes within weeks. Six hours bounds a 1.2 MB feed to ~5 MB a day while
+#: leaving the live source file as the record in between.
+UNATTENDED_ARCHIVE_INTERVAL = timedelta(hours=6)
+
+
+def _hours(span: timedelta) -> str:
+    """``span`` for a note: minutes under an hour, otherwise hours."""
+    minutes = round(span.total_seconds() / 60)
+    return f"{minutes} min" if minutes < 60 else f"{minutes / 60:.1f} h"
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,6 +110,8 @@ def run_import(
     *,
     home: Path,
     force: bool = False,
+    archive_every: timedelta | None = None,
+    now: int | None = None,
 ) -> ImportReport:
     """Archive, parse, and store one source file.
 
@@ -96,7 +122,13 @@ def run_import(
        the natural-key constraint, so a forced re-import is still a no-op rather
        than a duplication.
     2. Archive the raw bytes *before* parsing, so a parser that crashes still
-       leaves the source recoverable.
+       leaves the source recoverable. With ``archive_every`` set (unattended
+       imports), the copy is skipped when this stream was archived more recently
+       than that: a feed re-imported every minute would otherwise archive a
+       full copy of a growing file every minute. The run then records no
+       archived file (``archived_path`` is ``NULL``) and the source file itself
+       remains the record until the next copy is due. ``now`` is the current
+       time in epoch seconds, injectable for tests.
     3. Parse. A parse failure creates no import run at all, leaving no
        half-finished provenance behind.
     4. Insert inside one transaction. If it fails, nothing is stored and the run
@@ -132,7 +164,19 @@ def run_import(
                 skipped=True,
             )
 
-    archived = archive_file(source, home=home, stream_key=stream.key)
+    archived: ArchivedFile | None = None
+    throttled_note: str | None = None
+    if archive_every is not None:
+        last = repository.last_archived_at(stream.id)
+        moment = int(time.time()) if now is None else now
+        if last is not None and moment - last < archive_every.total_seconds():
+            age = _hours(timedelta(seconds=moment - last))
+            throttled_note = (
+                f"raw copy skipped: this stream was archived {age} ago "
+                f"(unattended imports archive at most every {_hours(archive_every)})"
+            )
+    if throttled_note is None:
+        archived = archive_file(source, home=home, stream_key=stream.key)
     parsed = importer.parse(source)
 
     import_run_id = repository.begin_import(
@@ -140,7 +184,7 @@ def run_import(
         importer=importer.name,
         source_name=source.name,
         source_sha256=digest,
-        archived_path=str(archived.path),
+        archived_path=str(archived.path) if archived is not None else None,
     )
 
     try:
@@ -163,12 +207,12 @@ def run_import(
         source_name=source.name,
         source_sha256=digest,
         import_run_id=import_run_id,
-        archived_path=archived.path,
+        archived_path=archived.path if archived is not None else None,
         rows_read=parsed.rows_read,
         inserted=outcome.inserted,
         duplicates=outcome.duplicates,
         rejected=len(parsed.rejections),
         rejections=parsed.rejections,
-        notes=parsed.notes,
+        notes=[*parsed.notes, throttled_note] if throttled_note else parsed.notes,
         skipped=False,
     )

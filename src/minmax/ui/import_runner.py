@@ -89,7 +89,12 @@ class _Task(QRunnable):
     def run(self) -> None:
         try:
             outcome = self._client.import_file(
-                self._job.path, stream_key=self._job.stream_key, force=self._job.force
+                self._job.path,
+                stream_key=self._job.stream_key,
+                force=self._job.force,
+                # Auto-fetch re-imports a growing file every minute; only the
+                # reader's own imports are always archived.
+                unattended=self._job.kind is not ImportKind.MANUAL,
             )
             result = ImportResult(self._job, outcome=outcome)
         except Exception as error:

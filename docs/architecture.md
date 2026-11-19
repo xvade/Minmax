@@ -153,6 +153,7 @@ src/minmax/
 ├── ingest/          # Getting foreign data in. One module per source.
 │   ├── base.py      #   Importer protocol, ParseResult, the import pipeline
 │   ├── archive.py   #   Byte-for-byte raw file archiving + content hashing
+│   ├── prune.py     #   Deleting archived copies a later copy contains (§6.2)
 │   ├── rows.py      #   Row-level parsing helpers shared by every CSV importer
 │   ├── csvstream.py #   CsvStreamImporter/IntervalCsvImporter -- declared,
 │                    #   no-code streams of either kind (§6.1)
@@ -367,6 +368,27 @@ from parts that already existed rather than as a new pipeline:
   entirely when the content matches the last import, so an unattended feed
   that has not grown since the last tick costs one query, not one more
   archived copy — see [§6](#6-storage)'s idempotency paragraph.
+- **Archiving is throttled for unattended imports, and the old excess is
+  prunable.** The hash shortcut above only helps when the file has *not* grown;
+  a growing file hashes differently every tick, so each tick archived a full
+  copy of it (the user's reached 99 GB, 86 GB of it `actions_per_minute`).
+  `run_import(archive_every=...)` -- passed as `UNATTENDED_ARCHIVE_INTERVAL`
+  (6 h) by `import_file(unattended=True)`, which the desktop app sets for every
+  auto-fetch job and never for a reader's own import -- skips the copy when the
+  stream was archived more recently, and records `archived_path = NULL` on that
+  run. "Last archived" is the newest run that still *has* a path, so skipped
+  runs do not push it forward. Raw data is not at risk in between: the rows are
+  committed to the database each tick and the source file still exists; the
+  copy is a backup of the file, not the only record of it. `ingest/prune.py`
+  cleans up what the old behaviour left. It breaks the archive's "only ever
+  added to" rule on purpose and so proves redundancy before deleting: a copy
+  goes only if the database knows it, it sits under `<home>/archive`, a later
+  copy of the same (stream, source name, UTC day) is kept, and the deleted
+  copy's bytes are a *prefix* of the kept one -- a rewritten file fails that and
+  is retained. Files are unlinked before the database forgets them, so an
+  interrupted prune leaves dangling references (cleared on the next run), never
+  orphaned files. `Repository.clear_archived_paths` does it in one statement
+  over a temp table because `import_run.archived_path` is unindexed.
 - **Opt-in per stream, not automatic for every one that has ever been
   imported into.** Two reasons: not every source is a live feed worth polling
   every minute, and there would be nothing to resume from for most existing

@@ -20,6 +20,7 @@ from minmax.core.payload import payload_hash
 from minmax.core.timeref import Instant
 
 __all__ = [
+    "ArchivedImport",
     "Category",
     "CategoryTotal",
     "DailyCategoryTotal",
@@ -346,6 +347,21 @@ class StoredEvent:
     at: Instant
     import_run_id: int
     values: tuple[FieldValue, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ArchivedImport:
+    """An import run together with the raw file archived for it.
+
+    The slice of :class:`ImportRun` that archive maintenance needs, plus the
+    stream's key (the archive is laid out by key, not by id).
+    """
+
+    import_run_id: int
+    stream_key: str
+    source_name: str
+    started_at: int
+    path: str
 
 
 @dataclass(frozen=True, slots=True)

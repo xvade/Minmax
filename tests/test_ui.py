@@ -1311,6 +1311,26 @@ class TestAutoFetch:
         assert window.day_screen._bounds == (date(2026, 6, 5), date(2026, 6, 7))
         assert "auto-fetched" in window.statusBar().currentMessage()
 
+    def test_ticks_do_not_archive_a_growing_feed_every_minute(
+        self, window: MainWindow, tmp_path: Path, home: Path
+    ) -> None:
+        feed = tmp_path / "feed.csv"
+        header = "timer_id,timer_name,started_at,stopped_at,duration_seconds\n"
+        window._client.set_auto_fetch("timecard", enabled=True, path=feed)
+
+        for day in (7, 8, 9):
+            feed.write_text(
+                header + f"N{day},reading,2026-06-{day:02d}T09:00:00-07:00,"
+                f"2026-06-{day:02d}T10:00:00-07:00,3600\n",
+                encoding="utf-8",
+            )
+            window._run_auto_fetch()
+            window.wait_for_imports()
+
+        # The fixture's own import archived the stream a moment ago, so none of
+        # the three ticks is due another copy.
+        assert len(list((home / "archive" / "timecard").glob("*.csv"))) == 1
+
     def test_a_tick_does_nothing_for_a_disabled_stream(
         self, window: MainWindow, tmp_path: Path
     ) -> None:
@@ -2567,10 +2587,10 @@ class TestBackgroundImport:
         started: list[str] = []
         real = window._client.import_file
 
-        def gated(path: Path, *, stream_key: str, force: bool = False):  # type: ignore[no-untyped-def]
+        def gated(path: Path, *, stream_key: str, force: bool = False, **extra):  # type: ignore[no-untyped-def]
             started.append(stream_key)
             release.wait(timeout=20)
-            return real(path, stream_key=stream_key, force=force)
+            return real(path, stream_key=stream_key, force=force, **extra)
 
         monkeypatch.setattr(window._client, "import_file", gated)
         return release, started
@@ -2663,9 +2683,9 @@ class TestBackgroundImport:
         order: list[str] = []
         real = window._client.import_file
 
-        def recording(path: Path, *, stream_key: str, force: bool = False):  # type: ignore[no-untyped-def]
+        def recording(path: Path, *, stream_key: str, force: bool = False, **extra):  # type: ignore[no-untyped-def]
             order.append(path.name)
-            return real(path, stream_key=stream_key, force=force)
+            return real(path, stream_key=stream_key, force=force, **extra)
 
         monkeypatch.setattr(window._client, "import_file", recording)
         first = tmp_path / "first.csv"
@@ -2687,7 +2707,7 @@ class TestBackgroundImport:
         warnings: list[tuple[object, ...]] = []
         monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: warnings.append(a))
 
-        def broken(path: Path, *, stream_key: str, force: bool = False):  # type: ignore[no-untyped-def]
+        def broken(path: Path, *, stream_key: str, force: bool = False, **extra):  # type: ignore[no-untyped-def]
             raise RuntimeError("the disk caught fire")
 
         monkeypatch.setattr(window._client, "import_file", broken)
@@ -2705,7 +2725,7 @@ class TestBackgroundImport:
         feed.write_text(self.FEED, encoding="utf-8")
         window._client.set_auto_fetch("timecard", enabled=True, path=feed)
 
-        def broken(path: Path, *, stream_key: str, force: bool = False):  # type: ignore[no-untyped-def]
+        def broken(path: Path, *, stream_key: str, force: bool = False, **extra):  # type: ignore[no-untyped-def]
             raise OSError("permission denied")
 
         monkeypatch.setattr(window._client, "import_file", broken)

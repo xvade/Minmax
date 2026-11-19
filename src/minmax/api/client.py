@@ -61,7 +61,13 @@ from minmax.core.palette import OTHER, ColourChoice, Swatch, resolve_auto, swatc
 from minmax.core.timeline import hour_boundaries
 from minmax.core.timeref import Instant, local_day_bounds
 from minmax.core.windows import TimeMask
-from minmax.ingest import guess_fields, importer_for, read_sample, run_import
+from minmax.ingest import (
+    UNATTENDED_ARCHIVE_INTERVAL,
+    guess_fields,
+    importer_for,
+    read_sample,
+    run_import,
+)
 from minmax.storage.repository import OverlapError, Repository
 
 __all__ = [
@@ -714,9 +720,17 @@ class MinmaxClient(Protocol):
         unknown key. A screen currently showing this view should fall back
         to unfiltered data -- the view simply stops existing."""
 
-    def import_file(self, path: Path, *, stream_key: str, force: bool = False) -> ImportOutcome:
+    def import_file(
+        self, path: Path, *, stream_key: str, force: bool = False, unattended: bool = False
+    ) -> ImportOutcome:
         """Archive, parse, and store one source file, exactly as the CLI's
         ``import`` command does.
+
+        ``unattended`` marks an import nobody asked for (auto-fetch). It is
+        archived at most once per ``UNATTENDED_ARCHIVE_INTERVAL`` per stream,
+        because a feed re-imported every minute would otherwise write a full
+        copy of a growing file every minute. A reader's own import is always
+        archived.
 
         **Must be callable from a worker thread** while other methods are being
         called from the UI thread: an import can take seconds on a large file,
@@ -1424,7 +1438,9 @@ class InProcessClient:
 
     # -- importing ---------------------------------------------------------
 
-    def import_file(self, path: Path, *, stream_key: str, force: bool = False) -> ImportOutcome:
+    def import_file(
+        self, path: Path, *, stream_key: str, force: bool = False, unattended: bool = False
+    ) -> ImportOutcome:
         """See the protocol. Safe to call from a worker thread (own connection)."""
         if self._home is None:
             raise RuntimeError(
@@ -1438,13 +1454,21 @@ class InProcessClient:
         sibling = self._repository.open_sibling()
         repository = sibling if sibling is not None else self._repository
         try:
-            return self._import_with(repository, path, stream_key=stream_key, force=force)
+            return self._import_with(
+                repository, path, stream_key=stream_key, force=force, unattended=unattended
+            )
         finally:
             if sibling is not None:
                 sibling.close()
 
     def _import_with(
-        self, repository: Repository, path: Path, *, stream_key: str, force: bool
+        self,
+        repository: Repository,
+        path: Path,
+        *,
+        stream_key: str,
+        force: bool,
+        unattended: bool,
     ) -> ImportOutcome:
         assert self._home is not None  # checked by import_file
         try:
@@ -1455,7 +1479,14 @@ class InProcessClient:
             return ImportOutcome(source_name=path.name, error=f"no such file: {path}")
 
         try:
-            report = run_import(repository, importer, path, home=self._home, force=force)
+            report = run_import(
+                repository,
+                importer,
+                path,
+                home=self._home,
+                force=force,
+                archive_every=UNATTENDED_ARCHIVE_INTERVAL if unattended else None,
+            )
         except (OverlapError, ValueError) as error:
             # OverlapError means the data conflicts with what is already
             # stored; ValueError means the importer does not recognise the

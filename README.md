@@ -376,7 +376,11 @@ with no remembered path yet asks you to pick the file, tries it immediately
 from then on. Re-importing a growing file merges rather than duplicates, and
 backs it up, the same way any import does — see
 [How the data is stored](#how-the-data-is-stored) — so nothing new was built
-for either; the timer just calls the same path a manual import would. Each
+for either; the timer just calls the same path a manual import would, with one
+difference: an auto-fetch archives a raw copy of the file at most once every six
+hours per stream, where your own imports always archive. (A growing file differs
+every minute, so archiving each fetch would write a full copy a minute.) The data
+is still merged every fetch; only the extra backup copy is spaced out. Each
 fetch runs in the background like any other import; if one is still running
 when the next minute comes round, that stream is skipped for the tick rather
 than queued behind it.
@@ -594,6 +598,30 @@ Use this when an export contained edited run times that conflict with what is
 already stored — Minmax refuses such an import rather than storing both versions
 (see *Conflicting edits* below).
 
+### `minmax archive prune`
+
+Deletes archived raw copies that a later copy of the same file fully contains.
+
+```
+$ minmax archive prune --dry-run
+  actions_per_minute: 74008 redundant copies
+  ...
+79123 redundant copies, 95.21 GB to free; 0 kept because a later copy does not contain them, 0 already missing
+dry run: nothing deleted
+```
+
+Archived files are otherwise never deleted. This command exists for the archive
+that auto-fetch used to grow by a full copy per minute (now capped at one per six
+hours, so a fresh install never needs it). It is deliberately conservative: a copy
+is deleted only if it is recorded in the database, lives under the archive
+directory, a later copy of the same file from the same UTC day exists, **and its
+bytes are a prefix of that later copy** — so everything it held is still held. A
+file that was rewritten rather than appended to fails that test and is kept. The
+newest copy of each file on each day is never deleted. The data in the database is
+not touched; the pruned import runs just stop pointing at a file.
+
+- `--dry-run` — print what would be deleted and delete nothing. Run this first.
+
 ### `minmax rebuild-rollups`
 
 Recomputes all aggregates from the observations. A repair tool; not needed in
@@ -625,11 +653,12 @@ recognizable as the same data under a different filename.
 
 **Raw files are kept forever.** Imports are archived byte-for-byte before
 parsing. If a parser turns out to be wrong, the fix is to revert and re-import,
-never to hand-edit the database. **Known problem:** a file that grows between
-imports hashes differently each time, so auto-fetch archives a complete new copy
-every minute. On a live feed that is tens of gigabytes within weeks. The policy
-for that is an open decision in `TODO.md`; until it is made, check the size of
-`~/.minmax/archive`.
+never to hand-edit the database. A file that grows between imports hashes
+differently each time, so archiving every auto-fetch would write a complete new
+copy every minute -- it reached 99 GB and filled a disk. Auto-fetch therefore
+archives a stream at most once every six hours (your own imports always archive),
+and `minmax archive prune` removes the redundant copies an older version left
+behind. Between copies, the live source file and the database are the record.
 
 **A point-in-time stream's payload is columns, not a blob.** Its declared
 fields (`stream_field`) and their values (`event_value`) are ordinary rows

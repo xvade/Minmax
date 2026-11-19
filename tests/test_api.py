@@ -1201,6 +1201,50 @@ class TestViews:
             client.correlations(view="nonexistent")
 
 
+class TestUnattendedImportArchiving:
+    """``import_file(unattended=True)`` is what auto-fetch uses; see
+    :data:`~minmax.ingest.UNATTENDED_ARCHIVE_INTERVAL`."""
+
+    @staticmethod
+    def _grow(path: Path, rows: int) -> Path:
+        path.write_text(
+            "timer_id,timer_name,started_at,stopped_at,duration_seconds\n"
+            + "".join(
+                f"N{i},reading,2026-06-0{7 + i}T09:00:00-07:00,"
+                f"2026-06-0{7 + i}T10:00:00-07:00,3600\n"
+                for i in range(rows)
+            ),
+            encoding="utf-8",
+        )
+        return path
+
+    def test_repeated_unattended_imports_archive_once(
+        self, repository: Repository, home: Path, tmp_path: Path
+    ) -> None:
+        client = InProcessClient(repository, timezone=PACIFIC, home=home)
+        feed = tmp_path / "feed.csv"
+
+        for rows in (1, 2, 3):
+            outcome = client.import_file(
+                self._grow(feed, rows), stream_key="timecard", unattended=True
+            )
+            assert outcome.error is None
+            assert outcome.inserted == 1
+
+        assert len(list((home / "archive" / "timecard").glob("*.csv"))) == 1
+
+    def test_a_readers_import_is_archived_even_right_after_an_unattended_one(
+        self, repository: Repository, home: Path, tmp_path: Path
+    ) -> None:
+        client = InProcessClient(repository, timezone=PACIFIC, home=home)
+        feed = tmp_path / "feed.csv"
+
+        client.import_file(self._grow(feed, 1), stream_key="timecard", unattended=True)
+        client.import_file(self._grow(feed, 2), stream_key="timecard")
+
+        assert len(list((home / "archive" / "timecard").glob("*.csv"))) == 2
+
+
 class TestImportFromAWorkerThread:
     """The desktop app runs ``import_file`` on a background thread while the UI
     thread keeps reading through the same client."""
