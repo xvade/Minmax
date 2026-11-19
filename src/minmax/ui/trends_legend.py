@@ -12,12 +12,13 @@ decorative.
 
 from __future__ import annotations
 
-from PySide6.QtCore import QRectF, QSize, Qt, Signal
+from PySide6.QtCore import QPoint, QRectF, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QFontMetrics, QMouseEvent, QPainter, QPaintEvent
 from PySide6.QtWidgets import QSizePolicy, QWidget
 
 from minmax.api import StreamKind, TrendMetric, TrendSeries
 from minmax.ui import theme
+from minmax.ui.colour_picker import ColourPicker
 from minmax.ui.trends_view import format_trend_amount
 
 __all__ = ["TrendsLegend"]
@@ -45,6 +46,11 @@ class TrendsLegend(QWidget):
 
     seriesActivated = Signal(str)
 
+    #: A colour was picked for a series: its category path, and a
+    #: :class:`~minmax.api.ColourChoice` (``None`` meaning Auto). The legend
+    #: only reports it; whoever owns the data decides what to store and repaint.
+    colourChosen = Signal(str, object)
+
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._series: list[TrendSeries] = []
@@ -52,6 +58,7 @@ class TrendsLegend(QWidget):
         self._values: list[float] = []
         self._stream_kind = StreamKind.INTERVAL
         self._metric = _DEFAULT_METRIC
+        self._picker: ColourPicker | None = None
         self.setMinimumWidth(300)
         self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
         self.setMouseTracking(True)
@@ -148,6 +155,39 @@ class TrendsLegend(QWidget):
                 format_trend_amount(value, self._metric, self._stream_kind),
             )
 
+    def _swatch_hit(self, x: float) -> bool:
+        """Whether ``x`` falls in the swatch column -- a generous target, wider
+        than the 11px swatch itself."""
+        return PADDING - 4 <= x <= PADDING + SWATCH + 6
+
+    def open_colour_picker(self, series: TrendSeries, global_point: QPoint | None = None) -> None:
+        """Offer the colour choices for one series.
+
+        "Other" is a fold of several categories, not one of them, so it has no
+        colour to choose and this does nothing for it.
+        """
+        if series.is_other or not series.path:
+            return
+        picker = ColourPicker(f"Colour for {series.label}", series.colour, self)
+        picker.chosen.connect(lambda choice, path=series.path: self.colourChosen.emit(path, choice))
+        self._picker = picker
+        row = self._series.index(series)
+        anchor = QPoint(PADDING, 32 + row * ROW_HEIGHT + ROW_HEIGHT)
+        picker.popup_at(global_point if global_point is not None else self.mapToGlobal(anchor))
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        series = self._series_at(event.position().y())
+        if series is None:
+            super().mousePressEvent(event)
+            return
+        wants_picker = event.button() == Qt.MouseButton.RightButton or (
+            event.button() == Qt.MouseButton.LeftButton and self._swatch_hit(event.position().x())
+        )
+        if wants_picker:
+            self.open_colour_picker(series)
+        else:
+            super().mousePressEvent(event)
+
     def _series_at(self, y: float) -> TrendSeries | None:
         index = int((y - 32) // ROW_HEIGHT)
         if 0 <= index < len(self._series):
@@ -161,8 +201,12 @@ class TrendsLegend(QWidget):
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
         series = self._series_at(event.position().y())
-        clickable = series is not None and (series.can_drill or series.is_other)
+        colourable = (
+            series is not None and not series.is_other and self._swatch_hit(event.position().x())
+        )
+        clickable = colourable or (series is not None and (series.can_drill or series.is_other))
         self.setCursor(
             Qt.CursorShape.PointingHandCursor if clickable else Qt.CursorShape.ArrowCursor
         )
+        self.setToolTip("Choose a colour" if colourable else "")
         super().mouseMoveEvent(event)

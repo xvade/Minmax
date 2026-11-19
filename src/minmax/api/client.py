@@ -57,7 +57,7 @@ from minmax.core.models import (
     StreamKind,
     View,
 )
-from minmax.core.palette import OTHER, Swatch, swatch_for_slot
+from minmax.core.palette import OTHER, ColourChoice, Swatch, resolve_auto, swatch_for_slot
 from minmax.core.timeline import hour_boundaries
 from minmax.core.timeref import Instant, local_day_bounds
 from minmax.core.windows import TimeMask
@@ -452,6 +452,16 @@ class TrendSeries:
     is_other: bool = False
     """True for the folded tail. It carries a neutral colour, not a hue."""
 
+    path: str = ""
+    """The category path this series stands for -- the key a colour choice is
+    stored under (:meth:`MinmaxClient.set_series_colour`). Empty for "Other",
+    which is a fold of several paths and cannot be coloured."""
+
+    colour: ColourChoice | None = None
+    """What the user picked for this series, or ``None`` while it is on Auto.
+    :attr:`swatch` is always what to draw; this is what a picker should show as
+    the current selection."""
+
     can_drill: bool = False
     """Whether this group has sub-categories worth focusing into."""
 
@@ -667,6 +677,18 @@ class MinmaxClient(Protocol):
 
     def category_paths(self, stream_key: str) -> list[str]:
         """Every category path in the stream, sorted -- for filter completion."""
+
+    def set_series_colour(
+        self, stream_key: str, category_path: str, choice: ColourChoice | None
+    ) -> None:
+        """Pick the colour of one series, or pass ``None`` to put it back on Auto.
+
+        ``category_path`` is a series' :attr:`TrendSeries.path` -- a top-level
+        group (``media``) colours it on every screen, a deeper path
+        (``media/gaming``) only where that path is its own series, i.e. in a
+        focus. Raises ``LookupError`` for an unknown stream. Takes effect on the
+        next read; nothing already returned is repainted.
+        """
 
     def views(self) -> list[ViewSummary]:
         """Every saved view, sorted by key -- for a view picker."""
@@ -1295,6 +1317,13 @@ class InProcessClient:
         stream_id = self._stream_id(stream_key)
         return sorted(category.path for category in self._repository.list_categories(stream_id))
 
+    def set_series_colour(
+        self, stream_key: str, category_path: str, choice: ColourChoice | None
+    ) -> None:
+        stream = self._require_stream(stream_key)
+        assert stream.id is not None
+        self._repository.set_series_colour(stream.id, category_path, choice)
+
     # -- views (saved) ------------------------------------------------------
 
     def views(self) -> list[ViewSummary]:
@@ -1662,10 +1691,13 @@ class InProcessClient:
         ranked = sorted(totals.items(), key=lambda item: (-sum(rank_by[item[0]]), item[0]))
         kept, folded = ranked[:max_series], ranked[max_series:]
         swatches = self._series_swatches(stream_id, [key for key, _ in kept], prefix)
+        picked = self._repository.series_colours(stream_id)
 
         series = [
             TrendSeries(
                 label=key,
+                path=key,
+                colour=picked.get(key),
                 swatch=swatches[key],
                 values=values,
                 total=sum(values),
@@ -1713,21 +1745,42 @@ class InProcessClient:
     ) -> dict[str, Swatch]:
         """Colours for trend series, stable against re-ranking.
 
-        At the top level the stored per-group slots are used, so a group keeps
-        its colour across sessions and matches the day timeline. Inside a focus,
-        slots are assigned by sorted key order -- deterministic for that focus,
-        and unaffected by which group happens to be largest today.
+        At the top level the stored per-group slots are the auto colours, so a
+        group keeps its colour across sessions and matches the day timeline.
+        Inside a focus there is nothing stored, so a series' home slot is its
+        position in sorted key order -- deterministic for that focus, and
+        unaffected by which group happens to be largest today. Either way a
+        colour the user picked wins, and the auto ones step aside for it (see
+        :func:`~minmax.core.palette.resolve_auto`).
         """
         if prefix is None:
-            slots = self._repository.ensure_group_slots(stream_id, sorted(keys))
-            return {key: swatch_for_slot(slots[key]) for key in keys}
-        return {key: swatch_for_slot(index) for index, key in enumerate(sorted(keys))}
+            home = self._repository.ensure_group_slots(stream_id, sorted(keys))
+        else:
+            home = {key: index for index, key in enumerate(sorted(keys))}
+        return self._resolve_swatches(stream_id, keys, home)
 
     def _swatches_for(self, stream_id: int, category_paths: Iterable[str]) -> dict[str, Swatch]:
         """Ensure every group mentioned has a stored slot, then map it to a swatch."""
-        groups = {paths.top_level(path) for path in category_paths}
-        slots = self._repository.ensure_group_slots(stream_id, sorted(groups))
-        return {group: swatch_for_slot(slot) for group, slot in slots.items()}
+        groups = sorted({paths.top_level(path) for path in category_paths})
+        home = self._repository.ensure_group_slots(stream_id, groups)
+        return self._resolve_swatches(stream_id, groups, home)
+
+    def _resolve_swatches(
+        self, stream_id: int, keys: Iterable[str], home: dict[str, int]
+    ) -> dict[str, Swatch]:
+        """Manual choices as picked; the rest auto-assigned around them.
+
+        Only the keys passed -- the series on screen together -- constrain each
+        other. A manual colour on a series that is not displayed moves nothing.
+        """
+        shown = list(dict.fromkeys(keys))
+        manual = self._repository.series_colours(stream_id)
+        picked = {key: manual[key] for key in shown if key in manual}
+        auto = [key for key in shown if key not in picked]
+        slots = resolve_auto(auto, home, [choice.swatch() for choice in picked.values()])
+        resolved = {key: choice.swatch() for key, choice in picked.items()}
+        resolved.update({key: swatch_for_slot(slots[key]) for key in auto})
+        return resolved
 
 
 def _metric_options(

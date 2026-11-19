@@ -519,6 +519,43 @@ class Repository:
         return assigned
 
     # ------------------------------------------------------------------
+    # Manual series colours
+    # ------------------------------------------------------------------
+
+    def series_colours(self, stream_id: int) -> dict[str, palette.ColourChoice]:
+        """Every colour the user picked by hand in this stream, by category path.
+
+        A series with no entry is on Auto.
+        """
+        rows = self._conn.execute(
+            "SELECT category_path, slot, hex FROM series_colour WHERE stream_id = ?",
+            (stream_id,),
+        ).fetchall()
+        return {
+            row["category_path"]: palette.ColourChoice(slot=row["slot"], hex=row["hex"])
+            for row in rows
+        }
+
+    def set_series_colour(
+        self, stream_id: int, category_path: str, choice: palette.ColourChoice | None
+    ) -> None:
+        """Pick a colour for a series, or pass ``None`` to put it back on Auto."""
+        with transaction(self._conn) as conn:
+            if choice is None:
+                conn.execute(
+                    "DELETE FROM series_colour WHERE stream_id = ? AND category_path = ?",
+                    (stream_id, category_path),
+                )
+                return
+            conn.execute(
+                "INSERT INTO series_colour (stream_id, category_path, slot, hex, chosen_at)"
+                " VALUES (?, ?, ?, ?, ?)"
+                " ON CONFLICT (stream_id, category_path) DO UPDATE SET"
+                " slot = excluded.slot, hex = excluded.hex, chosen_at = excluded.chosen_at",
+                (stream_id, category_path, choice.slot, choice.hex, int(time.time())),
+            )
+
+    # ------------------------------------------------------------------
     # Import provenance
     # ------------------------------------------------------------------
 

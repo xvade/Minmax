@@ -38,15 +38,18 @@ from minmax.api.client import (
 )
 from minmax.api.format import format_duration, format_value
 from minmax.core.models import FieldRole, FieldSpec
-from minmax.core.palette import Swatch
+from minmax.core.palette import PALETTE, SLOT_NAMES, ColourChoice, Swatch
 from minmax.ingest import validate_declaration
 
 __all__ = [
     "AUTO_INTERVAL",
     "DAILY_INTERVAL",
     "MAX_INTERVAL_COUNT",
+    "PALETTE",
+    "SLOT_NAMES",
     "Aggregate",
     "CategorySlice",
+    "ColourChoice",
     "CorrelationRow",
     "CorrelationsView",
     "CsvPreview",

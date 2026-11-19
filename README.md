@@ -474,6 +474,21 @@ top-level category. It answers "what has the shape of my time been" rather than
   more than eight colours on screen at once.
 - Periods with no tracking stay empty rather than being skipped, so a gap in
   your history reads as a gap.
+- **Click a legend swatch (or right-click a row) to choose that series' colour:**
+  *Auto*, one of the eight palette hues, or *Custom…* for any colour. The chart
+  repaints at once, and the choice is remembered. A top-level group's colour is
+  shared with the day timeline and its totals; a sub-category colour picked
+  while focused applies to that sub-category on the trends screen. "Other"
+  has no colour to choose — it is a fold of several categories, not one.
+
+  **Auto steps around what you picked.** An auto series keeps the colour it was
+  born with unless a colour you chose *on screen at the same time* is too close
+  to it; only then does it move, to whichever unused hue is visibly furthest from
+  everything else shown. Colours you picked for series that are not on screen
+  constrain nothing. Choosing Auto again gives the series its original colour
+  back. Because there are only eight validated hues, a chart showing eight
+  series plus a couple of hand-picked colours near palette hues cannot keep
+  everything apart — focus a group to see fewer at once.
 
 For a point-in-time stream the same chart plots **how many, per day**, instead
 of hours per day — stacked and daily-averaged exactly the same way, since a
@@ -618,6 +633,14 @@ value, so each slot can carry its own step for light and dark surfaces and the
 palette can be re-stepped without a data migration. Assignments are persisted
 rather than derived from the name, so a group's colour never shifts because a
 new group appeared, and two groups never collide while the palette lasts.
+
+**Colours you choose are stored separately from the automatic ones.** A hand-picked
+colour lives in `series_colour` (migration `0008`), keyed by stream and category
+path, as either a palette slot or a hex; no row means Auto. Keeping it apart is
+what makes "back to Auto" a delete rather than a lost assignment. The auto
+assignment that works around your picks is a pure function in `core/palette.py`
+(`resolve_auto`), measured in OKLab — the same colour space the palette was
+validated in — and checked under simulated colour-vision deficiency as well.
 
 The eight palette steps are validated rather than eyeballed — they clear the
 lightness band, chroma floor, colour-vision-deficiency separation, and

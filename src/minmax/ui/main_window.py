@@ -21,7 +21,7 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import (
     QAction,
     QDragEnterEvent,
@@ -49,6 +49,7 @@ from PySide6.QtWidgets import (
 
 from minmax.api import (
     Aggregate,
+    ColourChoice,
     CorrelationsView,
     Granularity,
     ImportOutcome,
@@ -549,6 +550,10 @@ class TrendsScreen(_ShortcutHost):
 
     scope = bindings.TRENDS
 
+    #: A series colour was changed. Colours are shared with the day timeline, so
+    #: the window listens and refreshes it.
+    colourChanged = Signal()
+
     def __init__(
         self, client: MinmaxClient, stream_key: str, parent: QWidget | None = None
     ) -> None:
@@ -563,6 +568,10 @@ class TrendsScreen(_ShortcutHost):
         #: any cached breakdown stale, since it was fetched for the view
         #: before it).
         self._other_stack: list[TrendsView] = []
+        #: The "Other" series clicked to reach each entry of ``_other_stack``, in
+        #: order, so a recolour -- which has to re-query -- can walk back into the
+        #: same breakdown instead of dropping the reader out of it.
+        self._other_labels: list[str] = []
         self._since: date | None = None
         self._until: date | None = None
         self._interval = Interval(Granularity.AUTO)
@@ -610,6 +619,7 @@ class TrendsScreen(_ShortcutHost):
         self.chart.visibleRangeChanged.connect(self._on_range_changed)
         self.chart.seriesActivated.connect(self._on_series_activated)
         self.legend.seriesActivated.connect(self._on_series_activated)
+        self.legend.colourChosen.connect(self._on_colour_chosen)
 
         body = QHBoxLayout()
         body.setContentsMargins(0, 0, 0, 0)
@@ -647,6 +657,7 @@ class TrendsScreen(_ShortcutHost):
         # A real query invalidates any cached "Other" breakdown -- it was
         # fetched for the view before this one, which may no longer exist.
         self._other_stack = []
+        self._other_labels = []
         self._view = self._client.trends(
             self._stream_key,
             since=self._since,
@@ -755,6 +766,22 @@ class TrendsScreen(_ShortcutHost):
         else:
             self.push_focus(series.label)
 
+    def _on_colour_chosen(self, path: str, choice: ColourChoice | None) -> None:
+        """Store a series' colour and repaint with it.
+
+        A colour is a fact about the stream, not about this chart, so it goes to
+        the client and the screen re-queries rather than patching swatches in
+        place: picking one colour can move *other* series' auto colours out of its
+        way, and only the backend knows which. Any "Other" breakdown being shown
+        is re-entered afterwards, so the reader stays where they were.
+        """
+        self._client.set_series_colour(self._stream_key, path, choice)
+        breakdown = list(self._other_labels)
+        self.reload()
+        for label in breakdown:
+            self.push_other(label)
+        self.colourChanged.emit()
+
     def push_focus(self, label: str) -> None:
         """Focus one group, splitting it into its children."""
         self._focus.append(label)
@@ -770,6 +797,7 @@ class TrendsScreen(_ShortcutHost):
         if other is None:
             return
         self._other_stack.append(self._view)
+        self._other_labels.append(label)
         self._view = other_breakdown(self._view, other)
         self.chart.set_view(self._view)
         self._title_label.setText(self._title())
@@ -777,6 +805,7 @@ class TrendsScreen(_ShortcutHost):
 
     def pop_focus(self) -> None:
         if self._other_stack:
+            self._other_labels.pop()
             self._view = self._other_stack.pop()
             self.chart.set_view(self._view)
             self._title_label.setText(self._title())
@@ -1099,6 +1128,7 @@ class MainWindow(QMainWindow):
 
         self._day_screen = DayScreen(client, stream_key, self)
         self._trends_screen = TrendsScreen(client, stream_key, self)
+        self._trends_screen.colourChanged.connect(self._day_screen.refresh)
         self._correlations_screen = CorrelationsScreen(client, self)
 
         self._screens = QStackedWidget()

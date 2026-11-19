@@ -134,7 +134,9 @@ src/minmax/
 │   ├── trends.py    #   Stacked-area layout arithmetic (§8) — no Qt
 │   ├── columns.py   #   Grouping a date range into anchored chart columns (§8.2)
 │   ├── measures.py  #   Duration/count/field-aggregate abstraction (§7.1) — no Qt
-│   ├── palette.py   #   Validated categorical palette and slot assignment
+│   ├── palette.py   #   Validated categorical palette, slot assignment, ColourChoice,
+│   │                #   and resolve_auto (auto colours around manual ones, D10)
+│   ├── colourmath.py#   OKLab distance and colour-vision-deficiency separation — no Qt
 │   ├── paths.py     #   Category path parsing, prefix matching, tree derivation
 │   └── windows.py   #   TimeMask: a sorted, disjoint set of epoch spans (§7.2)
 │
@@ -187,7 +189,8 @@ src/minmax/
 │                    #   duration or count depending on the stream's kind
 │   ├── record_inspector.py# Full detail and provenance for one record
 │   ├── trends_view.py# Stacked area over columns: paint and input only
-│   ├── trends_legend.py# Per-group share of the visible columns
+│   ├── trends_legend.py# Per-group share of the visible columns; opens the colour picker
+│   ├── colour_picker.py# Popup: Auto, the eight hues, Custom… (reports a ColourChoice)
 │   ├── correlations_view.py# The correlation sweep's results table -- a
 │                    #   native QTableWidget, nothing custom-painted (§7.1)
 │   └── theme.py     #   Colours derived from the system palette (light/dark)
@@ -230,6 +233,9 @@ The schema is organised around the three stream kinds:
   [§6.1](#61-point-in-time-streams-an-eav-schema).
 - `stream_field` — the column-role mapping a user declares once for a
   point-in-time stream, reused for every later import into it.
+- `group_color` / `series_colour` — the automatic palette slot each top-level
+  group is born with, and the colour the user picked by hand over it (migration
+  `0008`; no row means Auto). See [D10](#d10--manual-series-colours-stored-apart-from-the-auto-assignment).
 - `import_run` — provenance: which file (by SHA-256), when, how many rows
   inserted/skipped. Every observation row carries its `import_run_id`, which is
   what makes an import reversible.
@@ -569,6 +575,10 @@ logic:
   shift a group's colour the moment another group appeared. What is stored is a
   palette **slot**, not a hex value, so each slot carries its own step for light
   and dark surfaces and the palette can be re-stepped without a migration.
+- *Manual colours* → `series_colour` plus `palette.resolve_auto`, see
+  [D10](#d10--manual-series-colours-stored-apart-from-the-auto-assignment). The
+  client resolves every swatch through one function, so a colour picked on the
+  trends legend is honoured wherever that group appears.
 
 ### 8.1 Chart rules
 
@@ -997,3 +1007,60 @@ condition, which is the more specific version of this one).
 own timestamps, say, rather than an interval stream's category) — `View`
 has no `source_kind` discriminator today because only one kind exists to
 discriminate from.
+
+### D10 — Manual series colours, stored apart from the auto assignment
+
+Requested 2026-11-19: let the user pick each series' colour on the trends chart,
+with an "Auto" choice that spreads the remaining colours away from anything
+picked by hand among the series shown together.
+
+**A choice is a slot or a hex, in its own table (`series_colour`, migration
+`0008`), keyed by category path.** Not a new column on `group_color`: that table
+is the automatic assignment, and keeping the two apart makes "Auto" a `DELETE`
+that restores the original colour rather than a value that overwrote it. Keyed by
+the series' full path rather than its top-level group, so a sub-category shown
+inside a focus can be coloured too; a top-level path is the same key the day
+timeline uses, which is why one pick covers both screens. A slot is stored as a
+slot (not as its hex) for the reason `0003` exists — a re-stepped palette must
+still re-colour it correctly. A custom hex is one colour on both light and dark
+surfaces: there is no principled way to re-step an arbitrary colour for a dark
+surface without changing which colour the user chose.
+
+**Auto is a pure function of what is on screen together
+(`palette.resolve_auto`).** An auto series keeps its stored home slot unless a
+manual colour in the same display is too close to it, or another auto series
+holds the slot; the displaced ones then take the unused hues that are visibly
+furthest from the fixed colours. Two details are deliberate, both found by
+looking at screenshots rather than by reasoning:
+
+- *Displaced series are placed together, not one at a time.* A one-at-a-time
+  pick spends a clashing hue early and strands a clear one — the first
+  prototype put an orange auto series directly beside a hand-picked orange while
+  aqua sat unused.
+- *The "too close" test is lenient (`colourmath.CLEAR_NORMAL` 12, `CLEAR_CVD`
+  6), unlike the palette's own 15/8 targets.* Those targets were only ever
+  applied to *adjacent* palette pairs; against an arbitrary manual colour they
+  displace most of the palette (a plain red moved six series). The CVD figure is
+  the validator's "floor" band, accepted when a secondary encoding — the
+  legend's labels — carries identity. Ranking the displaced uses plain visual
+  distance, since a colour-vision-deficiency simulation ranked aqua below a
+  near-orange next to an orange pick.
+
+**Consequence worth knowing:** "displayed at the same time" is per screen. The
+trends chart resolves over its series; the day timeline over every group in the
+days it has loaded. The two sets differ, so a group that *clashes* with a manual
+colour can resolve differently on each, and on the day screen can change as
+scrolling loads more days. Groups that do not clash never move. The eight-hue
+ceiling is unchanged: eight series plus hand-picked colours near palette hues
+cannot all be kept apart, and the resolver minimises the damage rather than
+inventing a ninth hue.
+
+*Rejected:* resolving over the whole stream's groups (any manual pick would
+displace series that are not even on screen, and a stream with more than eight
+groups would always be in conflict); storing the resolved auto colours (they would
+need invalidating on every pick and every scroll).
+
+*Revisit if:* the timeline/chart disagreement on a clashing group bothers
+someone in practice — the fix is to resolve the day screen over the chart's
+group set, which means the client needs a notion of "the groups that matter in
+this stream" it does not have today.

@@ -23,6 +23,12 @@ floor (19.6 / 19.3 against a floor of 15). Three light steps sit below 3:1
 contrast against a light surface, which obliges visible labels rather than
 colour alone -- the trends legend and the timeline's in-block labels supply that.
 
+**The user can override.** A series' colour is *auto* (no stored choice) or a
+:class:`ColourChoice` -- one of the eight slots, or any hex the user picked. Auto
+colours are not free-floating: :func:`resolve_auto` keeps each group's stored
+slot unless a manual colour on screen is too close to it, in which case only
+that group moves, to the free hue furthest from everything else displayed.
+
 There are deliberately only eight. Past eight, adjacent hues stop being
 distinguishable under colour-vision deficiency, so a chart folds its tail into
 :data:`OTHER` rather than inventing a ninth hue.
@@ -30,10 +36,23 @@ distinguishable under colour-vision deficiency, so a chart folds its tail into
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 
-__all__ = ["OTHER", "PALETTE", "Swatch", "next_slot", "swatch_for_slot", "text_colour_on"]
+from minmax.core.colourmath import delta_e, linear_rgb, normalise_hex, separation
+
+__all__ = [
+    "CLEAR_SEPARATION",
+    "OTHER",
+    "PALETTE",
+    "SLOT_NAMES",
+    "ColourChoice",
+    "Swatch",
+    "next_slot",
+    "resolve_auto",
+    "swatch_for_slot",
+    "text_colour_on",
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,6 +78,52 @@ PALETTE: tuple[Swatch, ...] = (
     Swatch(light="#4a3aa7", dark="#9085e9"),  # violet
     Swatch(light="#e34948", dark="#e66767"),  # red
 )
+
+#: What to call each slot, for a picker's tooltips and a screen reader. Parallel
+#: to :data:`PALETTE`.
+SLOT_NAMES: tuple[str, ...] = (
+    "Blue",
+    "Orange",
+    "Aqua",
+    "Yellow",
+    "Magenta",
+    "Green",
+    "Violet",
+    "Red",
+)
+
+#: How far (see :func:`~minmax.core.colourmath.separation`) an auto colour must
+#: stay from a colour the user chose. ``1.0`` is exactly the "clear" thresholds.
+CLEAR_SEPARATION = 1.0
+
+
+@dataclass(frozen=True, slots=True)
+class ColourChoice:
+    """A colour the user picked: one palette slot, or an arbitrary hex.
+
+    Exactly one field is set. A slot keeps its separate light and dark steps; a
+    custom hex is one colour on both surfaces, because there is no principled way
+    to re-step an arbitrary colour for a dark surface without changing which
+    colour the user chose.
+    """
+
+    slot: int | None = None
+    hex: str | None = None
+
+    def __post_init__(self) -> None:
+        if (self.slot is None) == (self.hex is None):
+            raise ValueError("a colour choice is exactly one of a slot or a hex")
+        if self.slot is not None and not 0 <= self.slot < len(PALETTE):
+            raise ValueError(f"palette slot {self.slot} is out of range")
+        if self.hex is not None:
+            object.__setattr__(self, "hex", normalise_hex(self.hex))
+
+    def swatch(self) -> Swatch:
+        if self.slot is not None:
+            return PALETTE[self.slot]
+        assert self.hex is not None  # guaranteed by __post_init__
+        return Swatch(light=self.hex, dark=self.hex)
+
 
 #: The folded tail. Deliberately neutral: "Other" is not an identity, and giving
 #: it a hue would imply it were one more category alongside the rest.
@@ -89,24 +154,93 @@ def next_slot(already_assigned: Iterable[int]) -> int:
     return min(counts, key=lambda slot: (counts[slot], slot))
 
 
+def _apart(first: Swatch, second: Swatch) -> float:
+    """Separation of two swatches on their worst surface."""
+    return min(
+        separation(first.light, second.light),
+        separation(first.dark, second.dark),
+    )
+
+
+def _visual_gap(first: Swatch, second: Swatch) -> float:
+    """Plain normal-vision distance between two swatches, on their worst surface."""
+    return min(delta_e(first.light, second.light), delta_e(first.dark, second.dark))
+
+
+def resolve_auto(
+    auto_keys: Sequence[str],
+    home_slots: Mapping[str, int],
+    manual: Sequence[Swatch],
+) -> dict[str, int]:
+    """Choose a palette slot for each auto-coloured series on screen.
+
+    ``auto_keys`` are the series with no manual colour, ``home_slots`` the slot
+    each was stored with (see :func:`next_slot`), and ``manual`` the swatches of
+    every series on screen the user coloured by hand. Only what is displayed
+    together matters: a manual colour on a series not on screen constrains nothing.
+
+    Two rules, in order:
+
+    1. **Stay put.** A series keeps its home slot unless a manual colour is
+       closer than :data:`CLEAR_SEPARATION` to it, or another auto series already
+       holds it. Colour follows the entity, so a pick elsewhere never repaints a
+       series it does not collide with.
+    2. **Otherwise go furthest.** The displaced series are given the unused
+       slots in order of how visibly far each is (plain colour distance, not the
+       stricter test above) from its closest *fixed* colour -- the
+       manual colours and the auto series that stayed put. Ranking against the
+       fixed set only, rather than picking one series at a time, is what leaves
+       the slots that clash with a manual colour for last: a series-by-series
+       pick would spend a clashing slot early on and strand a clear one. Ties
+       go to the lower slot.
+
+    Series are visited in sorted order so the result never depends on the order
+    the caller happened to list them in. If there are more auto series than slots
+    the least-used slots are reused rather than failing.
+    """
+    chosen: dict[str, int] = {}
+    uses = dict.fromkeys(range(len(PALETTE)), 0)
+
+    def clear_of_manual(slot: int) -> bool:
+        return all(_apart(PALETTE[slot], other) >= CLEAR_SEPARATION for other in manual)
+
+    ordered = sorted(auto_keys)
+    displaced: list[str] = []
+    for key in ordered:
+        home = home_slots.get(key)
+        if (
+            home is not None
+            and 0 <= home < len(PALETTE)
+            and uses[home] == 0
+            and clear_of_manual(home)
+        ):
+            chosen[key] = home
+            uses[home] += 1
+        else:
+            displaced.append(key)
+
+    fixed = [*manual, *(PALETTE[slot] for slot in chosen.values())]
+
+    def room_from_fixed(slot: int) -> float:
+        return min((_visual_gap(PALETTE[slot], other) for other in fixed), default=float("inf"))
+
+    room = {slot: room_from_fixed(slot) for slot in range(len(PALETTE))}
+    for key in displaced:
+        # Unused slots first, then by room; reuse only begins once every slot
+        # has been given out.
+        best = min(uses, key=lambda slot: (uses[slot], -room[slot], slot))
+        chosen[key] = best
+        uses[best] += 1
+
+    return chosen
+
+
 def text_colour_on(background: str) -> str:
     """Black or white, whichever stays readable on ``background``.
 
     Uses the WCAG relative-luminance threshold so the choice is a contrast
     judgement rather than a guess.
     """
-    red, green, blue = _to_linear_rgb(background)
+    red, green, blue = linear_rgb(background)
     luminance = 0.2126 * red + 0.7152 * green + 0.0722 * blue
     return "#000000" if luminance > 0.179 else "#FFFFFF"
-
-
-def _to_linear_rgb(hex_colour: str) -> tuple[float, float, float]:
-    text = hex_colour.lstrip("#")
-    if len(text) != 6:
-        raise ValueError(f"{hex_colour!r} is not a #RRGGBB colour")
-
-    channels = []
-    for offset in (0, 2, 4):
-        value = int(text[offset : offset + 2], 16) / 255.0
-        channels.append(value / 12.92 if value <= 0.04045 else ((value + 0.055) / 1.055) ** 2.4)
-    return channels[0], channels[1], channels[2]

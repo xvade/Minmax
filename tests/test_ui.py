@@ -23,12 +23,17 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 pytest.importorskip("PySide6", reason="the desktop UI is an optional extra")
 
-from PySide6.QtCore import QPoint
-from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
+from PySide6.QtCore import QPoint, Qt
+from PySide6.QtGui import QColor
+from PySide6.QtTest import QTest
+from PySide6.QtWidgets import QApplication, QColorDialog, QFileDialog, QLabel, QMessageBox
 
 from minmax.api import (
     MAX_INTERVAL_COUNT,
+    PALETTE,
+    SLOT_NAMES,
     Aggregate,
+    ColourChoice,
     CorrelationRow,
     Granularity,
     InProcessClient,
@@ -45,6 +50,7 @@ from minmax.core.timeline import DEFAULT_PIXELS_PER_HOUR, MAX_PIXELS_PER_HOUR
 from minmax.ingest import TimecardCsvImporter, run_import
 from minmax.storage.repository import Repository
 from minmax.ui import shortcuts as bindings
+from minmax.ui.colour_picker import ColourPicker, SwatchGrid
 from minmax.ui.correlations_view import CorrelationsTable
 from minmax.ui.dialogs import IntervalDialog
 from minmax.ui.main_window import MAX_WINDOW_DAYS, MainWindow
@@ -2285,3 +2291,227 @@ class TestViewShading:
         covered = sorted([*gaps, *loaded.active_spans])
         total = sum(end - start for start, end in covered)
         assert total == loaded.end_epoch - loaded.start_epoch
+
+
+class TestSeriesColours:
+    """Choosing a series' colour: the picker, the legend that opens it, and the
+    trends screen that stores the choice and repaints."""
+
+    # -- the picker widget ------------------------------------------------
+
+    def test_the_picker_marks_the_current_choice(self, qt_app: QApplication) -> None:
+        auto = ColourPicker("x", None)
+        assert auto.auto_button.isChecked() and not auto.custom_button.isChecked()
+        assert auto.grid._selected is None
+
+        slot = ColourPicker("x", ColourChoice(slot=3))
+        assert not slot.auto_button.isChecked() and slot.grid._selected == 3
+
+        custom = ColourPicker("x", ColourChoice(hex="#ff2d95"))
+        assert custom.custom_button.isChecked() and "#ff2d95" in custom.custom_button.text()
+        assert custom.grid._selected is None
+
+    def test_auto_reports_none_and_closes(self, qt_app: QApplication) -> None:
+        picker = ColourPicker("x", ColourChoice(slot=1))
+        heard: list[object] = []
+        picker.chosen.connect(heard.append)
+        picker.show()
+
+        picker.auto_button.click()
+
+        assert heard == [None]
+        assert not picker.isVisible()
+
+    def test_clicking_a_hue_reports_that_slot(self, qt_app: QApplication) -> None:
+        picker = ColourPicker("x", None)
+        heard: list[object] = []
+        picker.chosen.connect(heard.append)
+        picker.show()
+        centre = picker.grid.cell_rect(5).center().toPoint()
+
+        QTest.mouseClick(picker.grid, Qt.MouseButton.LeftButton, pos=centre)
+
+        assert heard == [ColourChoice(slot=5)]
+
+    def test_the_gaps_between_hues_are_not_clickable(self, qt_app: QApplication) -> None:
+        grid = SwatchGrid()
+        between = QPoint(int(grid.cell_rect(0).right()) + 2, 5)
+        assert grid.slot_at(between) is None
+        assert grid.slot_at(QPoint(-3, -3)) is None
+
+    def test_every_hue_has_a_cell_and_a_name(self, qt_app: QApplication) -> None:
+        grid = SwatchGrid()
+        assert [grid.slot_at(grid.cell_rect(i).center().toPoint()) for i in range(8)] == list(
+            range(8)
+        )
+        assert len(SLOT_NAMES) == len(PALETTE)
+
+    def test_custom_reports_the_colour_the_dialog_returned(
+        self, qt_app: QApplication, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(QColorDialog, "getColor", lambda *a, **k: QColor("#FF2D95"))
+        picker = ColourPicker("x", None)
+        heard: list[object] = []
+        picker.chosen.connect(heard.append)
+        picker.show()
+
+        picker.custom_button.click()
+
+        assert heard == [ColourChoice(hex="#ff2d95")]
+
+    def test_cancelling_the_custom_dialog_chooses_nothing(
+        self, qt_app: QApplication, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(QColorDialog, "getColor", lambda *a, **k: QColor())  # invalid
+        picker = ColourPicker("x", ColourChoice(slot=2))
+        heard: list[object] = []
+        picker.chosen.connect(heard.append)
+        picker.show()
+
+        picker.custom_button.click()
+
+        assert heard == []
+
+    # -- the legend ---------------------------------------------------------
+
+    @staticmethod
+    def _row_y(index: int) -> int:
+        return 32 + index * 30 + 15
+
+    def test_clicking_a_swatch_offers_that_series_colours(self, shown: MainWindow) -> None:
+        shown.show_trends_screen()
+        legend = shown.trends_screen.legend
+        series = legend._series[1]
+
+        QTest.mouseClick(legend, Qt.MouseButton.LeftButton, pos=QPoint(17, self._row_y(1)))
+
+        assert legend._picker is not None
+        assert series.label in legend._picker.findChild(QLabel).text()
+        legend._picker.close()
+
+    def test_right_clicking_anywhere_on_a_row_offers_the_colours(self, shown: MainWindow) -> None:
+        shown.show_trends_screen()
+        legend = shown.trends_screen.legend
+
+        QTest.mouseClick(legend, Qt.MouseButton.RightButton, pos=QPoint(150, self._row_y(0)))
+
+        assert legend._picker is not None
+        legend._picker.close()
+
+    def test_clicking_the_label_does_not(self, shown: MainWindow) -> None:
+        shown.show_trends_screen()
+        legend = shown.trends_screen.legend
+
+        QTest.mouseClick(legend, Qt.MouseButton.LeftButton, pos=QPoint(150, self._row_y(0)))
+
+        assert legend._picker is None
+
+    def test_other_has_no_colour_to_choose(self, many_categories_window: MainWindow) -> None:
+        many_categories_window.show_trends_screen()
+        legend = many_categories_window.trends_screen.legend
+        other = next(s for s in legend._series if s.is_other)
+
+        legend.open_colour_picker(other)
+
+        assert legend._picker is None
+
+    def test_a_choice_is_reported_with_the_series_path(self, shown: MainWindow) -> None:
+        shown.show_trends_screen()
+        legend = shown.trends_screen.legend
+        series = legend._series[0]
+        heard: list[tuple[str, object]] = []
+        legend.colourChosen.connect(lambda path, choice: heard.append((path, choice)))
+
+        legend.open_colour_picker(series)
+        assert legend._picker is not None
+        legend._picker.grid.slotClicked.emit(4)
+
+        assert heard == [(series.path, ColourChoice(slot=4))]
+
+    # -- the screen -----------------------------------------------------------
+
+    def test_a_choice_is_stored_and_the_chart_repaints_with_it(self, window: MainWindow) -> None:
+        screen = window.trends_screen
+        target = screen._view.series[0]
+
+        screen._on_colour_chosen(target.path, ColourChoice(hex="#ff2d95"))
+
+        redrawn = next(s for s in screen._view.series if s.path == target.path)
+        assert redrawn.swatch.light == "#ff2d95"
+        legend_row = next(s for s in screen.legend._series if s.path == target.path)
+        assert legend_row.colour == ColourChoice(hex="#ff2d95")
+
+    def test_it_survives_a_restart_because_the_client_holds_it(self, window: MainWindow) -> None:
+        screen = window.trends_screen
+        target = screen._view.series[0]
+        screen._on_colour_chosen(target.path, ColourChoice(slot=6))
+
+        screen.reload()
+
+        assert next(s for s in screen._view.series if s.path == target.path).colour == (
+            ColourChoice(slot=6)
+        )
+
+    def test_auto_hands_the_colour_back(self, window: MainWindow) -> None:
+        screen = window.trends_screen
+        target = screen._view.series[0]
+        original = target.swatch
+        screen._on_colour_chosen(target.path, ColourChoice(hex="#ff2d95"))
+
+        screen._on_colour_chosen(target.path, None)
+
+        restored = next(s for s in screen._view.series if s.path == target.path)
+        assert restored.swatch == original and restored.colour is None
+
+    def test_the_day_timeline_picks_up_the_new_colour(self, window: MainWindow) -> None:
+        screen = window.trends_screen
+        target = screen._view.series[0]
+
+        screen._on_colour_chosen(target.path, ColourChoice(hex="#ff2d95"))
+
+        window_view = window.day_screen.pane.timeline.window_view
+        assert window_view is not None
+        coloured = [r for r in window_view.records if r.top_level == target.path]
+        assert coloured, "the sample's busiest group should appear on the loaded days"
+        assert all(r.swatch.light == "#ff2d95" for r in coloured)
+
+    def test_colour_changed_is_announced(self, window: MainWindow) -> None:
+        screen = window.trends_screen
+        heard: list[bool] = []
+        screen.colourChanged.connect(lambda: heard.append(True))
+
+        screen._on_colour_chosen(screen._view.series[0].path, ColourChoice(slot=0))
+
+        assert heard == [True]
+
+    def test_recolouring_inside_an_other_breakdown_stays_in_it(
+        self, many_categories_window: MainWindow
+    ) -> None:
+        screen = many_categories_window.trends_screen
+        other = next(s for s in screen._view.series if s.is_other)
+        screen.push_other(other.label)
+        shown_labels = [s.label for s in screen._view.series]
+        member = screen._view.series[0]
+
+        screen._on_colour_chosen(member.path, ColourChoice(hex="#ff2d95"))
+
+        assert [s.label for s in screen._view.series] == shown_labels
+        assert "Other" in screen._title()
+        assert screen._view.series[0].swatch.light == "#ff2d95"
+        # ...and Escape still backs out to the series it was folded out of.
+        screen.pop_focus()
+        assert any(s.is_other for s in screen._view.series)
+
+    def test_a_focused_sub_category_is_coloured_by_its_full_path(self, window: MainWindow) -> None:
+        screen = window.trends_screen
+        parent = next(s for s in screen._view.series if s.can_drill)
+        screen.push_focus(parent.label)
+        child = screen._view.series[0]
+        assert child.path.startswith(parent.path + "/")
+
+        screen._on_colour_chosen(child.path, ColourChoice(slot=7))
+
+        assert screen._view.series[0].swatch == PALETTE[7]
+        screen.pop_focus()
+        top = next(s for s in screen._view.series if s.path == parent.path)
+        assert top.colour is None
