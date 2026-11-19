@@ -550,6 +550,84 @@ class TestExclusiveStreams:
         )
         assert outcome.inserted == 2
 
+    def test_a_long_stored_run_is_still_found_by_a_late_overlapping_row(
+        self, repository: Repository, stream: Stream, run_id: int
+    ) -> None:
+        # The overlap query is bounded by the longest stored run so that it can use
+        # the start-time index. The bound must not hide a long run that began hours
+        # before the incoming row, with short rows stored after it.
+        repository.insert_intervals(
+            stream,
+            run_id,
+            [
+                record("sleep", "2026-06-06T00:00:00-07:00", "2026-06-06T10:00:00-07:00"),
+                record("admin", "2026-06-06T10:00:00-07:00", "2026-06-06T10:05:00-07:00"),
+            ],
+        )
+        with pytest.raises(OverlapError, match="overlaps stored"):
+            repository.insert_intervals(
+                stream,
+                run_id,
+                [record("social", "2026-06-06T09:30:00-07:00", "2026-06-06T09:45:00-07:00")],
+            )
+
+    def test_a_row_just_past_the_longest_run_is_accepted(
+        self, repository: Repository, stream: Stream, run_id: int
+    ) -> None:
+        repository.insert_intervals(
+            stream,
+            run_id,
+            [record("sleep", "2026-06-06T00:00:00-07:00", "2026-06-06T10:00:00-07:00")],
+        )
+        outcome = repository.insert_intervals(
+            stream,
+            run_id,
+            [record("social", "2026-06-06T10:00:00-07:00", "2026-06-06T10:30:00-07:00")],
+        )
+        assert outcome.inserted == 1
+
+    def test_a_new_row_is_checked_even_in_a_batch_of_already_stored_ones(
+        self, repository: Repository, stream: Stream, run_id: int
+    ) -> None:
+        # The new row clashes with a stored run that is *not* part of the batch,
+        # so only the check against storage can catch it -- and it must still run
+        # when most of the batch is rows that are skipped as already stored.
+        in_batch = [
+            record("admin", "2026-06-06T09:00:00-07:00", "2026-06-06T10:00:00-07:00"),
+            record("social", "2026-06-06T10:00:00-07:00", "2026-06-06T11:00:00-07:00"),
+        ]
+        elsewhere = record("sleep", "2026-06-06T12:00:00-07:00", "2026-06-06T13:00:00-07:00")
+        repository.insert_intervals(stream, run_id, [*in_batch, elsewhere])
+        clashing = record("media", "2026-06-06T12:30:00-07:00", "2026-06-06T12:45:00-07:00")
+        with pytest.raises(OverlapError, match="overlaps stored"):
+            repository.insert_intervals(stream, run_id, [*in_batch, clashing])
+
+    def test_reimporting_a_grown_file_checks_only_the_new_rows(
+        self, repository: Repository, connection: sqlite3.Connection, stream: Stream, run_id: int
+    ) -> None:
+        """Auto-fetch re-imports a growing file every minute. The overlap check
+        used to run one query for every row in it, stored or not -- quadratic,
+        and 19 s on a 33k-row stream."""
+        rows = [
+            record(
+                f"cat{i % 5}",
+                f"2026-06-06T{i // 60:02d}:{i % 60:02d}:00-07:00",
+                f"2026-06-06T{i // 60:02d}:{i % 60:02d}:30-07:00",
+            )
+            for i in range(600)
+        ]
+        repository.insert_intervals(stream, run_id, rows[:-2])
+
+        overlap_queries: list[str] = []
+        connection.set_trace_callback(
+            lambda sql: overlap_queries.append(sql) if "recorded_path, started_at" in sql else None
+        )
+        outcome = repository.insert_intervals(stream, run_id, rows)
+        connection.set_trace_callback(None)
+
+        assert outcome.inserted == 2
+        assert len(overlap_queries) == 2
+
     def test_a_non_exclusive_stream_permits_overlaps(self, repository: Repository) -> None:
         calendar = repository.ensure_stream(
             "calendar", "Calendar", StreamKind.INTERVAL, exclusive=False
@@ -1689,3 +1767,87 @@ class TestMaskedDailyEventCounts:
         assert len(totals) == 1
         assert totals[0].record_count == 1
         assert totals[0].seconds == 0
+
+
+class TestImportSourceNames:
+    def test_returns_only_the_requested_runs(
+        self, repository: Repository, stream: Stream, run_id: int
+    ) -> None:
+        assert stream.id is not None
+        other = repository.begin_import(
+            stream.id, importer="t", source_name="other.csv", source_sha256="2" * 64,
+            archived_path=None,
+        )  # fmt: skip
+        repository.begin_import(
+            stream.id, importer="t", source_name="unwanted.csv", source_sha256="3" * 64,
+            archived_path=None,
+        )  # fmt: skip
+        names = repository.import_source_names([other, other, run_id])
+        assert set(names) == {other, run_id}
+        assert names[other] == "other.csv"
+
+    def test_nothing_requested_is_nothing_returned(self, repository: Repository) -> None:
+        assert repository.import_source_names([]) == {}
+
+    def test_more_runs_than_one_query_chunk_are_all_found(
+        self, repository: Repository, stream: Stream
+    ) -> None:
+        assert stream.id is not None
+        ids = [
+            repository.begin_import(
+                stream.id,
+                importer="t",
+                source_name=f"f{i}.csv",
+                source_sha256=f"{i:064x}",
+                archived_path=None,
+            )
+            for i in range(1200)
+        ]
+        names = repository.import_source_names(ids)
+        assert len(names) == 1200
+        assert names[ids[777]] == "f777.csv"
+
+
+class TestSiblingRepository:
+    def test_a_sibling_shares_the_data_but_not_the_connection(
+        self, repository: Repository, stream: Stream
+    ) -> None:
+        sibling = repository.open_sibling()
+        assert sibling is not None
+        try:
+            assert sibling.connection is not repository.connection
+            assert [s.key for s in sibling.list_streams()] == [stream.key]
+        finally:
+            sibling.close()
+
+    def test_it_can_be_opened_and_used_from_another_thread(
+        self, repository: Repository, stream: Stream
+    ) -> None:
+        import threading
+
+        found: list[str] = []
+        failures: list[BaseException] = []
+
+        def work() -> None:
+            try:
+                sibling = repository.open_sibling()
+                assert sibling is not None
+                found.extend(s.key for s in sibling.list_streams())
+                sibling.close()
+            except BaseException as error:
+                failures.append(error)
+
+        thread = threading.Thread(target=work)
+        thread.start()
+        thread.join()
+
+        assert failures == []
+        assert found == [stream.key]
+
+    def test_an_in_memory_database_has_no_sibling(self) -> None:
+        from minmax.storage.database import migrate
+
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        migrate(conn)
+        assert Repository(conn).open_sibling() is None

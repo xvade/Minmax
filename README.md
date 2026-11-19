@@ -359,6 +359,12 @@ and a file the importer does not recognise (or one that overlaps stored data)
 is reported rather than crashing the app. New rows refresh whatever is on
 screen; a duplicate-only re-import leaves it untouched.
 
+**Imports run in the background.** The window stays responsive while a large
+file is read and stored: a status-bar indicator ("importing apm.csv…") shows
+while one is in flight, and the result is reported when it lands. Imports run
+one at a time, in the order you asked for them. Closing the window waits for the
+one in progress to finish rather than abandoning it halfway.
+
 #### Auto-fetch
 
 The "Auto-fetch every minute" checkbox beside the stream picker re-imports the
@@ -370,7 +376,10 @@ with no remembered path yet asks you to pick the file, tries it immediately
 from then on. Re-importing a growing file merges rather than duplicates, and
 backs it up, the same way any import does — see
 [How the data is stored](#how-the-data-is-stored) — so nothing new was built
-for either; the timer just calls the same path a manual import would.
+for either; the timer just calls the same path a manual import would. Each
+fetch runs in the background like any other import; if one is still running
+when the next minute comes round, that stream is skipped for the tick rather
+than queued behind it.
 
 If the file goes missing, or the merge itself fails (say it now conflicts
 with something already stored), you are asked once for a replacement; cancel
@@ -616,7 +625,11 @@ recognizable as the same data under a different filename.
 
 **Raw files are kept forever.** Imports are archived byte-for-byte before
 parsing. If a parser turns out to be wrong, the fix is to revert and re-import,
-never to hand-edit the database.
+never to hand-edit the database. **Known problem:** a file that grows between
+imports hashes differently each time, so auto-fetch archives a complete new copy
+every minute. On a live feed that is tens of gigabytes within weeks. The policy
+for that is an open decision in `TODO.md`; until it is made, check the size of
+`~/.minmax/archive`.
 
 **A point-in-time stream's payload is columns, not a blob.** Its declared
 fields (`stream_field`) and their values (`event_value`) are ordinary rows

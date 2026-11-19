@@ -716,7 +716,14 @@ class MinmaxClient(Protocol):
 
     def import_file(self, path: Path, *, stream_key: str, force: bool = False) -> ImportOutcome:
         """Archive, parse, and store one source file, exactly as the CLI's
-        ``import`` command does."""
+        ``import`` command does.
+
+        **Must be callable from a worker thread** while other methods are being
+        called from the UI thread: an import can take seconds on a large file,
+        and a UI that waits for it is frozen. An implementation that holds
+        thread-affine state (a database connection) has to give an import its
+        own. Nothing else on this protocol makes that promise.
+        """
 
     def create_stream(
         self,
@@ -1418,21 +1425,37 @@ class InProcessClient:
     # -- importing ---------------------------------------------------------
 
     def import_file(self, path: Path, *, stream_key: str, force: bool = False) -> ImportOutcome:
+        """See the protocol. Safe to call from a worker thread (own connection)."""
         if self._home is None:
             raise RuntimeError(
                 "this client has no data directory to archive imports into "
                 "(construct InProcessClient with home=...)"
             )
 
+        # Opens its own connection when it can, so a caller may run this on a
+        # worker thread while the UI keeps reading through the shared one. The
+        # import itself is one short write transaction; WAL lets readers carry on.
+        sibling = self._repository.open_sibling()
+        repository = sibling if sibling is not None else self._repository
         try:
-            importer = importer_for(self._repository, stream_key)
+            return self._import_with(repository, path, stream_key=stream_key, force=force)
+        finally:
+            if sibling is not None:
+                sibling.close()
+
+    def _import_with(
+        self, repository: Repository, path: Path, *, stream_key: str, force: bool
+    ) -> ImportOutcome:
+        assert self._home is not None  # checked by import_file
+        try:
+            importer = importer_for(repository, stream_key)
         except (LookupError, ValueError) as error:
             return ImportOutcome(source_name=path.name, stream_key=stream_key, error=str(error))
         if not path.is_file():
             return ImportOutcome(source_name=path.name, error=f"no such file: {path}")
 
         try:
-            report = run_import(self._repository, importer, path, home=self._home, force=force)
+            report = run_import(repository, importer, path, home=self._home, force=force)
         except (OverlapError, ValueError) as error:
             # OverlapError means the data conflicts with what is already
             # stored; ValueError means the importer does not recognise the
@@ -1597,7 +1620,7 @@ class InProcessClient:
         inspected, so that clicking a block is not a second round trip -- the
         import table is a handful of rows however much history exists.
         """
-        sources = {run.id: run.source_name for run in self._repository.list_imports()}
+        sources = self._repository.import_source_names(item.import_run_id for item in intervals)
         records: list[TimelineRecord] = []
         for item in intervals:
             top_level = paths.top_level(item.category_path)
@@ -1633,7 +1656,7 @@ class InProcessClient:
         no span, only an instant, so a renderer draws a marker rather than a
         block.
         """
-        sources = {run.id: run.source_name for run in self._repository.list_imports()}
+        sources = self._repository.import_source_names(item.import_run_id for item in events)
         records: list[TimelineRecord] = []
         for item in events:
             top_level = paths.top_level(item.category_path)

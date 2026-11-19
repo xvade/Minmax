@@ -337,7 +337,31 @@ from parts that already existed rather than as a new pipeline:
   reason a re-import already was: the natural-key constraint on
   `interval_record` / `event_record` recognises rows it has already stored, so
   reading the whole file fresh each minute only ever inserts what is new.
-  Nothing incremental needed building.
+  *Inserts*, that is -- the cost is another matter. Measured on real feeds
+  (85k-row event CSV, 33k-row interval CSVs), the first version spent ~25 s per
+  tick on the UI thread: the exclusive-stream overlap check ran one query per
+  row in the file, stored or not, and was quadratic. `_reject_overlaps` now
+  skips rows whose natural key is already stored (they were checked when first
+  inserted) and bounds the rest by the longest stored interval so the query
+  uses the start-time index. What remains is the full re-parse of an
+  append-only file -- ~1 s of CPU for 85k rows -- logged in `TODO.md` as a
+  possible append-only fast path.
+- **Imports run on a worker thread (`ui/import_runner.py`), one at a time.**
+  `InProcessClient.import_file` opens its own SQLite connection
+  (`Repository.open_sibling`) because a connection cannot be used from two
+  threads; WAL lets the UI keep reading while the import writes, and the import
+  is one short transaction so the UI's own occasional writes wait milliseconds on
+  `busy_timeout`, not seconds. Results come back as queued Qt signals, so every
+  dialog and every screen refresh still happens on the UI thread. The
+  `MinmaxClient` protocol states the requirement -- `import_file` must be
+  callable from a worker thread -- so a future `HttpClient` has to honour it
+  too. A tick skips a stream whose previous import is still running instead of
+  stacking another behind it.
+- **The same applies to reads that scale with history, not with the view.**
+  `window()` used to build a name map from *every* import run ever made to label
+  a few days of records -- ~350 ms once auto-fetch had made 89k runs. It now
+  looks up only the runs the records reference
+  (`Repository.import_source_names`).
 - **Backing up is a side effect of the existing archive step**, not new
   behaviour either: `run_import` hashes before archiving and skips the archive
   entirely when the content matches the last import, so an unattended feed

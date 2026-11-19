@@ -1167,6 +1167,8 @@ class TestFileImport:
 
         window._import_path(extra)
 
+        window.wait_for_imports()
+
         assert window.day_screen._bounds == (date(2026, 6, 5), date(2026, 6, 7))
         assert window.trends_screen._view.until == date(2026, 6, 7)
 
@@ -1178,6 +1180,8 @@ class TestFileImport:
         bounds_before = window.day_screen._bounds
 
         window._import_path(Path("/no/such/file.csv"))
+
+        window.wait_for_imports()
 
         assert len(warnings) == 1
         assert "no such file" in warnings[0][-1]
@@ -1197,6 +1201,8 @@ class TestFileImport:
 
         window._import_path(sample_csv)
 
+        window.wait_for_imports()
+
         assert len(questions) == 1
         assert "already imported" in questions[0][-1]
 
@@ -1208,6 +1214,8 @@ class TestFileImport:
         monkeypatch.setattr(QMessageBox, "information", lambda *a, **k: reports.append(a))
 
         window._import_path(sample_csv)
+
+        window.wait_for_imports()
 
         assert len(reports) == 1
         assert "4 already present" in reports[0][-1]
@@ -1264,6 +1272,8 @@ class TestAutoFetch:
 
         window._auto_fetch_checkbox.setChecked(True)
 
+        window.wait_for_imports()
+
         [summary] = [s for s in window._client.streams() if s.key == "timecard"]
         assert summary.watch_enabled
         assert summary.watch_path == str(feed)
@@ -1276,6 +1286,8 @@ class TestAutoFetch:
         monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *a, **k: ("", ""))
 
         window._auto_fetch_checkbox.setChecked(True)
+
+        window.wait_for_imports()
 
         assert not window._auto_fetch_checkbox.isChecked()
         [summary] = [s for s in window._client.streams() if s.key == "timecard"]
@@ -1294,6 +1306,8 @@ class TestAutoFetch:
 
         window._run_auto_fetch()
 
+        window.wait_for_imports()
+
         assert window.day_screen._bounds == (date(2026, 6, 5), date(2026, 6, 7))
         assert "auto-fetched" in window.statusBar().currentMessage()
 
@@ -1311,6 +1325,8 @@ class TestAutoFetch:
 
         window._run_auto_fetch()
 
+        window.wait_for_imports()
+
         assert window.day_screen._bounds == bounds_before
 
     def test_a_missing_file_prompts_once_and_pauses_on_cancel(
@@ -1322,6 +1338,8 @@ class TestAutoFetch:
         monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *a, **k: ("", ""))
 
         window._run_auto_fetch()
+
+        window.wait_for_imports()
 
         [summary] = [s for s in window._client.streams() if s.key == "timecard"]
         assert not summary.watch_enabled
@@ -1344,6 +1362,8 @@ class TestAutoFetch:
 
         window._run_auto_fetch()
 
+        window.wait_for_imports()
+
         [summary] = [s for s in window._client.streams() if s.key == "timecard"]
         assert summary.watch_enabled
         assert summary.watch_path == str(replacement)
@@ -1360,6 +1380,8 @@ class TestAutoFetch:
         monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *a, **k: (str(also_missing), ""))
 
         window._run_auto_fetch()
+
+        window.wait_for_imports()
 
         [summary] = [s for s in window._client.streams() if s.key == "timecard"]
         assert not summary.watch_enabled
@@ -1381,6 +1403,8 @@ class TestAutoFetch:
         bounds_before = window.day_screen._bounds
 
         window._run_auto_fetch()
+
+        window.wait_for_imports()
 
         assert window.day_screen._bounds == bounds_before
 
@@ -1600,6 +1624,8 @@ class TestPromptForNewStream:
 
         window.prompt_for_new_stream()
 
+        window.wait_for_imports()
+
         assert window._stream_key == "pickups"
         assert {s.key for s in window._client.streams()} == {"timecard", "pickups"}
         assert window._client.bounds("pickups") == (date(2026, 6, 6), date(2026, 6, 6))
@@ -1632,6 +1658,8 @@ class TestPromptForNewStream:
 
         window.prompt_for_new_stream()
 
+        window.wait_for_imports()
+
         assert len(warnings) == 1
         assert "already exists" in warnings[0][-1]
         assert window._stream_key == "timecard"
@@ -1661,6 +1689,8 @@ class TestPromptForNewStream:
         monkeypatch.setattr(QMessageBox, "information", lambda *a, **k: None)
 
         window.prompt_for_new_stream()
+
+        window.wait_for_imports()
 
         assert window._stream_key == "sessions"
         summary = next(s for s in window._client.streams() if s.key == "sessions")
@@ -2515,3 +2545,193 @@ class TestSeriesColours:
         screen.pop_focus()
         top = next(s for s in screen._view.series if s.path == parent.path)
         assert top.colour is None
+
+
+class TestBackgroundImport:
+    """An import never runs on the UI thread: a window that waits for one is a
+    spinning beachball. These tests hold an import open on purpose and check the
+    event loop keeps turning."""
+
+    FEED = (
+        "timer_id,timer_name,started_at,stopped_at,duration_seconds\n"
+        "NEW1,reading,2026-06-07T09:00:00-07:00,2026-06-07T10:00:00-07:00,3600\n"
+    )
+
+    @staticmethod
+    def _gate(window: MainWindow, monkeypatch: pytest.MonkeyPatch) -> tuple[object, list[str]]:
+        """Make the client's import block until released. Returns the release
+        event and a log of the stream keys that began importing."""
+        import threading
+
+        release = threading.Event()
+        started: list[str] = []
+        real = window._client.import_file
+
+        def gated(path: Path, *, stream_key: str, force: bool = False):  # type: ignore[no-untyped-def]
+            started.append(stream_key)
+            release.wait(timeout=20)
+            return real(path, stream_key=stream_key, force=force)
+
+        monkeypatch.setattr(window._client, "import_file", gated)
+        return release, started
+
+    def test_starting_an_import_returns_before_it_finishes(
+        self, monkeypatch: pytest.MonkeyPatch, window: MainWindow, tmp_path: Path
+    ) -> None:
+        monkeypatch.setattr(QMessageBox, "information", lambda *a, **k: None)
+        release, _ = self._gate(window, monkeypatch)
+        feed = tmp_path / "feed.csv"
+        feed.write_text(self.FEED, encoding="utf-8")
+        bounds_before = window.day_screen._bounds
+
+        window._import_path(feed)
+
+        assert window._imports.busy
+        assert window.day_screen._bounds == bounds_before  # nothing has landed yet
+        release.set()  # type: ignore[attr-defined]
+        assert window.wait_for_imports()
+        assert window.day_screen._bounds == (date(2026, 6, 5), date(2026, 6, 7))
+
+    def test_the_event_loop_keeps_turning_while_an_import_is_held_open(
+        self, monkeypatch: pytest.MonkeyPatch, window: MainWindow, tmp_path: Path
+    ) -> None:
+        from PySide6.QtCore import QTimer
+
+        monkeypatch.setattr(QMessageBox, "information", lambda *a, **k: None)
+        release, started = self._gate(window, monkeypatch)
+        feed = tmp_path / "feed.csv"
+        feed.write_text(self.FEED, encoding="utf-8")
+        beats: list[int] = []
+        timer = QTimer()
+        timer.setInterval(5)
+        timer.timeout.connect(lambda: beats.append(1))
+        timer.start()
+
+        window._import_path(feed)
+        # The import is blocked inside the client. If it were on this thread this
+        # loop would never run, and the heartbeat would never tick.
+        for _ in range(100):
+            QApplication.processEvents()
+            if len(beats) >= 5 and started:
+                break
+            QTest.qWait(5)
+        timer.stop()
+
+        assert started == ["timecard"]
+        assert len(beats) >= 5
+        release.set()  # type: ignore[attr-defined]
+        assert window.wait_for_imports()
+
+    def test_the_busy_indicator_shows_only_while_importing(
+        self, monkeypatch: pytest.MonkeyPatch, shown: MainWindow, tmp_path: Path
+    ) -> None:
+        monkeypatch.setattr(QMessageBox, "information", lambda *a, **k: None)
+        release, _ = self._gate(shown, monkeypatch)
+        feed = tmp_path / "feed.csv"
+        feed.write_text(self.FEED, encoding="utf-8")
+        assert not shown._busy_bar.isVisible()
+
+        shown._import_path(feed)
+
+        assert shown._busy_bar.isVisible()
+        assert "feed.csv" in shown._busy_label.text()
+        release.set()  # type: ignore[attr-defined]
+        shown.wait_for_imports()
+        assert not shown._busy_bar.isVisible()
+        assert not shown._busy_label.isVisible()
+
+    def test_a_tick_skips_a_stream_whose_import_is_still_running(
+        self, monkeypatch: pytest.MonkeyPatch, window: MainWindow, tmp_path: Path
+    ) -> None:
+        release, started = self._gate(window, monkeypatch)
+        feed = tmp_path / "feed.csv"
+        feed.write_text(self.FEED, encoding="utf-8")
+        window._client.set_auto_fetch("timecard", enabled=True, path=feed)
+
+        window._run_auto_fetch()
+        window._run_auto_fetch()
+        window._run_auto_fetch()
+        release.set()  # type: ignore[attr-defined]
+        window.wait_for_imports()
+
+        assert started == ["timecard"]  # not three queued imports
+
+    def test_imports_run_one_at_a_time_in_the_order_asked(
+        self, monkeypatch: pytest.MonkeyPatch, window: MainWindow, tmp_path: Path
+    ) -> None:
+        monkeypatch.setattr(QMessageBox, "information", lambda *a, **k: None)
+        order: list[str] = []
+        real = window._client.import_file
+
+        def recording(path: Path, *, stream_key: str, force: bool = False):  # type: ignore[no-untyped-def]
+            order.append(path.name)
+            return real(path, stream_key=stream_key, force=force)
+
+        monkeypatch.setattr(window._client, "import_file", recording)
+        first = tmp_path / "first.csv"
+        second = tmp_path / "second.csv"
+        first.write_text(self.FEED, encoding="utf-8")
+        second.write_text(
+            self.FEED.replace("NEW1", "NEW2").replace("06-07", "06-08"), encoding="utf-8"
+        )
+
+        window._import_path(first)
+        window._import_path(second)
+        window.wait_for_imports()
+
+        assert order == ["first.csv", "second.csv"]
+
+    def test_an_exception_in_the_worker_is_reported_and_clears_the_indicator(
+        self, monkeypatch: pytest.MonkeyPatch, window: MainWindow, tmp_path: Path
+    ) -> None:
+        warnings: list[tuple[object, ...]] = []
+        monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: warnings.append(a))
+
+        def broken(path: Path, *, stream_key: str, force: bool = False):  # type: ignore[no-untyped-def]
+            raise RuntimeError("the disk caught fire")
+
+        monkeypatch.setattr(window._client, "import_file", broken)
+
+        window._import_path(tmp_path / "anything.csv")
+        window.wait_for_imports()
+
+        assert len(warnings) == 1 and "the disk caught fire" in warnings[0][-1]
+        assert not window._imports.busy
+
+    def test_an_exception_during_auto_fetch_takes_the_ordinary_recovery_path(
+        self, monkeypatch: pytest.MonkeyPatch, window: MainWindow, tmp_path: Path
+    ) -> None:
+        feed = tmp_path / "feed.csv"
+        feed.write_text(self.FEED, encoding="utf-8")
+        window._client.set_auto_fetch("timecard", enabled=True, path=feed)
+
+        def broken(path: Path, *, stream_key: str, force: bool = False):  # type: ignore[no-untyped-def]
+            raise OSError("permission denied")
+
+        monkeypatch.setattr(window._client, "import_file", broken)
+        monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: None)
+        monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *a, **k: ("", ""))
+
+        window._run_auto_fetch()
+        window.wait_for_imports()
+
+        [summary] = [s for s in window._client.streams() if s.key == "timecard"]
+        assert not summary.watch_enabled  # paused, not crashed
+        assert "permission denied" in window.statusBar().currentMessage()
+
+    def test_closing_the_window_lets_the_running_import_finish(
+        self, monkeypatch: pytest.MonkeyPatch, window: MainWindow, tmp_path: Path
+    ) -> None:
+        import threading
+
+        monkeypatch.setattr(QMessageBox, "information", lambda *a, **k: None)
+        release, _ = self._gate(window, monkeypatch)
+        feed = tmp_path / "feed.csv"
+        feed.write_text(self.FEED, encoding="utf-8")
+        window._import_path(feed)
+        threading.Timer(0.2, release.set).start()  # type: ignore[attr-defined]
+
+        window.close()
+
+        assert not window._imports.busy
+        assert window._client.bounds("timecard") == (date(2026, 6, 5), date(2026, 6, 7))

@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import sqlite3
 import time
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, replace
 from itertools import pairwise
 
@@ -44,7 +44,7 @@ from minmax.core.models import (
 from minmax.core.timeref import Instant, Period
 from minmax.core.windows import TimeMask
 from minmax.storage import _sql, masked, rollups
-from minmax.storage.database import transaction
+from minmax.storage.database import connect, transaction
 
 __all__ = ["InsertOutcome", "OverlapError", "Repository"]
 
@@ -73,11 +73,33 @@ class Repository:
     """Reads and writes Minmax's stored data. Owns every SQL statement."""
 
     def __init__(self, conn: sqlite3.Connection) -> None:
+        # Read here, on the thread that owns the connection: a worker thread
+        # calling open_sibling() may not touch ``conn`` to look it up.
+        self._db_file: str = conn.execute("PRAGMA database_list").fetchone()[2]
         self._conn = conn
 
     @property
     def connection(self) -> sqlite3.Connection:
         return self._conn
+
+    def open_sibling(self) -> Repository | None:
+        """A second repository on the same database file, with its own connection.
+
+        A SQLite connection cannot be used from two threads, and the WAL journal
+        lets one connection read while another writes. Safe to call from any
+        thread, unlike everything else here. Work meant for a
+        background thread -- an import -- therefore opens a sibling and closes it
+        when done, rather than sharing this one. ``None`` for a database with no
+        file behind it (in memory), which cannot be reopened; the caller then has
+        to stay on the thread that owns this connection.
+        """
+        if not self._db_file:
+            return None
+        return Repository(connect(self._db_file))
+
+    def close(self) -> None:
+        """Close this repository's connection."""
+        self._conn.close()
 
     # ------------------------------------------------------------------
     # Streams
@@ -645,6 +667,26 @@ class Repository:
             ).fetchall()
         return [_import_run_from_row(row) for row in rows]
 
+    def import_source_names(self, import_run_ids: Iterable[int]) -> dict[int, str]:
+        """File name of each given import run, without loading every run.
+
+        ``list_imports`` builds a full :class:`ImportRun` per run ever made, which
+        on a stream that auto-fetches every minute is tens of thousands. A view of
+        a few days only ever references a handful.
+        """
+        wanted = sorted(set(import_run_ids))
+        names: dict[int, str] = {}
+        # SQLite's variable limit is 32766 on current builds; chunk well below it.
+        for offset in range(0, len(wanted), 500):
+            chunk = wanted[offset : offset + 500]
+            marks = ",".join("?" * len(chunk))
+            rows = self._conn.execute(
+                f"SELECT id, source_name FROM import_run WHERE id IN ({marks})",
+                chunk,
+            )
+            names.update({row["id"]: row["source_name"] for row in rows})
+        return names
+
     def revert_import(self, import_run_id: int) -> int:
         """Delete every observation an import produced, returning the row count.
 
@@ -799,19 +841,47 @@ class Repository:
                     f"{right.start.local_datetime.isoformat()}"
                 )
 
-        for category_id, record in resolved:
+        # Against what is stored. A row whose natural key is already stored is
+        # skipped: it was checked when it was first inserted, and a re-import of a
+        # growing file presents tens of thousands of those for a handful of new
+        # rows. Without the skip this loop ran one query per stored row and was
+        # quadratic -- 19 s per auto-fetch tick on a 33k-row stream.
+        starts = [record.start.epoch_seconds for _, record in resolved]
+        already_stored = {
+            (row["category_id"], row["started_at"], row["ended_at"])
+            for row in self._conn.execute(
+                "SELECT category_id, started_at, ended_at FROM interval_record"
+                " WHERE stream_id = ? AND started_at BETWEEN ? AND ?",
+                (stream_id, min(starts), max(starts)),
+            )
+        }
+        fresh = [
+            record
+            for category_id, record in resolved
+            if (category_id, record.start.epoch_seconds, record.end.epoch_seconds)
+            not in already_stored
+        ]
+        if not fresh:
+            return
+
+        # A stored row overlapping [start, end) must satisfy ended_at > start, and
+        # ended_at = started_at + duration <= started_at + longest, so its start
+        # lies after ``start - longest``. That bound lets the query use the
+        # (stream_id, started_at) index instead of scanning every earlier row.
+        longest = self._conn.execute(
+            "SELECT COALESCE(MAX(duration_seconds), 0) FROM interval_record WHERE stream_id = ?",
+            (stream_id,),
+        ).fetchone()[0]
+        for record in fresh:
             clash = self._conn.execute(
                 "SELECT recorded_path, started_at, ended_at FROM interval_record"
-                " WHERE stream_id = ? AND started_at < ? AND ended_at > ?"
-                "   AND NOT (category_id = ? AND started_at = ? AND ended_at = ?)"
+                " WHERE stream_id = ? AND started_at > ? AND started_at < ? AND ended_at > ?"
                 " LIMIT 1",
                 (
                     stream_id,
+                    record.start.epoch_seconds - longest,
                     record.end.epoch_seconds,
                     record.start.epoch_seconds,
-                    category_id,
-                    record.start.epoch_seconds,
-                    record.end.epoch_seconds,
                 ),
             ).fetchone()
             if clash is not None:

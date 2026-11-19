@@ -24,6 +24,7 @@ from pathlib import Path
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import (
     QAction,
+    QCloseEvent,
     QDragEnterEvent,
     QDropEvent,
     QFont,
@@ -41,6 +42,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QMainWindow,
     QMessageBox,
+    QProgressBar,
     QSplitter,
     QStackedWidget,
     QVBoxLayout,
@@ -74,6 +76,7 @@ from minmax.ui.dialogs import (
     ShortcutsDialog,
     prompt_for_prefix,
 )
+from minmax.ui.import_runner import ImportJob, ImportKind, ImportResult, ImportRunner
 from minmax.ui.record_inspector import RecordInspector
 from minmax.ui.shortcuts import ShortcutMap, load_shortcuts
 from minmax.ui.summary_panel import SummaryPanel
@@ -180,6 +183,21 @@ class _ShortcutHost(QWidget):
             action.triggered.connect(getattr(self, entry.name))
             self.addAction(action)
             self._actions.append(action)
+
+
+def _outcome_of(result: ImportResult) -> ImportOutcome:
+    """The result as an :class:`ImportOutcome`, an exception included.
+
+    Auto-fetch runs unattended -- an exception from the client has to travel the
+    same recovery path as an ordinary failed import, never escape a slot.
+    """
+    if result.outcome is not None:
+        return result.outcome
+    return ImportOutcome(
+        source_name=result.job.path.name,
+        stream_key=result.job.stream_key,
+        error=str(result.error),
+    )
 
 
 class DayScreen(_ShortcutHost):
@@ -1177,6 +1195,22 @@ class MainWindow(QMainWindow):
         quit_action.triggered.connect(self.close)
         self.addAction(quit_action)
 
+        self._imports = ImportRunner(client, self)
+        self._imports.finished.connect(self._on_import_finished)
+        self._imports.activityChanged.connect(self._on_import_activity)
+        self._busy_label = QLabel()
+        self._busy_bar = QProgressBar()
+        self._busy_bar.setRange(0, 0)  # indeterminate: an import has no known length
+        self._busy_bar.setTextVisible(False)
+        # Small enough not to make the status bar taller than it was: it reserves
+        # room for its widgets even while they are hidden, and a taller bar shrinks
+        # every screen above it by the difference.
+        self._busy_bar.setFixedSize(90, 8)
+        self.statusBar().addPermanentWidget(self._busy_label)
+        self.statusBar().addPermanentWidget(self._busy_bar)
+        self._busy_label.hide()
+        self._busy_bar.hide()
+
         self._auto_fetch_timer = QTimer(self)
         self._auto_fetch_timer.setInterval(AUTO_FETCH_INTERVAL_MS)
         self._auto_fetch_timer.timeout.connect(self._run_auto_fetch)
@@ -1284,8 +1318,7 @@ class MainWindow(QMainWindow):
         # data yet, landing on today rather than wherever this data actually
         # is. Reusing _import_path still gets the new stream its usual
         # import report, force-reimport offer included.
-        self._import_path(choice.path, stream_key=choice.key)
-        self.set_stream(choice.key)
+        self._import_path(choice.path, stream_key=choice.key, switch_after=True)
 
     def prompt_to_delete_stream(self) -> None:
         """Delete the currently picked stream, after confirming.
@@ -1523,42 +1556,53 @@ class MainWindow(QMainWindow):
                 self._auto_fetch_one(summary.key, summary.name, Path(summary.watch_path))
 
     def _auto_fetch_one(self, key: str, name: str, path: Path) -> None:
-        outcome = self._try_auto_fetch(key, path)
-        if outcome.ok:
-            self._on_auto_fetch_success(key, outcome)
-            return
+        """Queue one auto-fetch import. Returns at once; the result arrives in
+        :meth:`_finish_auto_fetch` on this thread.
 
-        # Found by hand (missing file) or by merging (an OverlapError or a
-        # column-shape mismatch) -- either way nothing was stored, and per the
-        # chosen UX this asks exactly once rather than nagging every minute.
-        replacement = self._prompt_for_replacement(name, outcome.error or "unknown error")
-        if replacement is None:
-            self._pause_auto_fetch(key, name, outcome.error or "unknown error")
+        A stream whose previous import has not finished is skipped rather than
+        queued behind it: if a fetch takes longer than the tick, stacking another
+        would only grow the backlog, and the next tick tries again.
+        """
+        if self._imports.is_importing(key):
             return
+        self._imports.submit(ImportJob(path, key, kind=ImportKind.AUTO, name=name))
 
-        retry = self._try_auto_fetch(key, replacement)
-        if not retry.ok:
-            self._pause_auto_fetch(key, name, retry.error or "unknown error")
-            QMessageBox.warning(
-                self,
-                "Auto-fetch",
-                f"That didn't work either:\n{retry.error}\n\n"
-                f"Auto-fetch for {name!r} has been paused.",
+    def _finish_auto_fetch(self, result: ImportResult) -> None:
+        job = result.job
+        key = job.stream_key
+        outcome = _outcome_of(result)
+
+        if job.kind is ImportKind.AUTO:
+            if outcome.ok:
+                self._on_auto_fetch_success(key, outcome)
+                return
+
+            # Found by hand (missing file) or by merging (an OverlapError or a
+            # column-shape mismatch) -- either way nothing was stored, and per the
+            # chosen UX this asks exactly once rather than nagging every minute.
+            replacement = self._prompt_for_replacement(job.name, outcome.error or "unknown error")
+            if replacement is None:
+                self._pause_auto_fetch(key, job.name, outcome.error or "unknown error")
+                return
+            self._imports.submit(
+                ImportJob(replacement, key, kind=ImportKind.AUTO_RETRY, name=job.name)
             )
             return
 
-        self._client.set_auto_fetch(key, enabled=True, path=replacement)
-        self._on_auto_fetch_success(key, retry)
-        self.statusBar().showMessage(f"auto-fetch for {name} now uses {replacement.name}", 5_000)
+        # AUTO_RETRY: the replacement the reader just chose.
+        if not outcome.ok:
+            self._pause_auto_fetch(key, job.name, outcome.error or "unknown error")
+            QMessageBox.warning(
+                self,
+                "Auto-fetch",
+                f"That didn't work either:\n{outcome.error}\n\n"
+                f"Auto-fetch for {job.name!r} has been paused.",
+            )
+            return
 
-    def _try_auto_fetch(self, key: str, path: Path) -> ImportOutcome:
-        try:
-            return self._client.import_file(path, stream_key=key)
-        except Exception as error:
-            # This runs unattended on a timer -- an exception here must be
-            # reported through the same recovery path as a normal import
-            # failure, never left to crash the tick (or the app).
-            return ImportOutcome(source_name=path.name, stream_key=key, error=str(error))
+        self._client.set_auto_fetch(key, enabled=True, path=job.path)
+        self._on_auto_fetch_success(key, outcome)
+        self.statusBar().showMessage(f"auto-fetch for {job.name} now uses {job.path.name}", 5_000)
 
     def _on_auto_fetch_success(self, key: str, outcome: ImportOutcome) -> None:
         if not outcome.inserted:
@@ -1605,40 +1649,87 @@ class MainWindow(QMainWindow):
             self._import_path(Path(path_str))
 
     def _import_path(
-        self, path: Path, *, force: bool = False, stream_key: str | None = None
+        self,
+        path: Path,
+        *,
+        force: bool = False,
+        stream_key: str | None = None,
+        switch_after: bool = False,
     ) -> None:
-        """Import ``path``, into ``stream_key`` if given, else the current stream.
+        """Queue an import of ``path``, into ``stream_key`` if given, else the
+        current stream. Returns at once; the outcome is reported by
+        :meth:`_finish_manual_import` when the background import finishes.
 
         A caller creating a stream and importing straight into it passes
-        ``stream_key`` explicitly and switches *after* this returns
-        (:meth:`prompt_for_new_stream` does exactly that) -- switching first
-        would compute the day screen's bounds and load a window before the
-        data exists, and refreshing afterwards would just reload that same,
-        now-stale range rather than the one the new data actually landed in.
+        ``stream_key`` and ``switch_after=True`` (:meth:`prompt_for_new_stream`
+        does exactly that): the window switches *after* the import has landed and
+        been reported -- switching first would compute the day screen's bounds and
+        load a window before the data exists, and refreshing afterwards would just
+        reload that same, now-stale range rather than the one the new data
+        actually landed in.
         """
         target = stream_key if stream_key is not None else self._stream_key
+        self._imports.submit(ImportJob(path, target, force=force, switch_after=switch_after))
+
+    def _on_import_finished(self, result: ImportResult) -> None:
+        if result.job.kind is ImportKind.MANUAL:
+            self._finish_manual_import(result)
+        else:
+            self._finish_auto_fetch(result)
+
+    def _finish_manual_import(self, result: ImportResult) -> None:
+        job = result.job
         try:
-            outcome = self._client.import_file(path, stream_key=target, force=force)
-        except RuntimeError as error:
-            QMessageBox.warning(self, "Import", str(error))
-            return
+            if result.error is not None:
+                QMessageBox.warning(self, "Import", str(result.error))
+                return
 
-        if not outcome.ok:
-            QMessageBox.warning(self, "Import", f"Could not import {path.name}:\n{outcome.error}")
-            return
+            outcome = _outcome_of(result)
+            if not outcome.ok:
+                QMessageBox.warning(
+                    self, "Import", f"Could not import {job.path.name}:\n{outcome.error}"
+                )
+                return
 
-        if outcome.skipped:
-            self._offer_reimport(path, outcome, stream_key=target)
-            return
+            if outcome.skipped:
+                self._offer_reimport(job.path, outcome, stream_key=job.stream_key)
+                return
 
-        self._report_import(path, outcome)
-        if outcome.inserted and target == self._stream_key:
-            self._day_screen.refresh()
-            self._trends_screen.reload()
-        if outcome.inserted:
-            # Relevant regardless of which stream is currently picked -- a
-            # cross-stream sweep cares about every stream's data, not just it.
-            self._correlations_screen.mark_dirty()
+            self._report_import(job.path, outcome)
+            if outcome.inserted and job.stream_key == self._stream_key:
+                self._day_screen.refresh()
+                self._trends_screen.reload()
+            if outcome.inserted:
+                # Relevant regardless of which stream is currently picked -- a
+                # cross-stream sweep cares about every stream's data, not just it.
+                self._correlations_screen.mark_dirty()
+        finally:
+            if job.switch_after:
+                self.set_stream(job.stream_key)
+
+    def _on_import_activity(self, job: ImportJob | None) -> None:
+        """Show, or hide, the status-bar indicator that something is importing."""
+        if job is None:
+            self._busy_label.hide()
+            self._busy_bar.hide()
+            return
+        self._busy_label.setText(job.description + "…")
+        self._busy_label.show()
+        self._busy_bar.show()
+
+    def wait_for_imports(self, timeout_ms: int = 60_000) -> bool:
+        """Block until every queued import has finished and been reported.
+
+        For tests and for quitting; ordinary use never waits.
+        """
+        return self._imports.wait(timeout_ms)
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        # An import killed mid-write would be rolled back by SQLite, but letting
+        # the one in flight finish is cheaper than explaining a half-applied one.
+        self._auto_fetch_timer.stop()
+        self._imports.wait()
+        super().closeEvent(event)
 
     def _offer_reimport(self, path: Path, outcome: ImportOutcome, *, stream_key: str) -> None:
         detail = f"\n{outcome.notes[0]}" if outcome.notes else ""

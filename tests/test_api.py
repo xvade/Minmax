@@ -1199,3 +1199,90 @@ class TestViews:
         client = InProcessClient(repository, timezone=PACIFIC, home=home)
         with pytest.raises(LookupError, match="no view"):
             client.correlations(view="nonexistent")
+
+
+class TestImportFromAWorkerThread:
+    """The desktop app runs ``import_file`` on a background thread while the UI
+    thread keeps reading through the same client."""
+
+    def _feed(self, tmp_path: Path, name: str = "feed.csv") -> Path:
+        feed = tmp_path / name
+        feed.write_text(
+            "timer_id,timer_name,started_at,stopped_at,duration_seconds\n"
+            "NEW1,reading,2026-06-07T09:00:00-07:00,2026-06-07T10:00:00-07:00,3600\n",
+            encoding="utf-8",
+        )
+        return feed
+
+    def test_an_import_can_run_on_another_thread(
+        self, repository: Repository, home: Path, sample_csv: Path, tmp_path: Path
+    ) -> None:
+        import threading
+
+        run_import(repository, TimecardCsvImporter(), sample_csv, home=home)
+        client = InProcessClient(repository, timezone=PACIFIC, home=home)
+        feed = self._feed(tmp_path)
+        outcomes: list[object] = []
+        failures: list[BaseException] = []
+
+        def work() -> None:
+            try:
+                outcomes.append(client.import_file(feed, stream_key="timecard"))
+            except BaseException as error:
+                failures.append(error)
+
+        thread = threading.Thread(target=work)
+        thread.start()
+        thread.join()
+
+        assert failures == []
+        assert getattr(outcomes[0], "inserted", None) == 1
+        # ...and what the other thread wrote is visible through the shared one.
+        assert client.bounds("timecard") == (date(2026, 6, 5), date(2026, 6, 7))
+
+    def test_the_ui_thread_can_keep_reading_while_an_import_runs(
+        self, repository: Repository, home: Path, sample_csv: Path, tmp_path: Path
+    ) -> None:
+        import threading
+
+        run_import(repository, TimecardCsvImporter(), sample_csv, home=home)
+        client = InProcessClient(repository, timezone=PACIFIC, home=home)
+        feed = self._feed(tmp_path)
+        started = threading.Event()
+        failures: list[BaseException] = []
+
+        def work() -> None:
+            started.set()
+            try:
+                client.import_file(feed, stream_key="timecard")
+            except BaseException as error:
+                failures.append(error)
+
+        thread = threading.Thread(target=work)
+        thread.start()
+        started.wait()
+        for _ in range(50):  # reads on this thread, racing the import's writes
+            client.streams()
+            client.trends("timecard")
+        thread.join()
+
+        assert failures == []
+
+    def test_a_bad_file_is_an_outcome_not_an_exception_on_any_thread(
+        self, repository: Repository, home: Path, sample_csv: Path, tmp_path: Path
+    ) -> None:
+        run_import(repository, TimecardCsvImporter(), sample_csv, home=home)
+        client = InProcessClient(repository, timezone=PACIFIC, home=home)
+        outcome = client.import_file(tmp_path / "missing.csv", stream_key="timecard")
+        assert not outcome.ok and "no such file" in (outcome.error or "")
+
+    def test_provenance_names_come_from_the_runs_actually_referenced(
+        self, repository: Repository, home: Path, sample_csv: Path, tmp_path: Path
+    ) -> None:
+        run_import(repository, TimecardCsvImporter(), sample_csv, home=home)
+        client = InProcessClient(repository, timezone=PACIFIC, home=home)
+        client.import_file(self._feed(tmp_path, "later.csv"), stream_key="timecard")
+
+        window = client.window("timecard", date(2026, 6, 5), date(2026, 6, 7))
+
+        assert {r.source_name for r in window.records} == {sample_csv.name, "later.csv"}
