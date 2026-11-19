@@ -19,6 +19,7 @@ Minmax should be a robust, maintainable codebase. This means that whenever you f
 - Current tasks will be stored in `TODO.md`. Top level tasks will be created by humans only, but you may add subtasks as you see fit.
 You must write rigorous documentation for everything. This includes both inline documentation of code, but also documentation of features in `README.md`.
 - You must keep incomplete subtasks properly logged in `TODO.md`.
+- You must keep `.gitignore` current. Whenever your work creates files that don't belong in the repo (build output, caches, local databases, screenshots, scratch files, editor or tool state), edit `.gitignore` to cover them before committing.
 - You must write rigorous tests to ensure safety of the data trusted to Minmax and a smooth user experience.
 - The user interface must remain primarily separate from the backend. Redoing the UI should have no effect on the underlying systems.
 - Both work completed and work to be completed should be represented in `TODO.md`. This means that before beginning work on a prompt, you should add any relevant subtasks you've been instructed to complete to `TODO.md`. If there is no reasonable top-level task to put these under, ask the user to create one.
